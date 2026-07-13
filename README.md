@@ -1,8 +1,8 @@
-# Warrant
+# Provenance
 
 A local-first, self-hosted AI agent with a trusted kernel — models propose, the kernel decides, and every action leaves verifiable evidence.
 
-> A *warrant* is both an authorization and a justification: the kernel authorizes every action, and the hash-chained ledger justifies it with recorded evidence.
+> *Provenance*: every durable memory and every action traces back to a recorded, hash-chained source of evidence. Nothing the agent knows or does is unaccounted for.
 
 ## Current Status
 
@@ -124,8 +124,8 @@ or point `CORE_MODEL_PATH` at the file. Until then, the runtime capability repor
 Clone the repository:
 
 ```bash
-git clone https://github.com/A-Deb-byte/warrant.git
-cd warrant
+git clone https://github.com/A-Deb-byte/Provenance.git
+cd Provenance
 ```
 
 Install dependencies:
