@@ -3,6 +3,7 @@ import type { WorkerRegistration } from '../capabilities/types';
 import type { ProviderRouter } from '../providers/router';
 import type { ProviderPublicStatus } from '../providers/types';
 import { buildRuntimeCapabilityReport } from './autonomy';
+import { sandboxStatus, SandboxRunner } from './sandbox/sandbox';
 import {
   createKernelService,
   KernelActionWorker,
@@ -21,6 +22,7 @@ export interface KernelRouterOptions {
   readonly observationAssessor?: KernelObservationAssessor;
   readonly secretVaultStatus?: () => Promise<{ status: 'available' | 'unavailable'; reason: string }>;
   readonly accessControlStatus?: () => { status: 'available' | 'unavailable'; reason: string };
+  readonly sandbox?: SandboxRunner;
 }
 
 type ApprovalDecisionStatus = 'approved' | 'denied';
@@ -42,6 +44,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     releaseSigningPublicKey: options.releaseSigningPublicKey,
     actionWorkers: options.actionWorkers,
     observationAssessor: options.observationAssessor,
+    sandbox: options.sandbox,
   });
   const kernel = createKernelService(config);
   const router = express.Router();
@@ -496,6 +499,9 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
       const coreModel = options.coreModelStatus ? await options.coreModelStatus() : undefined;
       const secretVault = options.secretVaultStatus ? await options.secretVaultStatus() : undefined;
       const accessControl = options.accessControlStatus ? options.accessControlStatus() : undefined;
+      const osSandbox = options.sandbox
+        ? (() => { const s = sandboxStatus(options.sandbox!); return { status: s.status, reason: s.reason }; })()
+        : undefined;
       res.json(buildRuntimeCapabilityReport({
         providerStatuses: options.providerStatuses ?? [],
         workerReport: kernel.getWorkers().report,
@@ -504,6 +510,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
         releaseSigningConfigured: Boolean(options.releaseSigningPublicKey?.trim()),
         secretVault,
         accessControl,
+        osSandbox,
       }));
     } catch {
       res.status(500).json({ error: 'Runtime capability report is unavailable.' });

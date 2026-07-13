@@ -8,15 +8,25 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
-import { createOperatorTokenGuard, operatorTokenStatus } from './src/auth/operatorToken';
+import { accessControlStatus, createAccessGuard } from './src/auth/accessControl';
+import { createAuthApi } from './src/auth/api';
+import { resolveSessionSecret } from './src/auth/session';
+import { createUserStore } from './src/auth/users';
 import { createCoreModelRuntime } from './src/core-model/runtime';
 import { createKernelRouter } from './src/kernel/api';
-import { buildWorkerRegistrations, WEB_INSPECT_WORKER_ID } from './src/kernel/autonomy';
+import {
+  BROWSER_WRITE_WORKER_ID,
+  buildBrowserWriteWorkerRegistration,
+  buildWorkerRegistrations,
+  WEB_INSPECT_WORKER_ID,
+} from './src/kernel/autonomy';
+import { createHostSandbox, detectDockerSandbox } from './src/kernel/sandbox/sandbox';
+import { createBrowserWorker, createPlaywrightDriver } from './src/kernel/workers/browserWorker';
 import { createWebInspectWorker } from './src/kernel/workers/webInspectWorker';
 import { createProviderApi } from './src/providers/api';
 import { createProviderRuntime } from './src/providers/runtime';
 import { createVaultApi } from './src/vault/api';
-import { createDpapiVault, injectVaultSecretsIntoEnvironment } from './src/vault/dpapi';
+import { createPlatformVault, injectVaultSecretsIntoEnvironment } from './src/vault/index';
 
 // Load environment variables from .env if present
 dotenv.config();
@@ -32,11 +42,11 @@ const VAULT_INJECTED_SECRETS = ['GEMINI_API_KEY', 'RELEASE_SIGNING_PUBLIC_KEY', 
 let ai: GoogleGenAI;
 let coreModelPromise: ReturnType<typeof createCoreModelRuntime>;
 
-// The OS secret vault (Windows DPAPI) protects credentials at rest. Any
-// allowlisted secrets it holds are injected into the environment before the
-// provider runtime and auth guard read them, so they never need to sit in a
-// plaintext .env file. Non-Windows hosts report the vault as unavailable.
-const vault = createDpapiVault({ vaultDir: path.join(RUNTIME_DIR, 'vault') });
+// The platform-native OS secret vault (Windows DPAPI / macOS Keychain / Linux
+// Secret Service) protects credentials at rest. Any allowlisted secrets it
+// holds are injected into the environment before the provider runtime and auth
+// guard read them, so they never need to sit in a plaintext .env file.
+const vault = createPlatformVault({ vaultDir: path.join(RUNTIME_DIR, 'vault') });
 
 app.use(express.json());
 
@@ -49,9 +59,47 @@ const createServerContext = async () => {
   ai = getGeminiClient();
   const operatorToken = process.env.KERNEL_API_TOKEN;
 
-  // Mutating requests require the operator token when one is configured.
-  app.use('/api/kernel', createOperatorTokenGuard(operatorToken));
-  app.use('/api/vault', createOperatorTokenGuard(operatorToken));
+  // Access control: multi-user accounts (file-backed, scrypt-hashed) take
+  // precedence; a shared operator token is the fallback; open loopback is the
+  // single-user default. Sessions are signed, expiring bearer tokens.
+  const userStore = await createUserStore(path.join(RUNTIME_DIR, 'users.json'));
+  const sessionSecret = resolveSessionSecret(process.env.SESSION_SECRET);
+  const accessGuard = createAccessGuard({ userStore, operatorToken, sessionSecret });
+
+  // Verification commands run inside a Docker container (no network, read-only
+  // root, bounded resources) when a Docker daemon is reachable; otherwise they
+  // fall back to the trusted host, which the runtime report states honestly.
+  const sandbox = (await detectDockerSandbox()) ?? createHostSandbox();
+  console.log(`[Sandbox] Command execution isolation: ${sandbox.mode} (${sandbox.isolation}).`);
+
+  // The write-capable browser worker is registered only when both an origin
+  // allowlist is set AND a real Playwright browser engine is installed.
+  const browserDriver = createPlaywrightDriver({
+    userDataDir: path.join(RUNTIME_DIR, 'browser-profile'),
+  });
+  const browserWorkerAvailable = Boolean(process.env.BROWSER_WRITE_ORIGINS?.trim()) && await browserDriver.isAvailable();
+  const browserWriteRegistration = browserWorkerAvailable
+    ? buildBrowserWriteWorkerRegistration(process.env.BROWSER_WRITE_ORIGINS)
+    : undefined;
+
+  const baseRegistrations = buildWorkerRegistrations(process.env);
+  const workerRegistrations = browserWriteRegistration
+    ? [...baseRegistrations.filter((r) => !(r.family === 'browser' && r.availability === 'unavailable')), browserWriteRegistration]
+    : baseRegistrations;
+  const actionWorkers = {
+    [WEB_INSPECT_WORKER_ID]: createWebInspectWorker(),
+    ...(browserWriteRegistration ? { [BROWSER_WRITE_WORKER_ID]: createBrowserWorker(browserDriver) } : {}),
+  };
+  if (browserWorkerAvailable) console.log('[Browser] Write-capable Playwright worker registered.');
+
+  // Auth endpoints (login/logout/status/user management) are reachable without
+  // the guard so a session can be obtained; user-management routes self-check
+  // admin rights and bootstrap the first admin on loopback.
+  app.use('/api/auth', createAuthApi({ userStore, sessionSecret, operatorToken }));
+
+  // Mutating kernel/vault requests pass the unified access guard.
+  app.use('/api/kernel', accessGuard);
+  app.use('/api/vault', accessGuard);
 
   app.use('/api/providers', createProviderApi(providerRuntime));
   app.use('/api/vault', createVaultApi(vault));
@@ -62,14 +110,15 @@ const createServerContext = async () => {
     providerStatuses: providerRuntime.statuses,
     coreModelStatus: async () => (await coreModelPromise).getStatus(),
     releaseSigningPublicKey: process.env.RELEASE_SIGNING_PUBLIC_KEY,
-    workerRegistrations: buildWorkerRegistrations(process.env),
-    actionWorkers: { [WEB_INSPECT_WORKER_ID]: createWebInspectWorker() },
+    workerRegistrations,
+    actionWorkers,
     observationAssessor: async (content) => (await coreModelPromise).assessObservation(content),
+    sandbox,
     secretVaultStatus: async () => {
       const status = await vault.getStatus();
       return { status: status.status, reason: status.reason };
     },
-    accessControlStatus: () => operatorTokenStatus(operatorToken),
+    accessControlStatus: () => accessControlStatus(userStore.count(), operatorToken),
   }));
 
   app.get('/api/core-model/status', async (_req, res) => {

@@ -1,11 +1,9 @@
-import { execFile } from 'node:child_process';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { useCapabilityToken } from '../capabilities';
+import { createHostSandbox, SandboxRunner } from '../sandbox/sandbox';
 import { CapabilityToken, KernelCommandRequest, KernelEvidence } from '../types';
 
-const execFileAsync = promisify(execFile);
 const allowedNpmArguments = new Set(['test', 'run lint', 'run build', '--version']);
 const sensitiveEnvironmentName = /(auth|credential|key|password|secret|token)/i;
 const maxEvidenceOutputLength = 32 * 1024;
@@ -17,20 +15,6 @@ const isWithinRoot = (root: string, candidate: string): boolean => {
 
 const isWorkerAllowlistedRequest = (request: KernelCommandRequest): boolean => {
   return request.command === 'npm' && allowedNpmArguments.has(request.args.join(' '));
-};
-
-const resolveExecutable = (request: KernelCommandRequest): { file: string; args: string[] } => {
-  if (process.platform === 'win32' && request.command === 'npm') {
-    const npmCliPath = process.env.npm_execpath && path.isAbsolute(process.env.npm_execpath)
-      ? process.env.npm_execpath
-      : path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    return {
-      file: process.execPath,
-      args: [npmCliPath, ...request.args],
-    };
-  }
-
-  return { file: request.command, args: request.args };
 };
 
 const createWorkerEnvironment = (): NodeJS.ProcessEnv => {
@@ -61,6 +45,8 @@ const isTokenScopedToRequest = (token: CapabilityToken, request: KernelCommandRe
 
 export interface CommandWorkerOptions {
   timeoutMs?: number;
+  /** Isolation boundary for execution. Defaults to the trusted host. */
+  sandbox?: SandboxRunner;
 }
 
 export const runKernelCommand = async (
@@ -119,34 +105,23 @@ export const runKernelCommand = async (
   }
   token.usedOperations = capabilityUse.token.usedOperations;
 
-  try {
-    const executable = resolveExecutable(request);
-    const result = await execFileAsync(executable.file, executable.args, {
-      cwd: request.cwd,
-      timeout: Math.max(1, Math.min(options.timeoutMs ?? 120000, 120000)),
-      windowsHide: true,
-      maxBuffer: 256 * 1024,
-      env: createWorkerEnvironment(),
-    });
-    return {
-      kind: 'command_output',
-      summary: `${request.command} ${request.args.join(' ')} exited with code 0.`,
-      command: `${request.command} ${request.args.join(' ')}`,
-      exitCode: 0,
-      durationMs: Date.now() - started,
-      stdout: sanitizeOutput(result.stdout),
-      stderr: sanitizeOutput(result.stderr),
-    };
-  } catch (error) {
-    const commandError = error as { code?: number; stdout?: string; stderr?: string; message?: string };
-    return {
-      kind: 'command_output',
-      summary: `${request.command} ${request.args.join(' ')} failed.`,
-      command: `${request.command} ${request.args.join(' ')}`,
-      exitCode: typeof commandError.code === 'number' ? commandError.code : 1,
-      durationMs: Date.now() - started,
-      stdout: sanitizeOutput(commandError.stdout),
-      stderr: sanitizeOutput(commandError.stderr || commandError.message || 'Command failed.'),
-    };
-  }
+  const sandbox = options.sandbox ?? createHostSandbox();
+  const result = await sandbox.run({
+    command: request.command,
+    args: request.args,
+    cwd: request.cwd,
+    timeoutMs: Math.max(1, Math.min(options.timeoutMs ?? 120000, 120000)),
+    maxBuffer: 256 * 1024,
+    env: createWorkerEnvironment(),
+  });
+  const label = `${request.command} ${request.args.join(' ')}`;
+  return {
+    kind: 'command_output',
+    summary: result.exitCode === 0 ? `${label} exited with code 0.` : `${label} failed.`,
+    command: label,
+    exitCode: result.exitCode,
+    durationMs: Date.now() - started,
+    stdout: sanitizeOutput(result.stdout),
+    stderr: sanitizeOutput(result.stderr),
+  };
 };

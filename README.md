@@ -12,8 +12,8 @@ The memory and chat workspace began as a Phase 0 prototype and now sits on a tes
 - Evidence-backed durable memory (candidate → promoted → superseded/revoked) and a bounded, non-executing skill foundry.
 - Normalized routing across six AI providers (Gemini SDK plus an OpenAI-compatible adapter; Bedrock as an unavailable boundary).
 - An in-process advisory core model (MiniCPM5-1B via `node-llama-cpp`) for fully on-device memory extraction, chat fallback, and tighten-only prompt-injection assessment.
-- A read-only web-inspect worker with executable, budgeted automations; parallel multi-goal execution; recovery and a Stop All control.
-- Ed25519-verified release proposals, a Windows DPAPI secret vault, and an optional operator API token.
+- Read-only and write-capable (Playwright) browser workers with executable, budgeted automations; a Docker command sandbox; parallel multi-goal execution; recovery and a Stop All control.
+- Ed25519-verified release proposals, a cross-platform OS secret vault (Windows DPAPI / macOS Keychain / Linux Secret Service), and multi-user access control with roles and session tokens.
 - Four auto-refreshing dashboard panels that project only recorded state.
 
 Boundaries that remain deployment integrations (reported as unavailable, never simulated) are listed under "Deployment Integrations Still Outstanding" below.
@@ -184,9 +184,9 @@ The following remain deployment integrations until their required runtimes exist
 
 - **Rust/Tauri process isolation and authenticated desktop IPC.** The TypeScript kernel remains the reference implementation; its validated contracts and independently replayable ledger (`npm run verify-ledger`) are the migration path to a compiled kernel.
 - **An operating-system sandbox confining project scripts.** Verification commands and the web-inspect fetch run on the trusted host. A real sandbox needs OS-level primitives (namespaces/jobs/seccomp) or the Rust runtime that a TypeScript workspace cannot honestly provide; the allowlists and capability tokens bound blast radius but are not isolation.
-- **Session-authenticated browser, desktop, and connector workers.** The shipped web-inspect worker is intentionally read-only and origin-allowlisted. Workers that carry a logged-in session or touch a desktop are the "hands" that require isolation and per-action permissioning infrastructure before they are safe to ship.
-- **A cross-platform OS vault.** The DPAPI vault is Windows-only; macOS Keychain and Linux Secret Service adapters are not yet implemented and report unavailable on those platforms.
-- **Multi-user access control.** The optional operator token is a single shared secret, not per-user accounts, roles, or sessions. The API remains single-user and loopback-only by design.
+- **Desktop and connector workers, and browser text-entry/downloads.** The write-capable browser worker (Playwright) now navigates and clicks through the approval pipeline, but desktop automation (UIA/AX/AT-SPI) and OAuth connectors are unbuilt, and browser text entry / downloads await an artifact store for typed payloads. The command sandbox provides real isolation only when Docker is installed; otherwise it falls back to the trusted host (reported honestly).
+- **Verified cross-platform vault.** Windows DPAPI is validated live; the macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but were unit-tested only (they need a real run on those OSes).
+- **Per-user isolation and external identity.** Multi-user accounts, roles (admin/operator/viewer), and signed session tokens exist, but goals/memory are not yet partitioned per user, and there is no SSO/OIDC. The API remains loopback-only by design.
 
 ## Architecture Direction
 

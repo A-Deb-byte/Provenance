@@ -18,7 +18,7 @@ const featureLabels: Record<string, string> = {
   backgroundAutomation: 'Background automation',
   coreModel: 'Core model (MiniCPM5-1B)',
   secretVault: 'OS secret vault',
-  accessControl: 'Operator access control',
+  accessControl: 'Access control',
   osSandbox: 'OS sandbox',
   releaseSigning: 'Release signing',
   desktopIpc: 'Desktop shell IPC',

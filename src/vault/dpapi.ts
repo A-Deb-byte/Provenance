@@ -5,10 +5,12 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+export type SecretVaultBackend = 'windows_dpapi' | 'macos_keychain' | 'linux_secret_service' | 'none';
+
 export interface SecretVaultStatus {
   status: 'available' | 'unavailable';
   reason: string;
-  backend: 'windows_dpapi' | 'none';
+  backend: SecretVaultBackend;
   secretNames: string[];
 }
 

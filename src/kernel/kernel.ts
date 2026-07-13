@@ -74,6 +74,7 @@ import {
   SkillManifest,
   SkillPackage,
 } from './types';
+import type { SandboxRunner } from './sandbox/sandbox';
 import { runKernelCommand } from './workers/commandWorker';
 
 export interface KernelActionWorkerResult {
@@ -119,6 +120,7 @@ export interface KernelServiceOptions {
   releaseSigningPublicKey?: string;
   actionWorkers?: Record<string, KernelActionWorker>;
   observationAssessor?: KernelObservationAssessor;
+  sandbox?: SandboxRunner;
 }
 
 export interface KernelStepResult {
@@ -421,6 +423,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (prepared.kind === 'result') return prepared.result;
     const evidence = await runKernelCommand(prepared.token, prepared.request, {
       timeoutMs: prepared.remainingRuntimeMs,
+      sandbox: options.sandbox,
     });
     return recordGoalStepOutcome(goalId, prepared.task, evidence);
   };

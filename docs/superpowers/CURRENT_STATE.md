@@ -2,7 +2,7 @@
 
 Date: 2026-07-13
 Purpose: The single authoritative answer to "what does this product do, and what is still missing."
-Verification basis: `npm run lint` clean, 204 tests across 45 files passing, `npm run build` clean, `npm run verify-ledger` clean, and a live runtime capability report.
+Verification basis: `npm run lint` clean, 234 tests across 50 files passing, `npm run build` clean, `npm run verify-ledger` clean, and a live runtime capability report.
 
 ## What This Product Is
 
@@ -23,20 +23,22 @@ Legend: **Done** = implemented and test-covered · **Partial** = works within st
 | Skill foundry (bounded DSL) | Done | Synthesize/evaluate/canary/promote/rollback; never executes generated code. |
 | Provider routing (6 providers) | Partial | Adapters + automatic/pinned/ensemble routing built; live calls need credentials. Bedrock is an unavailable boundary. |
 | On-device core model (MiniCPM5-1B) | Done | In-process via `node-llama-cpp`; local extraction, chat fallback, tighten-only injection assessment. |
-| Web-inspect worker + executable automations | Partial | Read-only, origin-allowlisted `browser.inspect` only; full policy→grant→observation→ledger pipeline. |
+| Web-inspect worker + executable automations | Partial | Read-only, origin-allowlisted `browser.inspect`; full policy→grant→observation→ledger pipeline. |
+| Write-capable browser worker (Playwright) | Partial | navigate/click through the approval pipeline; gated on Playwright + browser install; text-entry/download await an artifact store. |
+| OS process sandbox (Docker) | Partial | Verification commands run in an ephemeral container (no network, read-only root, bounded resources) when Docker is present; honest host fallback otherwise. |
 | Parallel multi-goal execution | Done | Up to 8 goals; worker commands run in parallel OS processes, state stays serialized. |
 | Recovery + Stop All | Done | Interrupted tasks recover to an inspectable blocked state; Stop All halts execution. |
 | Release proposals + Ed25519 signing | Done | Correctly signed proposals activate; unsigned/keyless/forged stay blocked with reasons. |
-| OS secret vault (Windows DPAPI) | Partial | Platform-native at-rest protection; **Windows only**, boot-time env injection, values never returned. |
-| Operator access control | Partial | Optional shared bearer token on mutating routes; **not** per-user accounts/roles. |
+| Cross-platform OS secret vault | Partial | Windows DPAPI, macOS Keychain, Linux Secret Service, selected by platform; each reports unavailable off-target. Values never returned. |
+| Multi-user access control | Done | File-backed accounts (scrypt), signed expiring session tokens, admin/operator/viewer roles; shared-token and open-loopback fallbacks. |
 | Auto-refreshing dashboard | Done | Four panels poll recorded state every 5s. |
 
 ## What Is Still Missing (Boundaries, With Reasons)
 
-- **OS process sandbox** — verification commands and the web-inspect fetch run on the trusted host. Real isolation needs OS primitives (namespaces/job objects/seccomp) or a compiled runtime; allowlists and capability tokens bound blast radius but are not isolation.
-- **Session-authenticated / desktop / connector workers** — the "hands" that carry a logged-in session or touch a desktop. They require isolation and per-action permissioning infrastructure before they are safe to ship; only the read-only web-inspect worker exists today.
-- **Cross-platform vault** — macOS Keychain and Linux Secret Service adapters are not implemented; those platforms report the vault unavailable.
-- **Multi-user access control** — the operator token is one shared secret, not accounts, roles, or sessions. Single-user, loopback-only by design.
+- **Sandbox depends on Docker being installed** — when no container runtime is present, verification falls back to the trusted host (reported honestly). Native OS-primitive isolation (job objects/namespaces/seccomp) without Docker still needs a compiled/native runtime.
+- **Desktop and connector workers** — the browser "hand" now writes (navigate/click), but desktop automation (UIA/AX/AT-SPI) and OAuth connectors remain unbuilt; browser text-entry and downloads await an artifact store for typed payloads.
+- **Cross-platform vault is unverified off-Windows** — the macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but were validated only by construction/unit tests on Windows; they need a real run on those OSes.
+- **Multi-user is single shared deployment** — accounts, roles, and sessions exist, but there is no per-user data partitioning of goals/memory yet, and no external identity provider (SSO/OIDC).
 - **Rust/Tauri kernel** — the TypeScript kernel is the reference implementation. Its validated contracts and the zero-import ledger verifier (`npm run verify-ledger`) are the concrete migration path to a compiled kernel.
 - **Live cloud provider execution** — requires operator-supplied credentials (env or vault); no keys ship with the repo.
 

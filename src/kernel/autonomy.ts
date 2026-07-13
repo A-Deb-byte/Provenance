@@ -96,6 +96,37 @@ const isCanonicalHttpOrigin = (value: string): boolean => {
 };
 
 export const WEB_INSPECT_WORKER_ID = 'worker.browser.web_inspect';
+export const BROWSER_WRITE_WORKER_ID = 'worker.browser.playwright';
+
+/**
+ * Registration for the write-capable Playwright browser worker. Returns
+ * undefined unless origins are allowlisted; the caller only supplies origins
+ * once it has confirmed a real browser engine is installed, so the worker is
+ * never advertised as available without a runtime behind it.
+ */
+export const buildBrowserWriteWorkerRegistration = (
+  originsCsv: string | undefined,
+  registeredAt = new Date().toISOString(),
+): WorkerRegistration | undefined => {
+  const origins = (originsCsv ?? '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(isCanonicalHttpOrigin);
+  if (origins.length === 0) return undefined;
+  return {
+    id: BROWSER_WRITE_WORKER_ID,
+    family: 'browser',
+    availability: 'available',
+    supportedActions: ['browser.inspect', 'browser.navigate', 'browser.click'],
+    configuredScopes: [{
+      family: 'browser',
+      operations: ['browser.inspect', 'browser.navigate', 'browser.click'],
+      origins,
+      downloadRoots: [],
+    }],
+    registeredAt,
+  };
+};
 
 /**
  * Builds the runtime worker registrations. The read-only web-inspect worker
@@ -387,6 +418,7 @@ export interface RuntimeReportInput {
   releaseSigningConfigured?: boolean;
   secretVault?: { status: 'available' | 'unavailable'; reason: string };
   accessControl?: { status: 'available' | 'unavailable'; reason: string };
+  osSandbox?: { status: 'available' | 'unavailable'; reason: string };
   now?: string;
 }
 
@@ -433,7 +465,7 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
       status: 'unavailable',
       reason: 'No operator API token is configured; mutating requests are open on loopback.',
     },
-    osSandbox: {
+    osSandbox: input.osSandbox ?? {
       status: 'unavailable',
       reason: 'No operating-system sandbox confines project scripts; verification runs on the trusted host.',
     },
