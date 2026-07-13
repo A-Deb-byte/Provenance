@@ -12,7 +12,7 @@ It is **not** a hardened, multi-user, isolated production runtime. The boundarie
 
 ## Capability Matrix
 
-Legend: **Done** = implemented and test-covered · **Partial** = works within stated limits · **Boundary** = deliberately not built, reported unavailable with a reason.
+Legend: **Done** = implemented and test-covered · **Done*** = also live-verified against the real runtime · **Partial** = works within stated limits · **Boundary** = deliberately not built, reported unavailable with a reason.
 
 | Capability | State | Notes |
 | --- | --- | --- |
@@ -24,8 +24,8 @@ Legend: **Done** = implemented and test-covered · **Partial** = works within st
 | Provider routing (6 providers) | Partial | Adapters + automatic/pinned/ensemble routing built; live calls need credentials. Bedrock is an unavailable boundary. |
 | On-device core model (MiniCPM5-1B) | Done | In-process via `node-llama-cpp`; local extraction, chat fallback, tighten-only injection assessment. |
 | Web-inspect worker + executable automations | Partial | Read-only, origin-allowlisted `browser.inspect`; full policy→grant→observation→ledger pipeline. |
-| Write-capable browser worker (Playwright) | Partial | navigate/click through the approval pipeline; gated on Playwright + browser install; text-entry/download await an artifact store. |
-| OS process sandbox (Docker) | Partial | Verification commands run in an ephemeral container (no network, read-only root, bounded resources) when Docker is present; honest host fallback otherwise. |
+| Write-capable browser worker (Playwright) | Done* | navigate/click through the approval pipeline; live-verified against example.com via playwright-core/Chromium. Text-entry/download await an artifact store. |
+| OS process sandbox (Docker) | Done* | Verification commands run in an ephemeral container (no network, read-only root, 2g/512pids/2cpu, workspace-only mount); live-verified (`npm run lint` exit 0 in-container, DNS blocked). Honest host fallback when Docker is absent. |
 | Parallel multi-goal execution | Done | Up to 8 goals; worker commands run in parallel OS processes, state stays serialized. |
 | Recovery + Stop All | Done | Interrupted tasks recover to an inspectable blocked state; Stop All halts execution. |
 | Release proposals + Ed25519 signing | Done | Correctly signed proposals activate; unsigned/keyless/forged stay blocked with reasons. |
@@ -35,7 +35,7 @@ Legend: **Done** = implemented and test-covered · **Partial** = works within st
 
 ## What Is Still Missing (Boundaries, With Reasons)
 
-- **Sandbox depends on Docker being installed** — when no container runtime is present, verification falls back to the trusted host (reported honestly). Native OS-primitive isolation (job objects/namespaces/seccomp) without Docker still needs a compiled/native runtime.
+- **Sandbox depends on Docker being installed** — live-verified with Docker Desktop present (container isolation + `--network none` confirmed). When no container runtime is present, verification falls back to the trusted host (reported honestly). Native OS-primitive isolation (job objects/namespaces/seccomp) without Docker still needs a compiled/native runtime.
 - **Desktop and connector workers** — the browser "hand" now writes (navigate/click), but desktop automation (UIA/AX/AT-SPI) and OAuth connectors remain unbuilt; browser text-entry and downloads await an artifact store for typed payloads.
 - **Cross-platform vault is unverified off-Windows** — the macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but were validated only by construction/unit tests on Windows; they need a real run on those OSes.
 - **Multi-user is single shared deployment** — accounts, roles, and sessions exist, but there is no per-user data partitioning of goals/memory yet, and no external identity provider (SSO/OIDC).

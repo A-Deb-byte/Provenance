@@ -28,9 +28,9 @@ describe('buildDockerRunArgs', () => {
     expect(args[0]).toBe('run');
     expect(joined).toContain('--network none');
     expect(joined).toContain('--read-only');
-    expect(joined).toContain('--memory 512m');
-    expect(joined).toContain('--pids-limit 256');
-    expect(joined).toContain('--cpus 1');
+    expect(joined).toContain('--memory 2g');
+    expect(joined).toContain('--pids-limit 512');
+    expect(joined).toContain('--cpus 2');
     expect(joined).toContain('--cap-drop ALL');
     expect(joined).toContain('--security-opt no-new-privileges');
     expect(joined).toContain(':/workspace');

@@ -45,6 +45,17 @@ Two adapters mirror the DPAPI pattern, selected by `src/vault/index.ts::createPl
 
 `npm run lint` clean; `npm test` **234 tests across 50 files** passing (was 204/45); `npm run build` clean. New tests: sandbox arg construction + host/docker/detection; browser worker mapping + registration with a fake driver; macOS/Linux vault construction/validation/gating with a fake runner; user store hashing/persistence, session round-trip/expiry/tamper, and the full multi-user HTTP flow (bootstrap → login → role-scoped mutation → viewer denial) over a live express app.
 
+## Live Verification (Docker + Playwright installed)
+
+After Docker Desktop and a Chromium browser were installed, the two runtime-gated features were verified end to end (not just build-and-gated):
+
+- **Sandbox isolation**: a command run through `DockerSandbox` reported `platform: linux` while the host is Windows — proving real container isolation, not host execution.
+- **Network isolation**: a DNS lookup inside the container failed with `EAI_AGAIN` under `--network none`.
+- **Real verification in-container**: `npm run lint` (tsc) exited 0 inside the container. This surfaced a tuning fix — the initial 512m memory OOM'd tsc, so the default was raised to 2g / 512 pids / 2 cpu.
+- **Browser worker**: the Playwright driver (via `playwright-core` + Chromium) navigated to https://example.com and returned the page text through the worker.
+
+Packaging refinements from this pass: the dependency is `playwright-core` (no forced browser download on install; enable with `npx playwright install chromium`); `isAvailable()` now confirms the browser binary exists on disk; and the docker executable path is configurable via `DOCKER_PATH` with its bin directory prepended to PATH so Docker Desktop's credential helper resolves.
+
 ## Deferred / Still Out
 
 - Rust/Tauri kernel (explicitly skipped this session).

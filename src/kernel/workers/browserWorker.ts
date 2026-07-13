@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import type { ActionIntent, BrowserAction } from '../../capabilities/types';
 
 /**
@@ -158,7 +159,10 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
     isAvailable: async () => {
       try {
         const mod = await importPlaywright();
-        return typeof mod.chromium.executablePath() === 'string';
+        // executablePath() returns the expected path even when the browser is
+        // not downloaded, so confirm the binary actually exists on disk.
+        const executable = mod.chromium.executablePath();
+        return typeof executable === 'string' && existsSync(executable);
       } catch {
         return false;
       }

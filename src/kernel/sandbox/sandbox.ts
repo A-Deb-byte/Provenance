@@ -85,6 +85,8 @@ export const createHostSandbox = (exec: SandboxExec = execFileAsync as unknown a
 });
 
 export interface DockerSandboxConfig {
+  /** Path or name of the docker executable (e.g. 'docker' or a full path). */
+  dockerPath: string;
   image: string;
   memory: string;
   pidsLimit: number;
@@ -93,11 +95,40 @@ export interface DockerSandboxConfig {
 }
 
 export const DEFAULT_DOCKER_SANDBOX_CONFIG: DockerSandboxConfig = {
+  dockerPath: 'docker',
   image: 'node:20-alpine',
-  memory: '512m',
-  pidsLimit: 256,
-  cpus: '1',
+  // 2 GB fits the project's tsc/vite verification commands; 512m OOMs tsc.
+  memory: '2g',
+  pidsLimit: 512,
+  cpus: '2',
   containerWorkdir: '/workspace',
+};
+
+/**
+ * Docker Desktop for Windows accepts a Windows path in `-v`, but the WSL2
+ * backend is happiest with the `//c/Users/...` form. Convert on win32; leave
+ * POSIX paths untouched.
+ */
+const toDockerMountSource = (cwd: string): string => {
+  const resolved = path.resolve(cwd);
+  const winMatch = /^([A-Za-z]):[\\/](.*)$/.exec(resolved);
+  if (!winMatch) return resolved;
+  const drive = winMatch[1].toLowerCase();
+  const rest = winMatch[2].replace(/\\/g, '/');
+  return `//${drive}/${rest}`;
+};
+
+/**
+ * The docker CLI shells out to sibling credential helpers (e.g.
+ * docker-credential-desktop) that live in its own directory. When docker is
+ * invoked by absolute path, that directory may be absent from PATH, so prepend
+ * it for the child process.
+ */
+const dockerEnv = (dockerPath: string, env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  if (!path.isAbsolute(dockerPath)) return env;
+  const binDir = path.dirname(dockerPath);
+  const currentPath = env.PATH ?? env.Path ?? '';
+  return { ...env, PATH: currentPath ? `${binDir}${path.delimiter}${currentPath}` : binDir };
 };
 
 /**
@@ -122,7 +153,7 @@ export const buildDockerRunArgs = (spec: SandboxRunSpec, config: DockerSandboxCo
     '--cpus', config.cpus,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
-    '-v', `${path.resolve(spec.cwd)}:${workdir}`,
+    '-v', `${toDockerMountSource(spec.cwd)}:${workdir}`,
     '-w', workdir,
     '-e', `HOME=${workdir}`,
     '-e', `npm_config_cache=${workdir}/.npm-cache`,
@@ -140,11 +171,11 @@ export const createDockerSandbox = (
   isolation: `docker: no network, read-only root, ${config.memory} memory, ${config.pidsLimit} pids, ${config.cpus} cpu, workspace-only mount`,
   run: async (spec) => {
     try {
-      const result = await exec('docker', buildDockerRunArgs(spec, config), {
+      const result = await exec(config.dockerPath, buildDockerRunArgs(spec, config), {
         timeout: spec.timeoutMs,
         windowsHide: true,
         maxBuffer: spec.maxBuffer,
-        env: spec.env,
+        env: dockerEnv(config.dockerPath, spec.env),
       });
       return { stdout: asString(result.stdout), stderr: asString(result.stderr), exitCode: 0 };
     } catch (error) {
@@ -162,11 +193,11 @@ export const detectDockerSandbox = async (
   config: DockerSandboxConfig = DEFAULT_DOCKER_SANDBOX_CONFIG,
 ): Promise<SandboxRunner | undefined> => {
   try {
-    await exec('docker', ['version', '--format', '{{.Server.Version}}'], {
-      timeout: 5000,
+    await exec(config.dockerPath, ['version', '--format', '{{.Server.Version}}'], {
+      timeout: 15000,
       windowsHide: true,
       maxBuffer: 64 * 1024,
-      env: process.env,
+      env: dockerEnv(config.dockerPath, process.env),
     });
     return createDockerSandbox(exec, config);
   } catch {

@@ -20,7 +20,7 @@ import {
   buildWorkerRegistrations,
   WEB_INSPECT_WORKER_ID,
 } from './src/kernel/autonomy';
-import { createHostSandbox, detectDockerSandbox } from './src/kernel/sandbox/sandbox';
+import { createHostSandbox, DEFAULT_DOCKER_SANDBOX_CONFIG, detectDockerSandbox } from './src/kernel/sandbox/sandbox';
 import { createBrowserWorker, createPlaywrightDriver } from './src/kernel/workers/browserWorker';
 import { createWebInspectWorker } from './src/kernel/workers/webInspectWorker';
 import { createProviderApi } from './src/providers/api';
@@ -69,7 +69,10 @@ const createServerContext = async () => {
   // Verification commands run inside a Docker container (no network, read-only
   // root, bounded resources) when a Docker daemon is reachable; otherwise they
   // fall back to the trusted host, which the runtime report states honestly.
-  const sandbox = (await detectDockerSandbox()) ?? createHostSandbox();
+  const sandbox = (await detectDockerSandbox(undefined, {
+    ...DEFAULT_DOCKER_SANDBOX_CONFIG,
+    dockerPath: process.env.DOCKER_PATH?.trim() || DEFAULT_DOCKER_SANDBOX_CONFIG.dockerPath,
+  })) ?? createHostSandbox();
   console.log(`[Sandbox] Command execution isolation: ${sandbox.mode} (${sandbox.isolation}).`);
 
   // The write-capable browser worker is registered only when both an origin
