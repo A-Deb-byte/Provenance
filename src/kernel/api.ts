@@ -1,0 +1,514 @@
+import express from 'express';
+import type { WorkerRegistration } from '../capabilities/types';
+import type { ProviderRouter } from '../providers/router';
+import type { ProviderPublicStatus } from '../providers/types';
+import { buildRuntimeCapabilityReport } from './autonomy';
+import {
+  createKernelService,
+  KernelActionWorker,
+  KernelObservationAssessor,
+} from './kernel';
+
+export interface KernelRouterOptions {
+  readonly runtimeDir: string;
+  readonly allowedWorkspaceRoot: string;
+  readonly providerRouter?: ProviderRouter;
+  readonly providerStatuses?: readonly ProviderPublicStatus[];
+  readonly workerRegistrations?: WorkerRegistration[];
+  readonly coreModelStatus?: () => Promise<{ status: 'available' | 'unavailable'; reason: string }>;
+  readonly releaseSigningPublicKey?: string;
+  readonly actionWorkers?: Record<string, KernelActionWorker>;
+  readonly observationAssessor?: KernelObservationAssessor;
+  readonly secretVaultStatus?: () => Promise<{ status: 'available' | 'unavailable'; reason: string }>;
+  readonly accessControlStatus?: () => { status: 'available' | 'unavailable'; reason: string };
+}
+
+type ApprovalDecisionStatus = 'approved' | 'denied';
+
+const errorMessage = (error: unknown): string => {
+  return error instanceof Error ? error.message : 'Unknown kernel error.';
+};
+
+const isApprovalDecisionStatus = (value: unknown): value is ApprovalDecisionStatus => {
+  return value === 'approved' || value === 'denied';
+};
+
+export const createKernelRouter = (options: KernelRouterOptions) => {
+  const config = Object.freeze({
+    runtimeDir: options.runtimeDir,
+    allowedWorkspaceRoot: options.allowedWorkspaceRoot,
+    providerRouter: options.providerRouter,
+    workerRegistrations: options.workerRegistrations,
+    releaseSigningPublicKey: options.releaseSigningPublicKey,
+    actionWorkers: options.actionWorkers,
+    observationAssessor: options.observationAssessor,
+  });
+  const kernel = createKernelService(config);
+  const router = express.Router();
+
+  // Interrupted running tasks are recovered into an inspectable blocked
+  // state at startup rather than silently resuming.
+  void kernel.recoverInterruptedTasks().catch((error) => {
+    console.warn('[Kernel] Startup recovery skipped:', error instanceof Error ? error.message : error);
+  });
+
+  router.post('/goals', async (req, res) => {
+    try {
+      const goal = await kernel.createGoal(req.body);
+      res.status(201).json(goal);
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.get('/goals', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ goals: state.goals });
+    } catch {
+      res.status(500).json({ error: 'Kernel state is unavailable.' });
+    }
+  });
+
+  router.get('/goals/:goalId', async (req, res) => {
+    try {
+      const [state, events] = await Promise.all([kernel.getState(), kernel.getEvents()]);
+      const goal = state.goals.find((candidate) => candidate.id === req.params.goalId);
+      if (!goal) {
+        res.status(404).json({ error: 'Goal not found.' });
+        return;
+      }
+
+      res.json({
+        goal,
+        tasks: state.tasks.filter((task) => task.goalId === goal.id),
+        approvals: state.approvals.filter((approval) => approval.goalId === goal.id),
+        events: events.filter((event) => event.entityId === goal.id || event.payload.goalId === goal.id),
+      });
+    } catch {
+      res.status(500).json({ error: 'Kernel state is unavailable.' });
+    }
+  });
+
+  router.post('/goals/:goalId/step', async (req, res) => {
+    try {
+      res.json(await kernel.stepGoal(req.params.goalId));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message === 'Goal not found.' ? 404 : 500;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.post('/goals/step-parallel', async (req, res) => {
+    const goalIds = req.body?.goalIds as unknown;
+    if (!Array.isArray(goalIds) || goalIds.length === 0 || !goalIds.every((id) => typeof id === 'string' && id.trim())) {
+      res.status(400).json({ error: 'goalIds must be a non-empty array of goal id strings.' });
+      return;
+    }
+    try {
+      res.json({ results: await kernel.stepGoalsInParallel(goalIds as string[]) });
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/goals/:goalId/provider-calls', async (req, res) => {
+    try {
+      const request = req.body?.request;
+      const policy = req.body?.policy;
+      if (!request || typeof request !== 'object' || !policy || typeof policy !== 'object') {
+        res.status(400).json({ error: 'Provider request and routing policy are required.' });
+        return;
+      }
+      res.json(await kernel.executeProviderRequest(req.params.goalId, request, policy));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message === 'Goal not found.' ? 404
+        : message === 'Provider router is unavailable.' ? 503
+          : message.includes('budget exceeded') ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/events', async (_req, res) => {
+    try {
+      res.json({ events: await kernel.getEvents() });
+    } catch {
+      res.status(500).json({ error: 'Kernel events are unavailable.' });
+    }
+  });
+
+  router.get('/approvals', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ approvals: state.approvals });
+    } catch {
+      res.status(500).json({ error: 'Kernel approvals are unavailable.' });
+    }
+  });
+
+  router.post('/approvals/:approvalId/decision', async (req, res) => {
+    const status = req.body?.status as unknown;
+    const reason = req.body?.reason as unknown;
+    if (!isApprovalDecisionStatus(status)) {
+      res.status(400).json({ error: 'Approval status must be approved or denied.' });
+      return;
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Approval decision reason is required.' });
+      return;
+    }
+
+    try {
+      res.json(await kernel.decideApproval(req.params.approvalId, status, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      const responseStatus = message === 'Approval not found.'
+        ? 404
+        : message === 'Approval has already been decided.' ? 409 : 400;
+      res.status(responseStatus).json({ error: message });
+    }
+  });
+
+  router.get('/memories', async (req, res) => {
+    try {
+      const state = await kernel.getState();
+      const requestedStatus = typeof req.query.status === 'string' ? req.query.status : undefined;
+      const memories = requestedStatus
+        ? state.memories.filter((memory) => memory.status === requestedStatus)
+        : state.memories;
+      res.json({ memories });
+    } catch {
+      res.status(500).json({ error: 'Kernel memories are unavailable.' });
+    }
+  });
+
+  router.post('/memories/candidates', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createMemoryCandidate(req.body));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/memories/:memoryId/promote', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Memory promotion reason is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.promoteMemory(req.params.memoryId, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Memory not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/memories/:memoryId/revoke', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Memory revocation reason is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.revokeMemory(req.params.memoryId, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Memory not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.get('/skills', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ skills: state.skillPackages, activations: state.skillActivations });
+    } catch {
+      res.status(500).json({ error: 'Kernel skills are unavailable.' });
+    }
+  });
+
+  router.get('/skill-evaluations', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ evaluations: state.skillEvaluations });
+    } catch {
+      res.status(500).json({ error: 'Skill evaluations are unavailable.' });
+    }
+  });
+
+  router.post('/skills/synthesize', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.synthesizeSkill(req.body));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/skills/:skillId/evaluate', async (req, res) => {
+    try {
+      res.json(await kernel.evaluateSkill(req.params.skillId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Skill not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/skills/:skillId/canary', async (req, res) => {
+    const maxRuns = req.body?.maxRuns as unknown;
+    if (!Number.isInteger(maxRuns)) {
+      res.status(400).json({ error: 'Canary maxRuns must be an integer.' });
+      return;
+    }
+    try {
+      res.json(await kernel.startSkillCanary(req.params.skillId, maxRuns as number));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.endsWith('not found.') ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/skills/:skillId/canary-runs', async (req, res) => {
+    const input = req.body?.input as unknown;
+    const expectedOutput = req.body?.expectedOutput as unknown;
+    if (typeof input !== 'string' || typeof expectedOutput !== 'string') {
+      res.status(400).json({ error: 'Canary input and expectedOutput must be strings.' });
+      return;
+    }
+    try {
+      res.json(await kernel.runSkillCanary(req.params.skillId, input, expectedOutput));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.endsWith('not found.') ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/skills/:skillId/promote', async (req, res) => {
+    try {
+      res.json(await kernel.promoteSkillPackage(req.params.skillId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.endsWith('not found.') ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/skills/:skillId/rollback', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Skill rollback reason is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.rollbackSkillPackage(req.params.skillId, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.endsWith('not found.') ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/skills/:skillId/invoke', async (req, res) => {
+    const input = req.body?.input as unknown;
+    if (typeof input !== 'string') {
+      res.status(400).json({ error: 'Skill input must be a string.' });
+      return;
+    }
+    try {
+      res.json({ output: await kernel.invokeSkill(req.params.skillId, input) });
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Skill not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.get('/workers', (_req, res) => {
+    res.json(kernel.getWorkers());
+  });
+
+  router.get('/automations', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ automations: state.automations });
+    } catch {
+      res.status(500).json({ error: 'Kernel automations are unavailable.' });
+    }
+  });
+
+  router.post('/automations', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createAutomation(req.body));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.endsWith('not found.') ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/automations/:automationId/enabled', async (req, res) => {
+    const enabled = req.body?.enabled as unknown;
+    const reason = req.body?.reason as unknown;
+    if (typeof enabled !== 'boolean') {
+      res.status(400).json({ error: 'Automation enabled must be a boolean.' });
+      return;
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Automation state change reason is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.setAutomationEnabled(req.params.automationId, enabled, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Automation not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/automations/:automationId/evaluate', async (req, res) => {
+    try {
+      res.json({ decision: await kernel.evaluateAutomation(req.params.automationId) });
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Automation not found.' ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/automations/:automationId/run', async (req, res) => {
+    try {
+      res.json(await kernel.runAutomation(req.params.automationId));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message.endsWith('not found.')
+        ? 404
+        : message.includes('disabled') || message.includes('Stop All') || message.includes('budget') || message.includes('halted')
+          ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/controls', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ controls: state.controls });
+    } catch {
+      res.status(500).json({ error: 'Kernel controls are unavailable.' });
+    }
+  });
+
+  router.post('/controls/stop-all', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Stop All reason is required.' });
+      return;
+    }
+    try {
+      res.json({ controls: await kernel.setStopAll(true, reason.trim()) });
+    } catch (error) {
+      res.status(409).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/controls/resume', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Resume reason is required.' });
+      return;
+    }
+    try {
+      res.json({ controls: await kernel.setStopAll(false, reason.trim()) });
+    } catch (error) {
+      res.status(409).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/recovery', async (_req, res) => {
+    try {
+      res.json(await kernel.recoverInterruptedTasks());
+    } catch (error) {
+      res.status(500).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.get('/release-proposals', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ releaseProposals: state.releaseProposals });
+    } catch {
+      res.status(500).json({ error: 'Release proposals are unavailable.' });
+    }
+  });
+
+  router.post('/release-proposals', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createReleaseProposal(req.body));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/release-proposals/:releaseId/activate', async (req, res) => {
+    try {
+      res.json(await kernel.activateReleaseProposal(req.params.releaseId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Release proposal not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/release-proposals/:releaseId/reject', async (req, res) => {
+    const reason = req.body?.reason as unknown;
+    if (typeof reason !== 'string' || !reason.trim()) {
+      res.status(400).json({ error: 'Release rejection reason is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.rejectRelease(req.params.releaseId, reason.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Release proposal not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.get('/benchmarks', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      res.json({ benchmarkRuns: state.benchmarkRuns });
+    } catch {
+      res.status(500).json({ error: 'Benchmark runs are unavailable.' });
+    }
+  });
+
+  router.post('/benchmarks', async (req, res) => {
+    const goalId = req.body?.goalId as unknown;
+    if (typeof goalId !== 'string' || !goalId.trim()) {
+      res.status(400).json({ error: 'Benchmark goalId is required.' });
+      return;
+    }
+    try {
+      res.status(201).json(await kernel.recordBenchmarkRun(goalId.trim()));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Goal not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.get('/runtime-report', async (_req, res) => {
+    try {
+      const state = await kernel.getState();
+      const coreModel = options.coreModelStatus ? await options.coreModelStatus() : undefined;
+      const secretVault = options.secretVaultStatus ? await options.secretVaultStatus() : undefined;
+      const accessControl = options.accessControlStatus ? options.accessControlStatus() : undefined;
+      res.json(buildRuntimeCapabilityReport({
+        providerStatuses: options.providerStatuses ?? [],
+        workerReport: kernel.getWorkers().report,
+        stopAll: state.controls.stopAll,
+        coreModel,
+        releaseSigningConfigured: Boolean(options.releaseSigningPublicKey?.trim()),
+        secretVault,
+        accessControl,
+      }));
+    } catch {
+      res.status(500).json({ error: 'Runtime capability report is unavailable.' });
+    }
+  });
+
+  return router;
+};
