@@ -121,6 +121,13 @@ or point `CORE_MODEL_PATH` at the file. Until then, the runtime capability repor
 
 ## Setup
 
+Clone the repository:
+
+```bash
+git clone https://github.com/A-Deb-byte/warrant.git
+cd warrant
+```
+
 Install dependencies:
 
 ```bash

@@ -63,3 +63,9 @@ Verified live on this Windows host: store → list → retrieve → env-inject �
 ## 8. Verification
 
 `npm run lint` clean; `npm test` 204/204 across 45 files; `npm run build` succeeds; `npm run verify-ledger` validates the live ledger. Dashboard confirmed rebranded with the four new framework identities and the two new capability-report rows (OS secret vault, Operator access control).
+
+## 9. Repository And Naming
+
+The project was placed under version control and pushed to `https://github.com/A-Deb-byte/warrant` (branch `main`). Secrets are excluded by `.gitignore` (`.env*`, `.agent-kernel/` including the DPAPI vault, `.claude/`, `.superpowers/`); only `.env.example` is tracked.
+
+**Naming note (unresolved):** the repository name `warrant` collides with `warrant-dev/warrant` — a 1.3k-star, Apache-2.0, Go authorization service (Google Zanzibar-style, associated with WorkOS). The collision is in an *adjacent* domain (both concern authorization/access decisions), so it is stronger than an incidental name clash. The current name is retained for now; if the project is ever made public-facing or commercial, renaming (e.g. to an evidence-forward identity like `provenance`, or a runtime-forward one like `agent-kernel`) should be reconsidered to avoid discoverability and brand confusion.
