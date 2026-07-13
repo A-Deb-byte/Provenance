@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { browserScope, browserWorker } from '../capabilities/testFixtures';
+import { createFileArtifactStore, hashArtifactContent } from './artifacts/artifactStore';
 import { createKernelService } from './kernel';
 import { writeKernelState } from './store';
 
@@ -340,6 +341,30 @@ describe('parallel goal execution', () => {
     await expect(kernel.stepGoalsInParallel([])).rejects.toThrow(/At least one goal id/);
     const results = await kernel.stepGoalsInParallel(['goal_missing']);
     expect(results[0].error).toBe('Goal not found.');
+  });
+});
+
+describe('artifact store integration', () => {
+  it('creates a hash-addressed artifact and records it in the ledger', async () => {
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      artifactStore: createFileArtifactStore(path.join(runtimeDir, 'artifacts')),
+    });
+    const meta = await kernel.createArtifact('staged form value');
+
+    expect(meta.contentHash).toBe(hashArtifactContent('staged form value'));
+    expect((await kernel.listArtifacts()).map((a) => a.id)).toContain(meta.id);
+    const events = await kernel.getEvents();
+    const created = events.find((e) => e.type === 'artifact.created');
+    expect(created?.payload.contentHash).toBe(meta.contentHash);
+    // The ledger records the hash, never the raw content.
+    expect(JSON.stringify(created)).not.toContain('staged form value');
+  });
+
+  it('refuses artifact creation when no store is configured', async () => {
+    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    await expect(kernel.createArtifact('x')).rejects.toThrow(/unavailable/);
   });
 });
 

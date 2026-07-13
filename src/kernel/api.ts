@@ -23,6 +23,7 @@ export interface KernelRouterOptions {
   readonly secretVaultStatus?: () => Promise<{ status: 'available' | 'unavailable'; reason: string }>;
   readonly accessControlStatus?: () => { status: 'available' | 'unavailable'; reason: string };
   readonly sandbox?: SandboxRunner;
+  readonly artifactStore?: import('./artifacts/artifactStore').ArtifactStore;
 }
 
 type ApprovalDecisionStatus = 'approved' | 'denied';
@@ -45,6 +46,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     actionWorkers: options.actionWorkers,
     observationAssessor: options.observationAssessor,
     sandbox: options.sandbox,
+    artifactStore: options.artifactStore,
   });
   const kernel = createKernelService(config);
   const router = express.Router();
@@ -326,6 +328,28 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
 
   router.get('/workers', (_req, res) => {
     res.json(kernel.getWorkers());
+  });
+
+  router.get('/artifacts', async (_req, res) => {
+    try {
+      res.json({ artifacts: await kernel.listArtifacts() });
+    } catch {
+      res.status(500).json({ error: 'Artifacts are unavailable.' });
+    }
+  });
+
+  router.post('/artifacts', async (req, res) => {
+    const content = req.body?.content as unknown;
+    if (typeof content !== 'string' || content.length === 0) {
+      res.status(400).json({ error: 'Artifact content must be a non-empty string.' });
+      return;
+    }
+    try {
+      res.status(201).json(await kernel.createArtifact(content));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.includes('unavailable') ? 503 : 400).json({ error: message });
+    }
   });
 
   router.get('/automations', async (_req, res) => {

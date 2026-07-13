@@ -21,6 +21,7 @@ import {
   WEB_INSPECT_WORKER_ID,
 } from './src/kernel/autonomy';
 import { createHostSandbox, DEFAULT_DOCKER_SANDBOX_CONFIG, detectDockerSandbox } from './src/kernel/sandbox/sandbox';
+import { createFileArtifactStore } from './src/kernel/artifacts/artifactStore';
 import { createBrowserWorker, createPlaywrightDriver } from './src/kernel/workers/browserWorker';
 import { createWebInspectWorker } from './src/kernel/workers/webInspectWorker';
 import { createProviderApi } from './src/providers/api';
@@ -77,6 +78,7 @@ const createServerContext = async () => {
 
   // The write-capable browser worker is registered only when both an origin
   // allowlist is set AND a real Playwright browser engine is installed.
+  const artifactStore = createFileArtifactStore(path.join(RUNTIME_DIR, 'artifacts'));
   const browserDriver = createPlaywrightDriver({
     userDataDir: path.join(RUNTIME_DIR, 'browser-profile'),
   });
@@ -91,7 +93,9 @@ const createServerContext = async () => {
     : baseRegistrations;
   const actionWorkers = {
     [WEB_INSPECT_WORKER_ID]: createWebInspectWorker(),
-    ...(browserWriteRegistration ? { [BROWSER_WRITE_WORKER_ID]: createBrowserWorker(browserDriver) } : {}),
+    ...(browserWriteRegistration
+      ? { [BROWSER_WRITE_WORKER_ID]: createBrowserWorker(browserDriver, (id) => artifactStore.resolve(id)) }
+      : {}),
   };
   if (browserWorkerAvailable) console.log('[Browser] Write-capable Playwright worker registered.');
 
@@ -117,6 +121,7 @@ const createServerContext = async () => {
     actionWorkers,
     observationAssessor: async (content) => (await coreModelPromise).assessObservation(content),
     sandbox,
+    artifactStore,
     secretVaultStatus: async () => {
       const status = await vault.getStatus();
       return { status: status.status, reason: status.reason };

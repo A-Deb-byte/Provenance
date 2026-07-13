@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { browserIntent } from '../../capabilities/testFixtures';
 import { buildBrowserWriteWorkerRegistration } from '../autonomy';
 import { isWorkerRegistration } from '../../capabilities/validators';
-import { BrowserDriver, createBrowserWorker } from './browserWorker';
+import { hashArtifactContent } from '../artifacts/artifactStore';
+import { ArtifactResolver, BrowserDriver, createBrowserWorker } from './browserWorker';
 
 const fakeDriver = (over: Partial<BrowserDriver> = {}): BrowserDriver => ({
   isAvailable: async () => true,
@@ -79,6 +80,51 @@ describe('browser write worker', () => {
 
     expect(result.status).toBe('failed');
     expect(result.errorCode).toBe('timeout');
+  });
+});
+
+describe('browser write worker: text entry', () => {
+  const typeIntent = (payloadHash: string) => browserIntent({
+    action: {
+      type: 'browser.type',
+      origin: 'https://example.com',
+      url: 'https://example.com/login',
+      selector: '#password',
+      payloadArtifactId: 'artifact_abc',
+      payloadHash,
+    },
+  } as never);
+
+  it('resolves the staged payload, verifies the hash, and types it without echoing the value', async () => {
+    const secret = 'my-staged-password';
+    const hash = hashArtifactContent(secret);
+    const perform = vi.fn(fakeDriver().perform);
+    const resolver: ArtifactResolver = async () => ({ content: secret, contentHash: hash });
+    const worker = createBrowserWorker(fakeDriver({ perform }), resolver);
+
+    const result = await worker.execute(typeIntent(hash), { timeoutMs: 10000 });
+
+    expect(result.status).toBe('succeeded');
+    expect(perform.mock.calls[0][0]).toMatchObject({ type: 'browser.type', selector: '#password', text: secret });
+    // The typed value must never appear in the summary/observation.
+    expect(result.summary).not.toContain(secret);
+    expect(result.summary).toContain('chars entered into #password');
+  });
+
+  it('refuses when the payload hash does not match the artifact', async () => {
+    const resolver: ArtifactResolver = async () => ({ content: 'actual', contentHash: hashArtifactContent('actual') });
+    const worker = createBrowserWorker(fakeDriver(), resolver);
+    const result = await worker.execute(typeIntent(hashArtifactContent('claimed-different')), { timeoutMs: 10000 });
+    expect(result.status).toBe('failed');
+    expect(result.errorCode).toBe('payload_hash_mismatch');
+  });
+
+  it('refuses when the artifact is missing or no store is configured', async () => {
+    const missing = createBrowserWorker(fakeDriver(), async () => undefined);
+    expect((await missing.execute(typeIntent('a'.repeat(64)), { timeoutMs: 10000 })).errorCode).toBe('artifact_not_found');
+
+    const noStore = createBrowserWorker(fakeDriver());
+    expect((await noStore.execute(typeIntent('a'.repeat(64)), { timeoutMs: 10000 })).errorCode).toBe('no_artifact_store');
   });
 });
 

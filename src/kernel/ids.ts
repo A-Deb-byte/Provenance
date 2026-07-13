@@ -14,7 +14,8 @@ export type IdPrefix =
   | 'intent'
   | 'release'
   | 'benchmark'
-  | 'obs';
+  | 'obs'
+  | 'artifact';
 
 export const createKernelId = (prefix: IdPrefix): string => {
   return `${prefix}_${crypto.randomUUID()}`;

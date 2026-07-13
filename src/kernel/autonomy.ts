@@ -117,10 +117,10 @@ export const buildBrowserWriteWorkerRegistration = (
     id: BROWSER_WRITE_WORKER_ID,
     family: 'browser',
     availability: 'available',
-    supportedActions: ['browser.inspect', 'browser.navigate', 'browser.click'],
+    supportedActions: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
     configuredScopes: [{
       family: 'browser',
-      operations: ['browser.inspect', 'browser.navigate', 'browser.click'],
+      operations: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
       origins,
       downloadRoots: [],
     }],

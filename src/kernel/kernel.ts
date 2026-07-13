@@ -74,6 +74,7 @@ import {
   SkillManifest,
   SkillPackage,
 } from './types';
+import type { ArtifactMetadata, ArtifactStore } from './artifacts/artifactStore';
 import type { SandboxRunner } from './sandbox/sandbox';
 import { runKernelCommand } from './workers/commandWorker';
 
@@ -121,6 +122,7 @@ export interface KernelServiceOptions {
   actionWorkers?: Record<string, KernelActionWorker>;
   observationAssessor?: KernelObservationAssessor;
   sandbox?: SandboxRunner;
+  artifactStore?: ArtifactStore;
 }
 
 export interface KernelStepResult {
@@ -1246,6 +1248,27 @@ export const createKernelService = (options: KernelServiceOptions) => {
     return rejected;
   });
 
+  const createArtifact = (content: string): Promise<ArtifactMetadata> => withMutation(async () => {
+    if (!options.artifactStore) throw new Error('Artifact store is unavailable.');
+    let state = await readConsistentState();
+    const artifact = await options.artifactStore.create(content);
+    const appended = await appendEvent(state, {
+      actor: 'user',
+      type: 'artifact.created',
+      entityId: artifact.id,
+      entityType: 'artifact',
+      payload: { artifactId: artifact.id, contentHash: artifact.contentHash, byteLength: artifact.byteLength },
+    });
+    state = appended.state;
+    await writeKernelState(options.runtimeDir, state);
+    return artifact;
+  });
+
+  const listArtifacts = (): Promise<ArtifactMetadata[]> => {
+    if (!options.artifactStore) return Promise.resolve([]);
+    return options.artifactStore.list();
+  };
+
   const recordBenchmarkRun = (goalId: string): Promise<BenchmarkRun> => withMutation(async () => {
     let state = await readConsistentState();
     const events = await readKernelEvents(options.runtimeDir);
@@ -1306,5 +1329,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     activateReleaseProposal,
     rejectRelease,
     recordBenchmarkRun,
+    createArtifact,
+    listArtifacts,
   };
 };

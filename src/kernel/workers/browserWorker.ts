@@ -9,18 +9,23 @@ import type { ActionIntent, BrowserAction } from '../../capabilities/types';
  * Every action still flows through the kernel's ActionIntent -> policy ->
  * grant -> observation -> ledger pipeline; this module only performs the
  * mechanical action and returns the resulting page text as untrusted content.
- * Text entry and downloads are intentionally out of scope until an artifact
- * store exists to hold typed payloads (so untrusted content cannot inject
- * keystrokes).
+ * Text entry (browser.type) resolves its payload from the hash-addressed
+ * artifact store: the value typed must match the artifact whose hash the intent
+ * declares, so untrusted page content can never inject keystrokes. Downloads
+ * remain out of scope.
  */
 
 export interface BrowserActionRequest {
-  type: 'browser.navigate' | 'browser.click';
+  type: 'browser.navigate' | 'browser.click' | 'browser.type';
   origin: string;
   url: string;
   selector?: string;
+  text?: string;
   timeoutMs: number;
 }
+
+/** Resolves a staged payload by artifact id, returning its content + hash. */
+export type ArtifactResolver = (id: string) => Promise<{ content: string; contentHash: string } | undefined>;
 
 export interface BrowserActionResult {
   status: 'succeeded' | 'failed';
@@ -46,60 +51,69 @@ export interface BrowserWorkerResult {
 
 const MAX_CONTENT_CHARS = 64 * 1024;
 
-const isSupportedAction = (action: BrowserAction): action is Extract<BrowserAction, { type: 'browser.navigate' | 'browser.click' }> => (
-  action.type === 'browser.navigate' || action.type === 'browser.click'
+type WriteAction = Extract<BrowserAction, { type: 'browser.navigate' | 'browser.click' | 'browser.type' }>;
+
+const isWriteAction = (action: BrowserAction): action is WriteAction => (
+  action.type === 'browser.navigate' || action.type === 'browser.click' || action.type === 'browser.type'
 );
 
-export const createBrowserWorker = (driver: BrowserDriver) => ({
+const fail = (summary: string, sourceRef: string, errorCode: string): BrowserWorkerResult => ({
+  status: 'failed', summary, sourceRef, errorCode,
+});
+
+export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: ArtifactResolver) => ({
   execute: async (
     intent: ActionIntent,
     options: { timeoutMs: number },
   ): Promise<BrowserWorkerResult> => {
-    const action = intent.action;
-    if (!isSupportedAction(action as BrowserAction)) {
-      return {
-        status: 'failed',
-        summary: 'Browser worker performs only navigate and click actions.',
-        sourceRef: 'about:invalid',
-        errorCode: 'unsupported_action',
-      };
+    const action = intent.action as BrowserAction;
+    if (!isWriteAction(action)) {
+      return fail('Browser worker performs only navigate, click, and type actions.', 'about:invalid', 'unsupported_action');
     }
-    const browserAction = action as Extract<BrowserAction, { type: 'browser.navigate' | 'browser.click' }>;
 
     // Defense in depth: the URL must belong to the intent origin. The kernel
     // scope check already enforces this, but the worker re-verifies.
     try {
-      if (new URL(browserAction.url).origin !== browserAction.origin) {
-        return {
-          status: 'failed',
-          summary: 'Requested URL is outside the intent origin.',
-          sourceRef: browserAction.url,
-          errorCode: 'origin_mismatch',
-        };
+      if (new URL(action.url).origin !== action.origin) {
+        return fail('Requested URL is outside the intent origin.', action.url, 'origin_mismatch');
       }
     } catch {
-      return {
-        status: 'failed',
-        summary: 'Requested URL could not be parsed.',
-        sourceRef: browserAction.url,
-        errorCode: 'origin_mismatch',
-      };
+      return fail('Requested URL could not be parsed.', action.url, 'origin_mismatch');
+    }
+
+    // Text entry resolves its value from the hash-addressed artifact store; the
+    // typed value must match the hash the intent declares.
+    let text: string | undefined;
+    if (action.type === 'browser.type') {
+      if (!artifactResolver) return fail('No artifact store is configured for text entry.', action.url, 'no_artifact_store');
+      const resolved = await artifactResolver(action.payloadArtifactId);
+      if (!resolved) return fail('Typed-payload artifact was not found.', action.url, 'artifact_not_found');
+      if (resolved.contentHash !== action.payloadHash) {
+        return fail('Typed-payload hash does not match the artifact.', action.url, 'payload_hash_mismatch');
+      }
+      text = resolved.content;
     }
 
     const result = await driver.perform({
-      type: browserAction.type,
-      origin: browserAction.origin,
-      url: browserAction.url,
-      selector: browserAction.type === 'browser.click' ? browserAction.selector : undefined,
+      type: action.type,
+      origin: action.origin,
+      url: action.url,
+      selector: action.type === 'browser.navigate' ? undefined : action.selector,
+      text,
       timeoutMs: Math.min(options.timeoutMs, 30_000),
     });
 
+    // The typed value itself is never echoed into the summary (it may be
+    // sensitive); only its length is recorded.
+    const detail = action.type === 'browser.type' && text !== undefined
+      ? ` (${text.length} chars entered into ${action.selector})`
+      : ` (${result.content.length} chars observed)`;
     return {
       status: result.status,
       summary: result.status === 'succeeded'
-        ? `${browserAction.type} on ${browserAction.origin} succeeded (${result.content.length} chars observed).`
-        : `${browserAction.type} on ${browserAction.origin} failed.`,
-      sourceRef: result.finalUrl || browserAction.url,
+        ? `${action.type} on ${action.origin} succeeded${detail}.`
+        : `${action.type} on ${action.origin} failed.`,
+      sourceRef: result.finalUrl || action.url,
       content: result.content.slice(0, MAX_CONTENT_CHARS),
       errorCode: result.errorCode,
     };
@@ -111,6 +125,7 @@ export const createBrowserWorker = (driver: BrowserDriver) => ({
 interface PlaywrightPage {
   goto(url: string, options: { timeout: number; waitUntil: string }): Promise<unknown>;
   click(selector: string, options: { timeout: number }): Promise<void>;
+  fill(selector: string, value: string, options: { timeout: number }): Promise<void>;
   url(): string;
   innerText(selector: string, options: { timeout: number }): Promise<string>;
 }
@@ -176,7 +191,11 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
           if (page.url() !== request.url) {
             await page.goto(request.url, { timeout: request.timeoutMs, waitUntil: 'domcontentloaded' });
           }
-          await page.click(request.selector ?? '', { timeout: request.timeoutMs });
+          if (request.type === 'browser.type') {
+            await page.fill(request.selector ?? '', request.text ?? '', { timeout: request.timeoutMs });
+          } else {
+            await page.click(request.selector ?? '', { timeout: request.timeoutMs });
+          }
         }
         const content = await page.innerText('body', { timeout: request.timeoutMs }).catch(() => '');
         return { status: 'succeeded', finalUrl: page.url(), content };

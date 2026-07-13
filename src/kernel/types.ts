@@ -213,7 +213,7 @@ export interface KernelEvent {
   actor: KernelActor;
   type: string;
   entityId: string;
-  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark';
+  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark' | 'artifact';
   payload: Record<string, unknown>;
   previousHash: string | null;
   hash: string;
