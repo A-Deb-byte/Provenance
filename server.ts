@@ -119,7 +119,13 @@ const createServerContext = async () => {
     releaseSigningPublicKey: process.env.RELEASE_SIGNING_PUBLIC_KEY,
     workerRegistrations,
     actionWorkers,
-    observationAssessor: async (content) => (await coreModelPromise).assessObservation(content),
+    // Live testing showed MiniCPM-1B over-flags benign content as injection,
+    // so the default observation assessor is the deterministic heuristic
+    // (the kernel's built-in floor). The model path is opt-in until a more
+    // capable local model is available.
+    observationAssessor: process.env.CORE_MODEL_INJECTION_ASSESSMENT?.trim()
+      ? async (content) => (await coreModelPromise).assessObservation(content)
+      : undefined,
     sandbox,
     artifactStore,
     secretVaultStatus: async () => {
