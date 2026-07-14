@@ -4,7 +4,7 @@ export type KernelActor = 'user' | 'kernel' | 'worker' | 'provider' | 'system';
 
 export type GoalStatus = 'drafted' | 'active' | 'blocked' | 'completed' | 'failed' | 'cancelled';
 export type TaskStatus = 'pending' | 'ready' | 'running' | 'awaiting_approval' | 'passed' | 'failed' | 'blocked' | 'denied' | 'cancelled';
-export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled';
+export type ApprovalStatus = 'pending' | 'approved' | 'consumed' | 'denied' | 'expired' | 'cancelled';
 export type PolicyDecisionKind = 'allow' | 'deny' | 'approval_required';
 export type CapabilityFamily = 'state.read' | 'state.write' | 'command.run' | 'provider.call' | 'approval.decide';
 
@@ -131,6 +131,9 @@ export interface SkillEvaluation {
 export interface SkillActivation {
   id: string;
   skillId: string;
+  evaluationId: string;
+  suiteHash: string;
+  replayCaseIds: string[];
   status: 'canary' | 'active' | 'rolled_back' | 'failed';
   maxRuns: number;
   usedRuns: number;

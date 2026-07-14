@@ -104,4 +104,20 @@ describe('provider telemetry and routing', () => {
     expect(() => router.plan({ ...request, requiredCapabilities: ['json_schema'] }, { mode: 'automatic' }))
       .toThrow('No configured provider satisfies');
   });
+
+  it('reports sanitized provider failure codes when every route fails', async () => {
+    const failing = adapter('openrouter', ['text']);
+    const router = new ProviderRouter([{
+      ...failing,
+      generate: async () => {
+        throw new ProviderError('rate_limited', 'Provider rate limit exceeded.', {
+          provider: 'openrouter', status: 429, retryable: true,
+        });
+      },
+    }]);
+    const plan = router.plan(request, { mode: 'pinned', provider: 'openrouter' });
+
+    await expect(router.execute(request, plan, new AbortController().signal))
+      .rejects.toThrow('openrouter:rate_limited(429)');
+  });
 });

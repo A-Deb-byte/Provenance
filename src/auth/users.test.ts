@@ -53,7 +53,7 @@ describe('session tokens', () => {
   const secret = 'session-signing-secret';
 
   it('round-trips claims and rejects tampering, expiry, and wrong secret', () => {
-    const token = issueSession({ userId: 'user_1', username: 'alice', role: 'operator' }, 60_000, secret);
+    const token = issueSession({ userId: 'user_1', username: 'alice', role: 'operator', sessionVersion: 0 }, 60_000, secret);
     const claims = verifySession(token, secret);
     expect(claims?.userId).toBe('user_1');
     expect(claims?.role).toBe('operator');
@@ -61,12 +61,26 @@ describe('session tokens', () => {
     expect(verifySession(token, 'other-secret')).toBeUndefined();
     expect(verifySession(`${token}x`, secret)).toBeUndefined();
 
-    const expired = issueSession({ userId: 'user_1', username: 'alice', role: 'operator' }, -1, secret);
+    const expired = issueSession({ userId: 'user_1', username: 'alice', role: 'operator', sessionVersion: 0 }, -1, secret);
     expect(verifySession(expired, secret)).toBeUndefined();
   });
 
   it('resolveSessionSecret uses the configured value or generates one', () => {
     expect(resolveSessionSecret('configured')).toBe('configured');
     expect(resolveSessionSecret(undefined)).toHaveLength(64);
+  });
+
+  it('persists session revocation and protects the final administrator', async () => {
+    const store = await createUserStore(usersFile());
+    const admin = await store.create({ username: 'admin', password: 'adminpassword', role: 'admin' });
+    expect(store.sessionVersion(admin.id)).toBe(0);
+    expect(await store.revokeSessions(admin.id)).toBe(true);
+    expect(store.sessionVersion(admin.id)).toBe(1);
+    await expect(store.remove(admin.id)).rejects.toThrow('final administrator');
+
+    const secondAdmin = await store.create({ username: 'admin2', password: 'adminpassword2', role: 'admin' });
+    expect(await store.remove(admin.id)).toBe(true);
+    expect(store.findById(admin.id)).toBeUndefined();
+    expect(store.findById(secondAdmin.id)?.role).toBe('admin');
   });
 });

@@ -7,6 +7,7 @@ import {
   isMemoryItemArray,
   isUserProfile,
   readJsonFromStorage,
+  purgeLegacyAuthoritativeStorage,
   writeJsonToStorage,
 } from './persistence';
 
@@ -76,5 +77,23 @@ describe('persistence guards', () => {
   it('writes JSON to storage', () => {
     writeJsonToStorage('key', { value: 1 });
     expect(localStorage.getItem('key')).toBe('{"value":1}');
+  });
+
+  it('purges obsolete browser-authoritative memory, skill, profile, and provider state', () => {
+    localStorage.setItem('agent_kb_memories_v2', '[]');
+    localStorage.setItem('agent_kb_profile_v2', '{}');
+    localStorage.setItem('agent_autonomous_skills', '[]');
+    localStorage.setItem('agent_provider_labels_v1', '[]');
+    localStorage.setItem('agent_skill_draft_activities', '[]');
+    localStorage.setItem('agent_kb_sessions_v2', 'presentation');
+
+    purgeLegacyAuthoritativeStorage();
+
+    expect(localStorage.getItem('agent_kb_memories_v2')).toBeNull();
+    expect(localStorage.getItem('agent_kb_profile_v2')).toBeNull();
+    expect(localStorage.getItem('agent_autonomous_skills')).toBeNull();
+    expect(localStorage.getItem('agent_provider_labels_v1')).toBeNull();
+    expect(localStorage.getItem('agent_skill_draft_activities')).toBeNull();
+    expect(localStorage.getItem('agent_kb_sessions_v2')).toBe('presentation');
   });
 });

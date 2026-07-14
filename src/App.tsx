@@ -4,10 +4,9 @@
  */
 
 import React, { useState, useEffect, useRef } from 'react';
-import { AgentFramework, MemoryItem, UserProfile, ChatSession, Message, ResearchMutation } from './types';
+import { AgentFramework, MemoryItem, ChatSession, Message, ResearchMutation } from './types';
 import type { KernelMemoryRecord, MemoryKind } from './kernel/types';
 import { 
-  INITIAL_MEMORIES, 
   INITIAL_PROFILE, 
   INITIAL_SESSIONS, 
   EXAMPLE_SUGGESTIONS 
@@ -16,14 +15,15 @@ import { addAssistantMessageToSession, addUserMessageToSession } from './lib/cha
 import {
   isAgentFramework,
   isChatSessionArray,
-  isMemoryItemArray,
-  isUserProfile,
   readJsonFromStorage,
   readStringFromStorage,
   STORAGE_KEYS,
+  purgeLegacyAuthoritativeStorage,
   writeJsonToStorage,
 } from './lib/persistence';
+import { authenticatedFetch } from './lib/auth';
 import MemoryDashboard from './components/MemoryDashboard';
+import { AuthPanel } from './components/AuthPanel';
 import { KernelPanel } from './components/KernelPanel';
 import { LearningPanel } from './components/LearningPanel';
 import { ProviderPanel } from './components/ProviderPanel';
@@ -49,8 +49,13 @@ const categoryToMemoryKind = (category: unknown): MemoryKind => {
   return 'semantic';
 };
 
+const sha256Text = async (value: string): Promise<string> => {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+};
+
 const fetchPromotedKernelMemories = async (): Promise<MemoryItem[]> => {
-  const response = await fetch('/api/kernel/memories?status=promoted');
+  const response = await authenticatedFetch('/api/kernel/memories?status=promoted');
   if (!response.ok) throw new Error('Promoted kernel memory is unavailable.');
   const payload: unknown = await response.json();
   if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as { memories?: unknown }).memories)) {
@@ -67,7 +72,7 @@ const fetchPromotedKernelMemories = async (): Promise<MemoryItem[]> => {
 };
 
 export default function App() {
-  // State loaded from localStorage with default fallbacks
+  // Conversation sessions are presentation state. Kernel memory is always read from the server.
   const defaultSessions = () => {
     return INITIAL_SESSIONS.map(s => {
       const activeLeaf = s.messages[s.messages.length - 1]?.id || '';
@@ -88,13 +93,8 @@ export default function App() {
     readJsonFromStorage(STORAGE_KEYS.sessions, defaultSessions(), isChatSessionArray)
   );
 
-  const [memories, setMemories] = useState<MemoryItem[]>(() =>
-    readJsonFromStorage(STORAGE_KEYS.memories, INITIAL_MEMORIES, isMemoryItemArray)
-  );
-
-  const [profile, setProfile] = useState<UserProfile>(() =>
-    readJsonFromStorage(STORAGE_KEYS.profile, INITIAL_PROFILE, isUserProfile)
-  );
+  const [memories, setMemories] = useState<MemoryItem[]>([]);
+  const profile = INITIAL_PROFILE;
 
   const [activeSessionId, setActiveSessionId] = useState<string>(() =>
     readStringFromStorage(STORAGE_KEYS.activeSessionId, sessions[0]?.id || '')
@@ -131,23 +131,19 @@ export default function App() {
   };
 
   useEffect(() => {
+    purgeLegacyAuthoritativeStorage();
+  }, []);
+
+  useEffect(() => {
     if (activePanelTab === 'chat') {
       scrollToBottom();
     }
   }, [sessions, activeSessionId, activePanelTab]);
 
-  // Handle saving configurations back to local client bases
+  // Persist only local conversation presentation preferences.
   useEffect(() => {
     writeJsonToStorage(STORAGE_KEYS.sessions, sessions);
   }, [sessions]);
-
-  useEffect(() => {
-    writeJsonToStorage(STORAGE_KEYS.memories, memories);
-  }, [memories]);
-
-  useEffect(() => {
-    writeJsonToStorage(STORAGE_KEYS.profile, profile);
-  }, [profile]);
 
   useEffect(() => {
     writeJsonToStorage(STORAGE_KEYS.framework, agentFramework);
@@ -156,6 +152,24 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.activeSessionId, activeSessionId);
   }, [activeSessionId]);
+
+  useEffect(() => {
+    let disposed = false;
+    const loadPromotedMemory = async () => {
+      try {
+        const promoted = await fetchPromotedKernelMemories();
+        if (!disposed) setMemories(promoted);
+      } catch {
+        if (!disposed) setMemories([]);
+      }
+    };
+    void loadPromotedMemory();
+    const interval = window.setInterval(() => void loadPromotedMemory(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   // Retrieve current active session
   const activeSessionIndex = Math.max(0, sessions.findIndex(s => s.id === activeSessionId));
@@ -167,32 +181,6 @@ export default function App() {
     setTimeout(() => {
       setSystemAlert(null);
     }, 4500);
-  };
-
-  // Trigger manual memory block subtraction / wipe
-  const handleDeleteMemory = (id: string) => {
-    setMemories(memories.filter(m => m.id !== id));
-    showAlert("Wiped memory fragment from local indices", "warning");
-  };
-
-  // Trigger manual memory block addition
-  const handleAddMemory = (content: string, category: MemoryItem['category'], importance: number) => {
-    const newMem: MemoryItem = {
-      id: `mem_${Date.now()}`,
-      content,
-      category,
-      source: "Explicit User Input Core Override",
-      createdAt: new Date().toISOString(),
-      importance
-    };
-    setMemories([newMem, ...memories]);
-    showAlert("Primal fragment recorded and indexed", "success");
-  };
-
-  // Trigger manual inline modification of a memory
-  const handleEditMemory = (id: string, updatedContent: string, importance: number) => {
-    setMemories(memories.map(m => m.id === id ? { ...m, content: updatedContent, importance } : m));
-    showAlert("Fragment block refined.", "success");
   };
 
   /**
@@ -413,7 +401,7 @@ export default function App() {
 
     try {
       const chatMemories = await fetchPromotedKernelMemories();
-      const response = await fetch('/api/chat', {
+      const response = await authenticatedFetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -455,7 +443,7 @@ export default function App() {
 
       // Perform background fact/priority extraction log
       setIsConsolidating(true);
-      const extractRes = await fetch('/api/extract', {
+      const extractRes = await authenticatedFetch('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -468,13 +456,26 @@ export default function App() {
       if (extractRes.ok) {
         const extraction = await extractRes.json();
         let createdCandidates = 0;
-        if (extraction.newMemories && extraction.newMemories.length > 0) {
+        if (
+          extraction.newMemories &&
+          extraction.newMemories.length > 0 &&
+          typeof extraction.evidenceEventId === 'string'
+        ) {
           const contradictionIds = Array.isArray(extraction.deletedMemoryIds)
             ? extraction.deletedMemoryIds.filter((id: unknown) => typeof id === 'string' && chatMemories.some((memory) => memory.id === id))
             : [];
-          const candidateResponses = await Promise.all(extraction.newMemories.map((raw: any, idx: number) => {
+          const userSources = messagesForApi
+            .filter((message) => message.role === 'user')
+            .map((message) => message.content);
+          const groundedMemories = extraction.newMemories.filter((raw: any) => (
+            typeof raw.sourceSnippet === 'string' &&
+            raw.sourceSnippet.trim().length > 0 &&
+            userSources.some((source) => source.includes(raw.sourceSnippet))
+          ));
+          const candidateResponses = await Promise.all(groundedMemories.map(async (raw: any) => {
             const importance = Number.isFinite(raw.importance) ? Number(raw.importance) : 3;
-            return fetch('/api/kernel/memories/candidates', {
+            const sourceSnippet = raw.sourceSnippet.trim();
+            return authenticatedFetch('/api/kernel/memories/candidates', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -486,10 +487,12 @@ export default function App() {
                 retention: { kind: 'durable' },
                 provenance: {
                   sourceType: 'provider_candidate',
-                  sourceId: `extract_${assistantMsgId}_${idx}`,
+                  sourceId: extraction.evidenceEventId,
                   actor: 'provider',
                   observedAt: new Date().toISOString(),
+                  excerptHash: await sha256Text(sourceSnippet),
                 },
+                evidenceRefs: [{ eventId: extraction.evidenceEventId }],
                 contradictionIds,
                 supersedesIds: [],
               }),
@@ -521,7 +524,7 @@ export default function App() {
 
     try {
       const contextMemories = await fetchPromotedKernelMemories();
-      const res = await fetch('/api/mutate', {
+      const res = await authenticatedFetch('/api/mutate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -545,6 +548,7 @@ export default function App() {
         novelInsight: data.novelInsight || "Insight calculation error",
         mathematicalBounds: data.mathematicalBounds || "O(1) Bounds undefined",
         suggestedActionItems: data.suggestedActionItems || [],
+        evidenceEventId: typeof data.evidenceEventId === 'string' ? data.evidenceEventId : '',
         createdAt: new Date().toISOString()
       };
 
@@ -558,31 +562,48 @@ export default function App() {
     }
   };
 
-  const commitMutationToMemory = () => {
+  const commitMutationToMemory = async () => {
     if (!activeMutation) return;
-    
+    if (!activeMutation.evidenceEventId) {
+      showAlert('Mutation has no provider ledger evidence and cannot be submitted.', 'error');
+      return;
+    }
+
     const content = `[Math Mutation - ${activeMutation.title}]: ${activeMutation.novelInsight}. Bounds: ${activeMutation.mathematicalBounds}`;
-    const newMem: MemoryItem = {
-      id: `mem_mut_${Date.now()}`,
-      content: content,
-      category: 'technical',
-      source: `Bred via Research Mutator under '${activeMutation.operator}' operator`,
-      createdAt: new Date().toISOString(),
-      importance: 5
-    };
-
-    setMemories([newMem, ...memories]);
-    showAlert("Mutation committed to local persistence core!", "success");
-  };
-
-  const handleUpdateBio = (newBio: string) => {
-    setProfile({ ...profile, bio: newBio, lastSummaryUpdate: new Date().toISOString() });
-    showAlert("Overarching biographical facts updated.", "success");
+    try {
+      const response = await authenticatedFetch('/api/kernel/memories/candidates', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          kind: 'semantic',
+          content,
+          confidence: 0.8,
+          scope: { kind: 'global' },
+          sensitivity: 'internal',
+          retention: { kind: 'durable' },
+          provenance: {
+            sourceType: 'provider_candidate',
+            sourceId: activeMutation.evidenceEventId,
+            actor: 'provider',
+            observedAt: new Date().toISOString(),
+          },
+          evidenceRefs: [{ eventId: activeMutation.evidenceEventId }],
+          contradictionIds: [],
+          supersedesIds: [],
+        }),
+      });
+      if (!response.ok) throw new Error(await response.text() || 'Candidate submission failed.');
+      showAlert('Mutation submitted as a kernel memory candidate for evidence review.', 'success');
+    } catch (error) {
+      showAlert(`Candidate submission failed: ${error instanceof Error ? error.message : 'unknown error'}`, 'error');
+    }
   };
 
   const handleRestoreDefaults = () => {
-    if (window.confirm("Verify clear all local system partitions? This wipes experimental branches.")) {
-      localStorage.clear();
+    if (window.confirm("Reset the local conversation workspace? Kernel state and authentication are preserved.")) {
+      localStorage.removeItem(STORAGE_KEYS.sessions);
+      localStorage.removeItem(STORAGE_KEYS.activeSessionId);
+      localStorage.removeItem(STORAGE_KEYS.framework);
       setSessions(INITIAL_SESSIONS.map(s => {
         let activeLeaf = s.messages[s.messages.length - 1]?.id || '';
         return {
@@ -591,12 +612,10 @@ export default function App() {
           activeLeafId: activeLeaf
         };
       }));
-      setMemories(INITIAL_MEMORIES);
-      setProfile(INITIAL_PROFILE);
       setActiveSessionId(INITIAL_SESSIONS[0].id);
       setTargetBranchParentId(null);
       setActiveMutation(null);
-      showAlert("System state reverted to factory baseline", "success");
+      showAlert("Local conversation workspace reset. Kernel state was not changed.", "success");
     }
   };
 
@@ -698,18 +717,13 @@ export default function App() {
             <div className="flex justify-between items-center mb-2">
               <span className="text-[9px] uppercase font-mono text-slate-500 tracking-wider flex items-center gap-1 font-bold">
                 <HardDrive size={10} className="text-teal-400" />
-                <span>ACTIVE MEMORY RECALL</span>
+                <span>PROMOTED KERNEL MEMORY</span>
               </span>
               <span className="text-[9px] font-mono text-teal-400">
-                {memories.length} / 50
+                {memories.length} active
               </span>
             </div>
-            <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-              <div 
-                className="bg-teal-500 h-full transition-all duration-500" 
-                style={{ width: `${Math.min(100, (memories.length / 50) * 100)}%` }}
-              />
-            </div>
+            <p className="text-[9px] font-mono text-slate-600">Read-only projection from the kernel API</p>
           </div>
 
           <button
@@ -717,7 +731,7 @@ export default function App() {
             className="w-full flex items-center justify-center gap-1.5 text-[9.5px] uppercase font-mono tracking-widest py-1.5 bg-slate-900 border border-slate-800 text-rose-400 hover:bg-rose-950/10 hover:border-rose-900/60 transition-colors rounded-md cursor-pointer"
           >
             <RefreshCw size={11} className="shrink-0" />
-            Wipe Partition
+            Reset Local Chat
           </button>
         </div>
       </aside>
@@ -782,6 +796,7 @@ export default function App() {
             {/* Thread timeline scroll Area */}
             <div className="flex-1 overflow-y-auto p-6 space-y-4">
               <div className="max-w-4xl mx-auto space-y-4">
+                <AuthPanel />
                 <KernelPanel />
                 <LearningPanel />
                 <ProviderPanel />
@@ -1000,10 +1015,10 @@ export default function App() {
               <div className="text-[9px] text-center font-mono text-slate-650 mt-2 flex justify-center gap-4">
                 <span className="flex items-center gap-1 select-none">
                   <ShieldCheck size={11} className="text-teal-600" />
-                  Browser local storage
+                  Local chat presentation only
                 </span>
                 <span>•</span>
-                <span>Gemini extraction when server key is configured</span>
+                <span>Provider-routed extraction with kernel evidence</span>
               </div>
             </div>
 
@@ -1178,11 +1193,11 @@ export default function App() {
                       </div>
                       
                       <button
-                        onClick={commitMutationToMemory}
+                        onClick={() => void commitMutationToMemory()}
                         className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-semibold flex items-center gap-1 select-none transition cursor-pointer"
                       >
                         <HardDrive size={12} />
-                        Commit to Core
+                        Submit Candidate
                       </button>
                     </div>
 
@@ -1245,10 +1260,6 @@ export default function App() {
         <MemoryDashboard
           memories={memories}
           profile={profile}
-          onAddMemory={handleAddMemory}
-          onDeleteMemory={handleDeleteMemory}
-          onEditMemory={handleEditMemory}
-          onUpdateBio={handleUpdateBio}
           isConsolidating={isConsolidating}
           agentFramework={agentFramework}
           onSetAgentFramework={setAgentFramework}

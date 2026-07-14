@@ -1,6 +1,14 @@
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { consumeCapabilityGrant, createCapabilityGrant } from '../capabilities/grants';
+import { createCapabilityGrant } from '../capabilities/grants';
+import {
+  authorizeCapabilityDispatch,
+  type CapabilityDispatchAuthorization,
+} from '../capabilities/dispatch';
+import {
+  createMemoryCapabilityGrantStore,
+  type CapabilityGrantStore,
+} from '../capabilities/grantStore';
 import { analyzePromptInjection, createUntrustedObservation } from '../capabilities/injection';
 import { CapabilityPolicyDecision, decideActionPolicy } from '../capabilities/policy';
 import { createWorkerRegistry } from '../capabilities/registry';
@@ -18,7 +26,6 @@ import {
   buildAutomationIntent,
   buildBenchmarkRun,
   buildReleaseProposal,
-  decideReleaseActivation,
   defaultWorkerRegistrations,
   isAutomationContractInput,
   isReleaseProposalInput,
@@ -44,6 +51,7 @@ import {
   activateSkillCanary,
   applySkillEvaluation,
   createSkillCandidate,
+  getKernelCanaryCase,
   getSkillActivationLedgerMetadata,
   getSkillPackageLedgerMetadata,
   promoteSkill,
@@ -52,7 +60,17 @@ import {
 } from './skills/foundry';
 import { runPureTransform, stableHash } from './skills/runtime';
 import { synthesizePureTransform } from './skills/synthesizer';
-import { readKernelState, writeKernelState } from './store';
+import {
+  clearPendingKernelSnapshot,
+  hashKernelStateContent,
+  PendingKernelSnapshot,
+  readKernelRecoveryState,
+  readKernelState,
+  readPendingKernelSnapshot,
+  writeKernelRecoveryState,
+  writeKernelState,
+  writePendingKernelSnapshot,
+} from './store';
 import { buildInitialTaskGraph, getNextReadyTask, markTaskStatus } from './taskGraph';
 import {
   ApprovalStatus,
@@ -63,6 +81,7 @@ import {
   KernelCommandRequest,
   KernelControls,
   KernelEvidence,
+  KernelEvent,
   KernelMemoryRecord,
   KernelState,
   KernelTask,
@@ -76,6 +95,7 @@ import {
 } from './types';
 import type { ArtifactMetadata, ArtifactStore } from './artifacts/artifactStore';
 import type { SandboxRunner } from './sandbox/sandbox';
+import type { createReleaseLifecycle } from './releases/lifecycle';
 import { runKernelCommand } from './workers/commandWorker';
 
 export interface KernelActionWorkerResult {
@@ -87,7 +107,10 @@ export interface KernelActionWorkerResult {
 }
 
 export interface KernelActionWorker {
-  execute(intent: ActionIntent, options: { timeoutMs: number }): Promise<KernelActionWorkerResult>;
+  execute(intent: ActionIntent, options: {
+    timeoutMs: number;
+    authorization?: CapabilityDispatchAuthorization;
+  }): Promise<KernelActionWorkerResult>;
 }
 
 /** May only tighten: heuristic assessment stays the floor on any failure. */
@@ -98,6 +121,7 @@ export type KernelObservationAssessor = (content: string) => Promise<{
 
 export interface AutomationRunOutcome {
   decision: CapabilityPolicyDecision;
+  approvalId?: string;
   dispatch?: {
     status: 'succeeded' | 'failed';
     summary: string;
@@ -123,6 +147,8 @@ export interface KernelServiceOptions {
   observationAssessor?: KernelObservationAssessor;
   sandbox?: SandboxRunner;
   artifactStore?: ArtifactStore;
+  capabilityGrantStore?: CapabilityGrantStore;
+  releaseLifecycle?: ReturnType<typeof createReleaseLifecycle>;
 }
 
 export interface KernelStepResult {
@@ -148,8 +174,71 @@ const isWithinRoot = (root: string, candidate: string): boolean => {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
 };
 
+const SNAPSHOT_COMMITTED_EVENT_TYPE = 'system.snapshot_committed';
+const SNAPSHOT_PREPARED_EVENT_TYPE = 'system.snapshot_prepared';
+
+const isSnapshotCommitEvent = (event: KernelEvent): boolean => (
+  event.type === SNAPSHOT_COMMITTED_EVENT_TYPE &&
+  event.entityType === 'system' &&
+  event.entityId === 'kernel-state'
+);
+
+const isSnapshotPreparedEvent = (event: KernelEvent): boolean => (
+  event.type === SNAPSHOT_PREPARED_EVENT_TYPE &&
+  event.entityType === 'system' &&
+  event.entityId === 'kernel-state'
+);
+
+const eventSnapshotHash = (event: KernelEvent): string | null => (
+  (isSnapshotCommitEvent(event) || isSnapshotPreparedEvent(event)) && typeof event.payload.stateHash === 'string'
+    ? event.payload.stateHash
+    : null
+);
+
+const sourceBackedMemoryEventTypes = new Set([
+  'memory.source_attested',
+  'goal.created',
+  'task.passed',
+  'provider.call.completed',
+  'automation.run_completed',
+  'artifact.created',
+  'benchmark.recorded',
+]);
+
+const isIndependentMemoryEvidence = (
+  event: KernelEvent,
+  record: KernelMemoryRecord,
+  reference: MemoryEvidenceRef,
+): boolean => {
+  if (
+    event.entityId === record.id ||
+    event.type === 'memory.candidate_created' ||
+    !sourceBackedMemoryEventTypes.has(event.type)
+  ) {
+    return false;
+  }
+  if (reference.artifactId) {
+    return event.entityId === reference.artifactId || event.payload.artifactId === reference.artifactId;
+  }
+  if (record.provenance.sourceType === 'provider_candidate') {
+    return event.type === 'provider.call.completed' && (
+      event.id === record.provenance.sourceId || event.entityId === record.provenance.sourceId
+    );
+  }
+  if (record.provenance.sourceType === 'kernel_event') {
+    return event.id === record.provenance.sourceId;
+  }
+  if (event.type === 'memory.source_attested') {
+    return event.payload.sourceType === record.provenance.sourceType &&
+      event.payload.sourceId === record.provenance.sourceId &&
+      event.payload.contentHash === record.contentHash;
+  }
+  return true;
+};
+
 export const createKernelService = (options: KernelServiceOptions) => {
   const workerRegistry = createWorkerRegistry(options.workerRegistrations ?? defaultWorkerRegistrations());
+  const capabilityGrantStore = options.capabilityGrantStore ?? createMemoryCapabilityGrantStore();
   let mutationQueue: Promise<void> = Promise.resolve();
 
   const withMutation = <T>(work: () => Promise<T>): Promise<T> => {
@@ -163,6 +252,80 @@ export const createKernelService = (options: KernelServiceOptions) => {
     return { event, state: { ...state, lastEventHash: event.hash } };
   };
 
+  const finishPendingSnapshot = async (
+    pending: PendingKernelSnapshot,
+    committedEvent?: KernelEvent,
+  ): Promise<KernelState> => {
+    const events = await readKernelEvents(options.runtimeDir);
+    const prepared = events.find((candidate) => candidate.hash === pending.baseEventHash);
+    if (
+      !prepared ||
+      !isSnapshotPreparedEvent(prepared) ||
+      prepared.payload.baseEventHash !== prepared.previousHash ||
+      eventSnapshotHash(prepared) !== pending.stateHash
+    ) {
+      throw new Error('Pending kernel snapshot is not authenticated by a preparation event.');
+    }
+    const event = committedEvent ?? await appendKernelEvent(
+      options.runtimeDir,
+      pending.baseEventHash,
+      {
+        actor: 'system',
+        type: SNAPSHOT_COMMITTED_EVENT_TYPE,
+        entityId: 'kernel-state',
+        entityType: 'system',
+        payload: {
+          schemaVersion: 1,
+          baseEventHash: pending.baseEventHash,
+          preparedEventHash: prepared.hash,
+          stateHash: pending.stateHash,
+        },
+      },
+    );
+    if (
+      event.previousHash !== pending.baseEventHash ||
+      event.payload.baseEventHash !== pending.baseEventHash ||
+      event.payload.preparedEventHash !== prepared.hash ||
+      eventSnapshotHash(event) !== pending.stateHash
+    ) {
+      throw new Error('Kernel snapshot commit does not match its pending content.');
+    }
+    const committedState = { ...pending.state, lastEventHash: event.hash };
+    await writeKernelState(options.runtimeDir, committedState);
+    await writeKernelRecoveryState(options.runtimeDir, committedState);
+    await clearPendingKernelSnapshot(options.runtimeDir);
+    return committedState;
+  };
+
+  const commitState = async (state: KernelState): Promise<KernelState> => {
+    const events = await readKernelEvents(options.runtimeDir);
+    const ledgerHead = events.at(-1)?.hash ?? null;
+    if (state.lastEventHash !== ledgerHead) {
+      throw new Error('Kernel snapshot commit base does not match the event ledger.');
+    }
+    const stateHash = hashKernelStateContent(state);
+    const prepared = await appendKernelEvent(options.runtimeDir, state.lastEventHash, {
+      actor: 'system',
+      type: SNAPSHOT_PREPARED_EVENT_TYPE,
+      entityId: 'kernel-state',
+      entityType: 'system',
+      payload: {
+        schemaVersion: 1,
+        baseEventHash: state.lastEventHash,
+        stateHash,
+      },
+    });
+    const preparedState = { ...state, lastEventHash: prepared.hash };
+    const pending: PendingKernelSnapshot = {
+      schemaVersion: 1,
+      baseEventHash: prepared.hash,
+      stateHash,
+      state: preparedState,
+    };
+    await writePendingKernelSnapshot(options.runtimeDir, pending);
+    return finishPendingSnapshot(pending);
+  };
+
   const normalizeWorkspaceRoot = async (requestedRoot: string): Promise<string> => {
     const configuredRoot = await realpath(options.allowedWorkspaceRoot ?? process.cwd());
     const candidateRoot = await realpath(requestedRoot);
@@ -173,15 +336,84 @@ export const createKernelService = (options: KernelServiceOptions) => {
   };
 
   const readConsistentState = async (): Promise<KernelState> => {
-    const [state, events] = await Promise.all([
+    const [state, recoveryState, pending, events] = await Promise.all([
       readKernelState(options.runtimeDir),
+      readKernelRecoveryState(options.runtimeDir),
+      readPendingKernelSnapshot(options.runtimeDir),
       readKernelEvents(options.runtimeDir),
     ]);
     const ledgerHead = events.at(-1)?.hash ?? null;
-    if (state.lastEventHash !== ledgerHead) {
-      throw new Error('Kernel snapshot head does not match the event ledger.');
+
+    if (pending) {
+      if (
+        pending.state.lastEventHash !== pending.baseEventHash ||
+        hashKernelStateContent(pending.state) !== pending.stateHash
+      ) {
+        throw new Error('Pending kernel snapshot integrity check failed.');
+      }
+      if (pending.baseEventHash === ledgerHead) {
+        return finishPendingSnapshot(pending);
+      }
+      const committed = events.at(-1);
+      if (
+        committed &&
+        isSnapshotCommitEvent(committed) &&
+        committed.previousHash === pending.baseEventHash &&
+        eventSnapshotHash(committed) === pending.stateHash
+      ) {
+        return finishPendingSnapshot(pending, committed);
+      }
     }
-    return state;
+
+    const snapshotEventIndexes = new Map(
+      events
+        .map((event, index) => ({ event, index }))
+        .filter(({ event }) => isSnapshotCommitEvent(event))
+        .map(({ event, index }) => [event.hash, { event, index }] as const),
+    );
+    const verifiedCandidates = [state, recoveryState]
+      .filter((candidate): candidate is KernelState => candidate !== null)
+      .map((candidate) => ({ candidate, commit: candidate.lastEventHash ? snapshotEventIndexes.get(candidate.lastEventHash) : undefined }))
+      .filter(({ candidate, commit }) => (
+        commit !== undefined &&
+        commit.event.previousHash === commit.event.payload.baseEventHash &&
+        eventSnapshotHash(commit.event) === hashKernelStateContent(candidate)
+      ))
+      .sort((left, right) => right.commit!.index - left.commit!.index);
+
+    const verified = verifiedCandidates[0];
+    if (verified?.candidate.lastEventHash === ledgerHead) {
+      await writeKernelState(options.runtimeDir, verified.candidate);
+      await writeKernelRecoveryState(options.runtimeDir, verified.candidate);
+      await clearPendingKernelSnapshot(options.runtimeDir);
+      return verified.candidate;
+    }
+
+    if (verified) {
+      const tail = events.slice(verified.commit!.index + 1);
+      if (tail.some((event) => isSnapshotCommitEvent(event))) {
+        throw new Error('Kernel snapshot integrity check failed: a newer committed snapshot is unavailable.');
+      }
+      const recoveryEvent = await appendKernelEvent(options.runtimeDir, ledgerHead, {
+        actor: 'system',
+        type: 'system.snapshot_recovered',
+        entityId: 'kernel-state',
+        entityType: 'system',
+        payload: {
+          recoveredSnapshotCommitHash: verified.candidate.lastEventHash,
+          abandonedTailHashes: tail.map((event) => event.hash),
+        },
+      });
+      return commitState({ ...verified.candidate, lastEventHash: recoveryEvent.hash });
+    }
+
+    const hasSnapshotCommit = snapshotEventIndexes.size > 0;
+    if (!hasSnapshotCommit && state.lastEventHash === ledgerHead) {
+      if (events.length === 0) return state;
+      return commitState(state);
+    }
+
+    throw new Error('Kernel snapshot integrity check failed against the event ledger.');
   };
 
   const getState = (): Promise<KernelState> => withMutation(readConsistentState);
@@ -227,7 +459,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       state = appended.state;
     }
 
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       goals: [...state.goals, goal],
       tasks: [...state.tasks, ...tasks],
@@ -287,7 +519,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         payload: { goalId, taskId: task.id, riskLevel: approval.riskLevel, reason: approval.reason },
       });
       state = appended.state;
-      await writeKernelState(options.runtimeDir, {
+      await commitState({
         ...state,
         approvals: [...state.approvals, approval],
         goals: state.goals.map((candidate) => candidate.id === goalId
@@ -308,7 +540,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         payload: { reason: policy.reason },
       });
       state = appended.state;
-      await writeKernelState(options.runtimeDir, {
+      await commitState({
         ...state,
         goals: state.goals.map((candidate) => candidate.id === goalId
           ? { ...candidate, status: 'blocked', updatedAt: now }
@@ -355,7 +587,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { goalId, taskId: task.id, family: token.family, expiresAt: token.expiresAt },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       goals: state.goals.map((candidate) => candidate.id === goalId
         ? { ...candidate, usage: reserved.usage, updatedAt: startedAt }
@@ -410,7 +642,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       state = goalAppended.state;
     }
 
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       goals: state.goals.map((candidate) => candidate.id === goalId
         ? { ...candidate, status: goalStatus, usage: updatedUsage, updatedAt: finishedAt }
@@ -474,14 +706,21 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { goalId: approval.goalId, taskId: approval.taskId, reason },
     });
     state = appended.state;
+    const automationApproval = approval.taskId.startsWith('automation:') && state.automations.some(
+      (automation) => `automation:${automation.id}` === approval.taskId,
+    );
     const taskStatus = status === 'denied' ? 'denied' : 'blocked';
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       approvals: state.approvals.map((candidate) => candidate.id === approvalId ? decided : candidate),
-      tasks: markTaskStatus(state.tasks, approval.taskId, taskStatus, decided.updatedAt),
-      goals: state.goals.map((candidate) => candidate.id === approval.goalId
-        ? { ...candidate, status: 'blocked', updatedAt: decided.updatedAt }
-        : candidate),
+      tasks: automationApproval
+        ? state.tasks
+        : markTaskStatus(state.tasks, approval.taskId, taskStatus, decided.updatedAt),
+      goals: automationApproval
+        ? state.goals
+        : state.goals.map((candidate) => candidate.id === approval.goalId
+          ? { ...candidate, status: 'blocked', updatedAt: decided.updatedAt }
+          : candidate),
     });
     return decided;
   });
@@ -498,7 +737,32 @@ export const createKernelService = (options: KernelServiceOptions) => {
       throw new Error('Memory provenance event is not in the kernel ledger.');
     }
 
-    const draft = createMemoryCandidateRecord({ ...input, evidenceRefs: suppliedEvidence });
+    const evidenceRefs = suppliedEvidence.map((reference) => ({ ...reference }));
+    if (input.provenance.sourceType === 'kernel_event' && !evidenceRefs.some((reference) => (
+      reference.eventId === input.provenance.sourceId
+    ))) {
+      evidenceRefs.push({ eventId: input.provenance.sourceId });
+    }
+
+    const contentHash = hashMemoryContent(input.content.trim());
+    if (input.provenance.sourceType === 'user') {
+      const source = await appendEvent(state, {
+        actor: 'user',
+        type: 'memory.source_attested',
+        entityId: input.provenance.sourceId,
+        entityType: 'memory',
+        payload: {
+          sourceType: input.provenance.sourceType,
+          sourceId: input.provenance.sourceId,
+          observedAt: input.provenance.observedAt,
+          contentHash,
+        },
+      });
+      state = source.state;
+      evidenceRefs.push({ eventId: source.event.id });
+    }
+
+    const draft = createMemoryCandidateRecord({ ...input, evidenceRefs });
     const appended = await appendEvent(state, {
       actor: input.provenance.actor,
       type: 'memory.candidate_created',
@@ -507,11 +771,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: createMemoryLedgerPayload(draft),
     });
     state = appended.state;
-    const record: KernelMemoryRecord = {
-      ...draft,
-      evidenceRefs: [...draft.evidenceRefs, { eventId: appended.event.id }],
-    };
-    await writeKernelState(options.runtimeDir, {
+    const record: KernelMemoryRecord = draft;
+    await commitState({
       ...state,
       memories: [...state.memories, record],
     });
@@ -523,12 +784,15 @@ export const createKernelService = (options: KernelServiceOptions) => {
     const events = await readKernelEvents(options.runtimeDir);
     const record = state.memories.find((candidate) => candidate.id === memoryId);
     if (!record) throw new Error('Memory not found.');
-    const eventIds = new Set(events.map((event) => event.id));
-    if (record.evidenceRefs.some((reference) => !eventIds.has(reference.eventId))) {
+    const eventsById = new Map(events.map((event) => [event.id, event]));
+    if (record.evidenceRefs.some((reference) => !eventsById.has(reference.eventId))) {
       throw new Error('Memory evidence is missing from the kernel ledger.');
     }
+    const validatedEvidenceEventIds = record.evidenceRefs
+      .filter((reference) => isIndependentMemoryEvidence(eventsById.get(reference.eventId)!, record, reference))
+      .map((reference) => reference.eventId);
 
-    const promoted = promoteMemoryRecord(state.memories, memoryId, reason);
+    const promoted = promoteMemoryRecord(state.memories, memoryId, reason, validatedEvidenceEventIds);
     const appended = await appendEvent(state, {
       actor: 'user',
       type: 'memory.promoted',
@@ -541,7 +805,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, { ...state, memories: promoted.records });
+    await commitState({ ...state, memories: promoted.records });
     return promoted.record;
   });
 
@@ -560,7 +824,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, { ...state, memories: revoked.records });
+    await commitState({ ...state, memories: revoked.records });
     return revoked.record;
   });
 
@@ -596,7 +860,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { ...getSkillPackageLedgerMetadata(skill) },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillPackages: [...state.skillPackages, skill],
     });
@@ -621,7 +885,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { ...getSkillEvaluationLedgerMetadata(evaluation) },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillPackages: state.skillPackages.map((candidate) => candidate.id === skillId ? evaluatedSkill : candidate),
       skillEvaluations: [...state.skillEvaluations, evaluation],
@@ -649,7 +913,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { ...getSkillActivationLedgerMetadata(canary.activation) },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillPackages: state.skillPackages.map((candidate) => candidate.id === skillId ? canary.skill : candidate),
       skillActivations: [...state.skillActivations, canary.activation],
@@ -659,19 +923,36 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
   const runSkillCanary = (
     skillId: string,
-    input: string,
-    expectedOutput: string,
-  ): Promise<{ output: string; passed: boolean; activation: SkillActivation }> => withMutation(async () => {
+  ): Promise<{ caseId: string; passed: boolean; activation: SkillActivation }> => withMutation(async () => {
     let state = await readConsistentState();
     const skill = state.skillPackages.find((candidate) => candidate.id === skillId);
     if (!skill) throw new Error('Skill not found.');
     const activation = [...state.skillActivations].reverse().find((candidate) => candidate.skillId === skillId);
     if (!activation) throw new Error('Skill activation not found.');
-    const output = runPureTransform(skill.program, input, {
+    if (
+      typeof activation.evaluationId !== 'string' ||
+      typeof activation.suiteHash !== 'string' ||
+      !Array.isArray(activation.replayCaseIds)
+    ) {
+      throw new Error('Legacy skill canary must be restarted with kernel-owned replay evidence.');
+    }
+    const evaluation = state.skillEvaluations.find((candidate) => candidate.id === activation.evaluationId);
+    if (
+      !evaluation ||
+      evaluation.skillId !== skill.id ||
+      !evaluation.eligibleForCanary ||
+      activation.suiteHash !== skill.contentHash
+    ) {
+      throw new Error('Skill canary evaluation evidence is missing or does not match its activation.');
+    }
+    const caseId = activation.replayCaseIds[activation.usedRuns];
+    const canaryCase = getKernelCanaryCase(skill, activation.usedRuns);
+    if (caseId !== canaryCase.id) throw new Error('Skill canary kernel-owned case sequence is invalid.');
+    const output = runPureTransform(skill.program, canaryCase.input, {
       maxInputChars: skill.manifest.maxInputChars,
       maxSteps: skill.manifest.maxSteps,
     });
-    const passed = output === expectedOutput;
+    const passed = output === canaryCase.expectedOutput;
     const updated = recordCanaryRun(skill, activation, { passed, updatedAt: new Date().toISOString() });
     const appended = await appendEvent(state, {
       actor: 'kernel',
@@ -680,17 +961,20 @@ export const createKernelService = (options: KernelServiceOptions) => {
       entityType: 'skill_activation',
       payload: {
         ...getSkillActivationLedgerMetadata(updated),
-        inputHash: stableHash(input),
+        caseId,
+        inputHash: stableHash(canaryCase.input),
         outputHash: stableHash(output),
-        expectedOutputHash: stableHash(expectedOutput),
+        expectedOutputHash: stableHash(canaryCase.expectedOutput),
+        evaluationId: evaluation.id,
+        suiteHash: evaluation.suiteHash,
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillActivations: state.skillActivations.map((candidate) => candidate.id === activation.id ? updated : candidate),
     });
-    return { output, passed, activation: updated };
+    return { caseId, passed, activation: updated };
   });
 
   const promoteSkillPackage = (skillId: string): Promise<SkillPackage> => withMutation(async () => {
@@ -708,7 +992,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { ...getSkillPackageLedgerMetadata(promoted.skill) },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillPackages: state.skillPackages.map((candidate) => candidate.id === skillId ? promoted.skill : candidate),
       skillActivations: state.skillActivations.map((candidate) => candidate.id === activation.id ? promoted.activation : candidate),
@@ -734,7 +1018,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       skillPackages: state.skillPackages.map((candidate) => candidate.id === skillId ? rolledBack.skill : candidate),
       skillActivations: state.skillActivations.map((candidate) => candidate.id === activation.id ? rolledBack.activation : candidate),
@@ -762,7 +1046,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { inputHash: stableHash(input), outputHash: stableHash(output), contentHash: skill.contentHash },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, state);
+    await commitState(state);
     return output;
   });
 
@@ -814,7 +1098,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       goals: state.goals.map((candidate) => candidate.id === goalId
         ? { ...candidate, usage: reserved.usage, updatedAt: new Date().toISOString() }
@@ -853,7 +1137,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         },
       });
       state = appended.state;
-      await writeKernelState(options.runtimeDir, state);
+      await commitState(state);
       return execution;
     } catch (error) {
       state = await readConsistentState();
@@ -869,7 +1153,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         },
       });
       state = appended.state;
-      await writeKernelState(options.runtimeDir, state);
+      await commitState(state);
       throw error;
     }
   });
@@ -904,7 +1188,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       automations: [...state.automations, automation],
     });
@@ -941,7 +1225,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { automationId, reason: reason.trim() },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       automations: state.automations.map((candidate) => candidate.id === automationId ? updated : candidate),
     });
@@ -970,7 +1254,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, state);
+    await commitState(state);
     return decision;
   });
 
@@ -1000,22 +1284,81 @@ export const createKernelService = (options: KernelServiceOptions) => {
       throw new Error('Automation is halted after consecutive run failures.');
     }
 
-    const reserved = reserveBudget(goal.budget, goal.usage, { operations: 1 });
-    if (!reserved.allowed) throw new Error(reserved.reason);
+    const approvalTaskId = `automation:${automation.id}`;
+    const approvalRequest = `automation-run:${automation.id}:${stableHash({
+      workerId: automation.workerId,
+      riskLevel: automation.riskLevel,
+      action: automation.action,
+      scope: automation.scope,
+    })}`;
+    let approval = [...state.approvals].reverse().find((candidate) => (
+      candidate.goalId === automation.goalId &&
+      candidate.taskId === approvalTaskId &&
+      candidate.requestedAction === approvalRequest &&
+      (candidate.status === 'pending' || candidate.status === 'approved')
+    ));
+    let intent = buildAutomationIntent(automation);
+    let decision = decideActionPolicy(intent, workerRegistry);
 
-    const intent = buildAutomationIntent(automation);
-    const decision = decideActionPolicy(intent, workerRegistry);
+    if (decision.kind === 'approval_required' && approval?.status !== 'approved') {
+      if (!approval) {
+        const approvalBudget = reserveBudget(goal.budget, goal.usage, { approvals: 1 });
+        if (!approvalBudget.allowed) throw new Error(approvalBudget.reason);
+        approval = createApprovalRecord({
+          goalId: automation.goalId,
+          taskId: approvalTaskId,
+          requestedAction: approvalRequest,
+          riskLevel: automation.riskLevel,
+          reason: decision.reason,
+        });
+        let appended = await appendEvent(state, {
+          actor: 'kernel',
+          type: 'approval.requested',
+          entityId: approval.id,
+          entityType: 'approval',
+          payload: {
+            goalId: automation.goalId,
+            taskId: approvalTaskId,
+            automationId,
+            riskLevel: automation.riskLevel,
+            reason: decision.reason,
+          },
+        });
+        state = appended.state;
+        appended = await appendEvent(state, {
+          actor: 'kernel',
+          type: 'automation.run_blocked',
+          entityId: automationId,
+          entityType: 'automation',
+          payload: { automationId, intentId: intent.id, approvalId: approval.id, reasonCode: decision.reasonCode, reason: decision.reason },
+        });
+        state = appended.state;
+        await commitState({
+          ...state,
+          approvals: [...state.approvals, approval],
+          goals: state.goals.map((candidate) => candidate.id === goal.id
+            ? { ...candidate, usage: approvalBudget.usage, updatedAt: approval!.updatedAt }
+            : candidate),
+        });
+      }
+      return { decision, approvalId: approval.id };
+    }
+
+    const approvalId = approval?.status === 'approved' ? approval.id : undefined;
+    if (approvalId) {
+      intent = buildAutomationIntent(automation, new Date().toISOString(), approvalId);
+      decision = decideActionPolicy(intent, workerRegistry);
+    }
     if (decision.kind !== 'allow') {
       const appended = await appendEvent(state, {
         actor: 'kernel',
-        type: decision.kind === 'approval_required' ? 'automation.run_blocked' : 'automation.run_denied',
+        type: 'automation.run_denied',
         entityId: automationId,
         entityType: 'automation',
         payload: { automationId, intentId: intent.id, reasonCode: decision.reasonCode, reason: decision.reason },
       });
-      state = appended.state;
-      await writeKernelState(options.runtimeDir, state);
-      return { decision };
+      await commitState(appended.state);
+      return { decision, approvalId };
     }
 
     const worker = options.actionWorkers?.[automation.workerId];
@@ -1023,6 +1366,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!worker || !registration) {
       throw new Error('No executable worker runtime is registered for this automation.');
     }
+    const reserved = reserveBudget(goal.budget, goal.usage, { operations: 1 });
+    if (!reserved.allowed) throw new Error(reserved.reason);
 
     const startedAt = new Date().toISOString();
     const grant = createCapabilityGrant(intent, {
@@ -1030,18 +1375,67 @@ export const createKernelService = (options: KernelServiceOptions) => {
       issuedAt: startedAt,
       expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
       maxOps: 1,
+      approvalId,
     });
+    await capabilityGrantStore.create(grant);
+    const authorized = await authorizeCapabilityDispatch(
+      capabilityGrantStore,
+      grant.id,
+      intent,
+      registration,
+      { now: new Date().toISOString(), operationsUsed: 1 },
+    );
+    if (!authorized.allowed || !authorized.authorization || !authorized.grant) {
+      throw new Error(`Capability authorization failed before dispatch: ${authorized.reason}`);
+    }
+
     let appended = await appendEvent(state, {
+      actor: 'kernel',
+      type: 'capability.grant_consumed',
+      entityId: grant.id,
+      entityType: 'capability',
+      payload: {
+        automationId,
+        intentId: intent.id,
+        grantId: grant.id,
+        approvalId,
+        grantStatus: authorized.grant.status,
+      },
+    });
+    state = appended.state;
+    appended = await appendEvent(state, {
       actor: 'kernel',
       type: 'automation.run_started',
       entityId: automationId,
       entityType: 'automation',
-      payload: { automationId, intentId: intent.id, grantId: grant.id, actionType: automation.action.type },
+      payload: { automationId, intentId: intent.id, grantId: grant.id, approvalId, actionType: automation.action.type },
     });
     state = appended.state;
+    const consumedAt = new Date().toISOString();
+    await commitState({
+      ...state,
+      approvals: approvalId
+        ? state.approvals.map((candidate) => candidate.id === approvalId
+          ? { ...candidate, status: 'consumed', updatedAt: consumedAt }
+          : candidate)
+        : state.approvals,
+      goals: state.goals.map((candidate) => candidate.id === goal.id
+        ? { ...candidate, usage: reserved.usage, updatedAt: consumedAt }
+        : candidate),
+    });
 
     const timeoutMs = Math.min(automation.budget.maxRuntimeMsPerRun, 30_000);
-    const dispatch = await worker.execute(intent, { timeoutMs });
+    let dispatch: KernelActionWorkerResult;
+    try {
+      dispatch = await worker.execute(intent, { timeoutMs, authorization: authorized.authorization });
+    } catch {
+      dispatch = {
+        status: 'failed',
+        summary: 'Worker execution failed after capability authorization.',
+        sourceRef: `automation:${automationId}`,
+        errorCode: 'worker_exception',
+      };
+    }
 
     const content = dispatch.content ?? '';
     const heuristic = analyzePromptInjection(content);
@@ -1068,11 +1462,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
       injectionSignalCodes: assessment.codes,
     };
 
-    const consumed = consumeCapabilityGrant(grant, intent, registration, {
-      now: new Date().toISOString(),
-      operationsUsed: 1,
-    });
-    const succeeded = dispatch.status === 'succeeded' && consumed.allowed;
+    const succeeded = dispatch.status === 'succeeded';
+    state = await readConsistentState();
     appended = await appendEvent(state, {
       actor: 'worker',
       type: succeeded ? 'automation.run_completed' : 'automation.run_failed',
@@ -1082,25 +1473,21 @@ export const createKernelService = (options: KernelServiceOptions) => {
         automationId,
         intentId: intent.id,
         grantId: grant.id,
-        grantStatus: consumed.grant.status,
+        approvalId,
+        grantStatus: authorized.grant.status,
         summary: dispatch.summary,
-        errorCode: dispatch.errorCode ?? (consumed.allowed ? undefined : consumed.reasonCode),
+        errorCode: dispatch.errorCode,
         observationId: observation.id,
         contentHash: observation.contentHash,
         injectionSignalCodes: observation.injectionSignalCodes,
         risk: assessment.risk,
       },
     });
-    state = appended.state;
-    await writeKernelState(options.runtimeDir, {
-      ...state,
-      goals: state.goals.map((candidate) => candidate.id === goal.id
-        ? { ...candidate, usage: reserved.usage, updatedAt: new Date().toISOString() }
-        : candidate),
-    });
+    await commitState(appended.state);
 
     return {
       decision,
+      approvalId,
       dispatch: {
         status: dispatch.status,
         summary: dispatch.summary,
@@ -1136,7 +1523,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { reason: reason.trim() },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, { ...state, controls });
+    await commitState({ ...state, controls });
     return controls;
   });
 
@@ -1162,7 +1549,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
     const interruptedTaskIds = new Set(interrupted.map((task) => task.id));
     const interruptedGoalIds = new Set(interrupted.map((task) => task.goalId));
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       tasks: state.tasks.map((task) => interruptedTaskIds.has(task.id)
         ? { ...task, status: 'blocked', updatedAt: now }
@@ -1199,28 +1586,54 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       releaseProposals: [...state.releaseProposals, proposal],
     });
     return proposal;
   });
 
-  const activateReleaseProposal = (releaseId: string): Promise<ReleaseProposal> => withMutation(async () => {
+  const activateReleaseProposal = (
+    releaseId: string,
+    artifactId: string,
+  ): Promise<ReleaseProposal> => withMutation(async () => {
+    if (!artifactId.trim()) throw new Error('Release artifact id is required.');
     let state = await readConsistentState();
     const proposal = state.releaseProposals.find((candidate) => candidate.id === releaseId);
     if (!proposal) throw new Error('Release proposal not found.');
+    if (proposal.activationState === 'rejected') throw new Error('Rejected release proposals cannot be activated.');
+    if (proposal.activationState === 'activated') throw new Error('Release proposal is already activated.');
 
-    const decided = decideReleaseActivation(proposal, options.releaseSigningPublicKey);
+    const result = options.releaseLifecycle
+      ? await options.releaseLifecycle.activate(proposal, artifactId.trim())
+      : {
+        status: 'blocked' as const,
+        reasonCode: 'install_failed' as const,
+        reason: 'Staged release lifecycle is unavailable.',
+      };
+    const now = new Date().toISOString();
+    const decided: ReleaseProposal = {
+      ...proposal,
+      activationState: result.status === 'activated' ? 'activated' : 'blocked',
+      activationReason: `${result.reasonCode}: ${result.reason}`,
+      updatedAt: now,
+    };
     const appended = await appendEvent(state, {
       actor: 'kernel',
       type: decided.activationState === 'activated' ? 'release.activated' : 'release.activation_blocked',
       entityId: releaseId,
       entityType: 'release',
-      payload: { releaseId, reason: decided.activationReason },
+      payload: {
+        releaseId,
+        artifactId: artifactId.trim(),
+        reasonCode: result.reasonCode,
+        reason: result.reason,
+        releaseDirectory: result.manifest?.releaseDirectory,
+        previousReleaseId: result.previousManifest?.releaseId,
+      },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       releaseProposals: state.releaseProposals.map((candidate) => candidate.id === releaseId ? decided : candidate),
     });
@@ -1241,7 +1654,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { releaseId, reason: rejected.activationReason },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       releaseProposals: state.releaseProposals.map((candidate) => candidate.id === releaseId ? rejected : candidate),
     });
@@ -1260,7 +1673,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { artifactId: artifact.id, contentHash: artifact.contentHash, byteLength: artifact.byteLength },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, state);
+    await commitState(state);
     return artifact;
   });
 
@@ -1292,7 +1705,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
     });
     state = appended.state;
-    await writeKernelState(options.runtimeDir, {
+    await commitState({
       ...state,
       benchmarkRuns: [...state.benchmarkRuns, run],
     });

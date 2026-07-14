@@ -10,6 +10,7 @@ export interface UserRecord {
   role: UserRole;
   salt: string;
   passwordHash: string;
+  sessionVersion: number;
   createdAt: string;
 }
 
@@ -46,6 +47,9 @@ export interface UserStore {
   list(): PublicUser[];
   create(input: CreateUserInput): Promise<PublicUser>;
   verify(username: string, password: string): PublicUser | undefined;
+  findById(id: string): PublicUser | undefined;
+  sessionVersion(id: string): number | undefined;
+  revokeSessions(id: string): Promise<boolean>;
   remove(id: string): Promise<boolean>;
 }
 
@@ -64,7 +68,11 @@ export const createUserStore = async (filePath: string): Promise<UserStore> => {
       users = parsed.filter((u): u is UserRecord => (
         u && typeof u.id === 'string' && typeof u.username === 'string' &&
         roles.has(u.role) && typeof u.salt === 'string' && typeof u.passwordHash === 'string'
-      ));
+      )).map((user) => ({
+        ...user,
+        sessionVersion: Number.isSafeInteger(user.sessionVersion) && user.sessionVersion >= 0
+          ? user.sessionVersion : 0,
+      }));
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -98,6 +106,7 @@ export const createUserStore = async (filePath: string): Promise<UserStore> => {
         role: input.role,
         salt,
         passwordHash: hashPassword(input.password, salt),
+        sessionVersion: 0,
         createdAt: new Date().toISOString(),
       };
       users = [...users, record];
@@ -113,7 +122,25 @@ export const createUserStore = async (filePath: string): Promise<UserStore> => {
       if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) return undefined;
       return toPublic(user);
     },
+    findById: (id) => {
+      const user = users.find((candidate) => candidate.id === id);
+      return user ? toPublic(user) : undefined;
+    },
+    sessionVersion: (id) => users.find((candidate) => candidate.id === id)?.sessionVersion,
+    revokeSessions: async (id) => {
+      const user = users.find((candidate) => candidate.id === id);
+      if (!user) return false;
+      users = users.map((candidate) => candidate.id === id
+        ? { ...candidate, sessionVersion: candidate.sessionVersion + 1 }
+        : candidate);
+      await persist();
+      return true;
+    },
     remove: async (id) => {
+      const target = users.find((user) => user.id === id);
+      if (target?.role === 'admin' && users.filter((user) => user.role === 'admin').length === 1) {
+        throw new Error('The final administrator account cannot be removed.');
+      }
       const next = users.filter((u) => u.id !== id);
       if (next.length === users.length) return false;
       users = next;

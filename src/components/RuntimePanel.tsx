@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { RuntimeCapabilityReport, RuntimeFeatureStatus } from '../kernel/autonomy';
+import { authenticatedFetch } from '../lib/auth';
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -21,6 +22,7 @@ const featureLabels: Record<string, string> = {
   accessControl: 'Access control',
   osSandbox: 'OS sandbox',
   releaseSigning: 'Release signing',
+  releaseDeployment: 'Supervised core releases',
   desktopIpc: 'Desktop shell IPC',
 };
 
@@ -34,7 +36,7 @@ export const RuntimePanel: React.FC = () => {
 
     const loadReport = async () => {
       try {
-        const response = await fetch('/api/kernel/runtime-report');
+        const response = await authenticatedFetch('/api/kernel/runtime-report');
         if (!response.ok) throw new Error(`Runtime report request failed with status ${response.status}.`);
         const payload: unknown = await response.json();
         if (!isRecord(payload) || !isRecord(payload.features) || !isRecord(payload.workers)) {

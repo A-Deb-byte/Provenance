@@ -1,202 +1,135 @@
 # Provenance
 
-A local-first, self-hosted AI agent with a trusted kernel — models propose, the kernel decides, and every action leaves verifiable evidence.
+A local-first, self-hosted AI agent control plane with a trusted kernel. Models propose; policy, budgets, approvals, and capability grants decide what may execute; durable mutations leave hash-chained evidence.
 
-> *Provenance*: every durable memory and every action traces back to a recorded, hash-chained source of evidence. Nothing the agent knows or does is unaccounted for.
+The name is literal: promoted memory and privileged execution must trace to recorded evidence rather than a model's assertion.
 
 ## Current Status
 
-The memory and chat workspace began as a Phase 0 prototype and now sits on a test-covered local control plane. It provides:
+Provenance now provides:
 
-- A trusted local kernel that owns goal contracts, an evidence-gated task lifecycle, budgets, approvals, and a hash-chained tamper-evident event ledger.
-- Evidence-backed durable memory (candidate → promoted → superseded/revoked) and a bounded, non-executing skill foundry.
-- Normalized routing across six AI providers (Gemini SDK plus an OpenAI-compatible adapter; Bedrock as an unavailable boundary).
-- An in-process advisory core model (MiniCPM5-1B via `node-llama-cpp`) for fully on-device memory extraction, chat fallback, and tighten-only prompt-injection assessment.
-- Read-only and write-capable (Playwright) browser workers with executable, budgeted automations; a Docker command sandbox; parallel multi-goal execution; recovery and a Stop All control.
-- Ed25519-verified release proposals, a cross-platform OS secret vault (Windows DPAPI / macOS Keychain / Linux Secret Service), and multi-user access control with roles and session tokens.
-- Four auto-refreshing dashboard panels that project only recorded state.
+- A TypeScript kernel for goal contracts, task state, budgets, approvals, capabilities, automations, recovery, and a tamper-evident event ledger.
+- A shared application AI gateway for chat, extraction, mutation, and bounded skill drafting. These routes use the configured provider router, kernel provider-call budgets, ledger evidence, and the same mutation access guard as the cockpit.
+- Normalized provider routing for Google Gemini, OpenAI, OpenRouter, DeepSeek, and GLM, plus an explicit unavailable boundary for AWS Bedrock when its runtime is absent.
+- Evidence-backed memory and a bounded `pure-transform-v1` skill foundry that never executes model-generated source code.
+- Read-only web inspection and a Playwright browser worker for navigation, clicking, and hash-addressed text entry.
+- A Docker command sandbox when Docker is available, with an explicitly reported trusted-host fallback when it is not.
+- Windows DPAPI, macOS Keychain, and Linux Secret Service vault adapters, selected and reported by platform.
+- Dashboard authentication for operator-token, bootstrap, login, role-scoped sessions, logout, and session revocation.
+- Controlled staged releases with canonical authorization signatures, evaluation gates, verified installation, supervised process readiness, restart restoration, and rollback on activation failure.
 
-Boundaries that remain deployment integrations (reported as unavailable, never simulated) are listed under "Deployment Integrations Still Outstanding" below.
+This is a substantial local control plane, not an unrestricted self-modifying agent. Remaining deployment boundaries are listed below.
 
-## Kernel MVP
+## Trust Boundaries
 
-Phase 1 adds a loopback-only local kernel API under `/api/kernel` and stores its runtime state under `.agent-kernel/`.
+### Application AI and providers
 
-It supports:
+`POST /api/chat`, `/api/extract`, `/api/mutate`, and `/api/self-improve` share the provider contract under `src/app-ai/`. Calls are normalized, schema-constrained where appropriate, budgeted by the kernel, and recorded with provider/model route evidence. The skill-drafting endpoint may propose only bounded transform operations and deterministic cases; it cannot submit arbitrary JavaScript for execution.
 
-- Validated goal contracts with objectives, success criteria, constraints, autonomy level, workspace scope, verification commands, and budgets.
-- Sequential task graph state with dependency and status tracking.
-- Hash-chained local JSONL event records with link/hash verification on read. The chain is tamper-evident bookkeeping, not encryption or a complete protection boundary.
-- Local policy decisions, approval record state, and an approval decision endpoint. The current planner creates only allowlisted local verification tasks.
-- Deterministic operation, command-runtime, approval, and provider-call budget counters.
-- Short-lived, single-use, exact-command-scoped in-process capability tokens. These are not cryptographic bearer credentials.
-- Allowlisted local verification commands (`npm test`, `npm run lint`, and `npm run build`) inside the server-configured workspace, with bounded structured command evidence.
+Provider credentials stay server-side in environment variables or the OS vault. The browser receives provider status and routing metadata, never credentials. AWS Bedrock remains unavailable until its supported runtime and credentials are installed.
 
-The verification worker executes project-defined npm scripts on the host. Phase 1 does not provide an OS sandbox, so verification must be limited to a trusted local workspace.
+### Authentication and loopback access
 
-It does not yet provide:
+All mutating application, provider, kernel, and vault routes pass the unified access guard. The active mode is:
 
-- Desktop or browser automation.
-- Automatic routing across AI providers.
-- OS secret-vault integration, at-rest data protection, or SQLite persistence.
-- Automatic snapshot replay or repair after an interrupted ledger/state write.
-- Long-running background agents.
-- Real skill installation or execution.
-- Arbitrary shell access.
-- Autonomous modification or installation of core updates.
+- `multi_user` when accounts exist: admin/operator sessions may mutate; viewers are read-only.
+- `operator_token` when no accounts exist and `KERNEL_API_TOKEN` is configured.
+- `open` only when neither accounts nor an operator token exist, on the loopback-only deployment.
 
-## Evidence Memory And Skill Foundry
+When an operator token is configured, it is also required to bootstrap the first administrator. The dashboard can bootstrap, log in, use an operator token, log out, and clear revoked credentials. Loopback host/origin checks reject cross-site mutations and security headers constrain browser embedding and content sources.
 
-Phase 2 moves durable learning into the kernel snapshot and event ledger.
+### Memory and skills
 
-Memory records now support:
+Memory records follow `candidate -> promoted -> superseded/revoked`. Promotion requires an explicit reason and at least one independent, source-backed ledger event; a candidate's own creation event is not acceptable evidence. Provider extraction creates candidates only and cannot silently promote or delete durable memory.
 
-- Candidate, promoted, superseded, and revoked lifecycle states.
-- Provenance, confidence, scope, sensitivity, retention, contradictions, supersession, and evidence references.
-- Explicit promotion and revocation reasons.
-- Content hashes in the ledger instead of raw memory text.
-- Candidate-only ingestion from model extraction. Provider output cannot silently promote, delete, or rewrite durable memory.
+The skill foundry synthesizes an allowlisted text-transform DSL, compares it with a baseline, evaluates submitted replay cases, and then canaries kernel-generated fixtures against a separate reference interpreter. The canary-run endpoint accepts no caller input or expected output. Promotion requires every independent canary run to pass and remains reversible.
 
-The Skill Foundry uses a bounded `pure-transform-v1` text DSL. It can synthesize only allowlisted transformations, compare them with an identity baseline, evaluate held-out replay cases, run a bounded canary, promote a passing package, and roll it back. It does not execute generated JavaScript, load dependencies, access files, use the network, or request capability tokens.
+### Browser actions, approvals, and grants
 
-The browser-local memory and draft-skill views remain legacy presentation workspaces. Chat context is assembled from promoted kernel memory at request time, and authoritative memory/skill state appears in the Learning Cockpit.
+`browser.inspect` is read-only L0. Browser navigation, clicking, typing, and downloads have a minimum L2 risk and require explicit approval. The browser driver checks the allowlisted origin before an action, after navigation, and after click/script-driven navigation; redirects cannot silently widen scope.
 
-## Provider Intelligence
+For approval-gated automations, the first run creates a persisted approval. A later run may consume the matching approved record and execute within that exact intent. Capability grants are persisted and consumed before worker I/O; the worker must claim the resulting opaque one-use dispatch authorization immediately before acting.
 
-Phase 3 adds a normalized provider layer under `src/providers/`.
+### Snapshots and recovery
 
-It supports:
+The JSONL ledger is hash-chained and independently verifiable with `npm run verify-ledger`. Snapshot content is authenticated by ledgered prepare/commit events containing the canonical state hash. Startup validates the primary and authenticated recovery copy, completes interrupted commits, and records abandoned ledger tails during recovery.
 
-- One request/response/error/usage contract across Google Gemini (SDK), and OpenAI, OpenRouter, DeepSeek, and GLM through a shared OpenAI-compatible HTTP adapter.
-- Automatic, pinned, and ensemble routing over configured providers only, scored by deterministic operational telemetry, with ensemble disagreement recorded.
-- Server-side-only credentials resolved from environment variables and held behind non-serializable secret handles.
-- Kernel-budgeted provider calls (`POST /api/kernel/goals/:goalId/provider-calls`) recorded in the ledger with request/result hashes.
-- A sanitized status and routing-preview API (`/api/providers/status`, `/api/providers/plan`) and a read-only dashboard panel.
+This authenticates a snapshot against the ledger. It is not a claim that every historical snapshot can be reconstructed solely from domain-event payloads.
 
-AWS Bedrock is an adapter boundary only: it reports itself unavailable until its official runtime dependency and credentials are configured. No provider can modify kernel policy or grant capabilities.
+### Controlled releases
 
-## Capabilities, Automations, And Measured Autonomy
+A release signature covers the target version, package hash, sorted evaluation references, and rollback instructions. The matching staged package must declare a controlled `.cjs` entrypoint and pass path, size, and file-hash validation. Activation installs only beneath the controlled releases directory, performs the installed-file health check, launches the candidate with a fixed Node invocation and minimal environment, and requires a nonce/version/hash IPC readiness proof plus a stability window before committing the active manifest and stopping the previous child.
 
-Phases 4 and 5 add capability and autonomy contracts to the kernel snapshot and ledger.
+Candidate failure terminates and removes the candidate while leaving the previous process and manifest active. Startup revalidates the persisted proposal, signature, evaluations, artifact, installed files, and health before restoring the supervised child. This is a bounded operator-signed core service, not permission for a model to rewrite source or replace the trusted parent Express control plane.
 
-They support:
+Generate the operator release key outside the repository, then sign a proposal JSON document containing `targetVersion`, `contentHash`, `evaluationEventIds`, and `rollbackInstructions`:
 
-- Typed browser/desktop/connector action contracts, worker registrations, intent-hash-bound single-consume capability grants, and prompt-injection tagging of untrusted observations (`src/capabilities/`).
-- Persisted automation definitions with deterministic policy evaluation (`POST /api/kernel/automations/:id/evaluate`). Automations are created disabled; enabling one requires an available registered worker.
-- A Stop All control (`/api/kernel/controls/stop-all`, `/resume`) that halts task execution, provider calls, and automation enablement until explicitly resumed, with both transitions recorded.
-- Startup and on-demand recovery (`POST /api/kernel/recovery`): interrupted `running` tasks are recovered into an inspectable blocked state rather than silently resumed.
-- Benchmark records projected from finished goals' recorded evidence (`/api/kernel/benchmarks`).
-- Release proposals with content hashes, ledger-verified evaluation references, rollback instructions, and explicit activation state. Activation is always blocked in this deployment: unsigned proposals cannot activate, and no signing verification key is installed to validate signed ones.
-- A runtime capability report (`GET /api/kernel/runtime-report`) and dashboard panel that distinguish available, configured, unavailable, and blocked features from recorded state only.
-
-One worker runtime ships with this repository: a **read-only web-inspect browser worker** (`browser.inspect`, risk L0). It is disabled until the operator allowlists origins through `WEB_INSPECT_ORIGINS`. When enabled, `POST /api/kernel/automations/:id/run` executes an automation end to end: policy decision, intent-hash-bound single-use grant, bounded fetch (no redirects, no clicks, no typing, 64 KB text cap), an untrusted observation with prompt-injection assessment, grant consumption, and ledger evidence. Run counts and consecutive-failure halts are enforced from recorded events.
-
-**Release proposals can now genuinely activate** when the operator installs an Ed25519 verification key (`RELEASE_SIGNING_PUBLIC_KEY`, keypair via `node scripts/release-signing.mjs generate <file>`) and the proposal's signature over its content hash verifies. Unsigned proposals, missing keys, and failed verification remain blocked with recorded reasons.
-
-Desktop and connector worker runtimes do not ship here. Their placeholder registrations exist so those families are reported honestly as unavailable; the dashboard does not simulate them, and automations targeting them cannot be enabled. Dashboard panels poll every five seconds, so recorded state appears without manual reloads.
-
-## Core Model (In-Process Advisory Inference)
-
-The server can embed OpenBMB MiniCPM5-1B directly through `node-llama-cpp` — no Ollama, LM Studio, or separate inference daemon. The weights run inside the Express process as a strictly advisory, tighten-only component:
-
-- **Local memory extraction**: when weights are installed, `/api/extract` runs fully on-device and conversation text never leaves the machine. There is deliberately no silent cloud fallback from this path.
-- **Local chat fallback**: when no `GEMINI_API_KEY` is configured and weights are installed, `/api/chat` is served by the core model entirely on-device (responses carry `servedBy: "core_model"`). Expect noticeably slower, simpler answers than a frontier model.
-- **Prompt-injection assessment**: the model can add signals and raise risk above the deterministic heuristics, never lower or clear them. The regex heuristics remain the floor, and a model failure falls back to heuristics alone. Automation-run observations are assessed through this path.
-- The core model never decides policy, issues capabilities, writes the ledger, or promotes memory. Deterministic kernel code and human approvals keep that authority.
-
-To enable it, download a GGUF quantization of [openbmb/MiniCPM5-1B-GGUF](https://huggingface.co/openbmb/MiniCPM5-1B-GGUF) (Q4_K_M, ~688 MB, is recommended) and place it at:
-
-```
-.agent-kernel/models/minicpm5-1b.gguf
+```bash
+node scripts/release-signing.mjs generate /secure/path/release-private.pem
+node scripts/release-signing.mjs sign /secure/path/release-private.pem proposal.json
 ```
 
-or point `CORE_MODEL_PATH` at the file. Until then, the runtime capability report and `GET /api/core-model/status` list the core model as unavailable with download guidance; nothing is simulated.
+## Dashboard State
 
-## Secrets, Access Control, And Parallel Work
+The right-hand memory view is kernel-backed and read-only. Legacy `localStorage` keys for memory, profile, provider-like configuration, and skill drafts are purged. `localStorage` is limited to presentation state such as local chat sessions, the selected chat lens, and the active session id. `sessionStorage` may hold the transient active bearer for the current tab, but its validity remains server-authoritative; neither store is authoritative memory, skill, provider configuration, approval, or release state.
 
-- **OS secret vault (Windows DPAPI)**: `PUT /api/vault/secrets/:name` stores a secret protected at rest by the operating system's user-scoped DPAPI master key — platform-native protection, not an application-managed key. Values are never returned over the API; only names and status are exposed. At startup the server injects allowlisted vault secrets (`GEMINI_API_KEY`, `RELEASE_SIGNING_PUBLIC_KEY`, `KERNEL_API_TOKEN`) into its environment, so credentials need not live in a plaintext `.env`. On non-Windows hosts the vault reports itself unavailable rather than substituting a weaker file-based scheme.
-- **Operator access control**: set `KERNEL_API_TOKEN` to require an `Authorization: Bearer <token>` header on every mutating (non-GET) kernel and vault request. GET reads stay open on loopback so the dashboard keeps working. Unset by default (single-user loopback).
-- **Parallel goal execution**: `POST /api/kernel/goals/step-parallel` steps several goals at once. State mutations remain serialized on the kernel queue for consistency, but the verification commands themselves run in parallel OS processes — one worker per goal — bounded to eight concurrent steps.
-- **Independent ledger verification**: `npm run verify-ledger` replays `.agent-kernel/events.jsonl` with no project imports, recomputing every hash and link and checking the snapshot head. It is the reference for a future Rust verifier and proves the ledger format is replayable outside the TypeScript kernel.
+## Optional Core Model
+
+OpenBMB MiniCPM5-1B can run in-process through `node-llama-cpp` as an advisory, tighten-only prompt-injection assessor. It may raise risk above deterministic heuristics but cannot lower the heuristic floor, decide policy, issue capabilities, write the ledger, or promote memory.
+
+Place a compatible GGUF file at `.agent-kernel/models/minicpm5-1b.gguf` or set `CORE_MODEL_PATH`. Application chat and extraction still use the provider gateway; the core model is not a bypass around routing, budgets, or access control.
 
 ## Setup
-
-Clone the repository:
 
 ```bash
 git clone https://github.com/A-Deb-byte/Provenance.git
 cd Provenance
-```
-
-Install dependencies:
-
-```bash
 npm ci
 ```
 
-Create `.env` from `.env.example` and set:
+Create `.env` from `.env.example`. For OpenRouter, configure a server-side key and model, for example:
 
 ```bash
-GEMINI_API_KEY="your_server_side_value"
+AI_PROVIDER=openrouter
+AI_MODEL=openrouter/free
+OPENROUTER_MODEL=openrouter/free
+OPENROUTER_API_KEY=your_server_side_value
 ```
 
-Run development server:
+Do not put provider keys in browser storage or commit them. The OS-vault API is the preferred local at-rest store where its platform adapter is available.
+
+Run the development server:
 
 ```bash
 npm run dev
 ```
 
-Build production assets:
+Build and start the compiled server:
 
 ```bash
 npm run build
-```
-
-Run the compiled server:
-
-```bash
 npm start
 ```
 
 ## Verification
 
-Run type checking:
-
 ```bash
 npm run lint
-```
-
-Run tests:
-
-```bash
 npm test
-```
-
-Run a production build:
-
-```bash
 npm run build
+npm run verify-ledger
 ```
 
-## Deployment Integrations Still Outstanding
+The last baseline before the 2026-07-13 trust-boundary hardening was **242 tests across 51 files**. The completed hardening passes **297 tests across 62 files**; `npm test` remains the source of truth as the suite evolves.
 
-The following remain deployment integrations until their required runtimes exist, and are reported as unavailable in the runtime capability report rather than simulated:
+## Deployment Boundaries
 
-- **Rust/Tauri process isolation and authenticated desktop IPC.** The TypeScript kernel remains the reference implementation; its validated contracts and independently replayable ledger (`npm run verify-ledger`) are the migration path to a compiled kernel.
-- **An operating-system sandbox confining project scripts.** Verification commands and the web-inspect fetch run on the trusted host. A real sandbox needs OS-level primitives (namespaces/jobs/seccomp) or the Rust runtime that a TypeScript workspace cannot honestly provide; the allowlists and capability tokens bound blast radius but are not isolation.
-- **Desktop and connector workers, and browser text-entry/downloads.** The write-capable browser worker (Playwright) now navigates and clicks through the approval pipeline, but desktop automation (UIA/AX/AT-SPI) and OAuth connectors are unbuilt, and browser text entry / downloads await an artifact store for typed payloads. The command sandbox provides real isolation only when Docker is installed; otherwise it falls back to the trusted host (reported honestly).
-- **Verified cross-platform vault.** Windows DPAPI is validated live; the macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but were unit-tested only (they need a real run on those OSes).
-- **Per-user isolation and external identity.** Multi-user accounts, roles (admin/operator/viewer), and signed session tokens exist, but goals/memory are not yet partitioned per user, and there is no SSO/OIDC. The API remains loopback-only by design.
+- No Rust/Tauri kernel or authenticated desktop IPC channel ships yet; the TypeScript kernel remains the reference implementation.
+- Docker supplies real command isolation when available. Without Docker, the runtime reports and uses a trusted-host fallback; native Windows job-object or Linux namespace/seccomp isolation is not implemented.
+- Desktop automation, OAuth connector runtimes, and browser downloads are not implemented.
+- macOS Keychain and Linux Secret Service adapters need live validation on their target operating systems.
+- Accounts share one local kernel state. There is no per-user goal/memory partitioning or SSO/OIDC.
+- Supervised releases do not hot-replace or proxy the trusted parent Express control plane; stable-port traffic switching remains a deployment concern.
+- Provider availability and model behavior depend on operator configuration and the upstream provider.
 
-## Architecture Direction
-
-For the delivered capability matrix and what remains, see **`docs/superpowers/CURRENT_STATE.md`** — the single authoritative status document.
-
-The approved target design and implementation history are documented in:
-
-- `docs/superpowers/specs/2026-06-21-sovereign-agent-design.md` (target architecture)
-- `docs/superpowers/specs/2026-07-12-completion-architecture.md` (completion definition)
-- `docs/superpowers/plans/2026-07-12-completion-implementation-record.md`
-- `docs/superpowers/plans/2026-07-13-hardening-and-parallelism-record.md`
-
-Phase 0 established the honest memory/chat prototype; Phase 1 introduced the TypeScript Kernel MVP; Phase 2 moved durable memory and the bounded skill foundry into the kernel; Phase 3 added normalized provider routing; Phases 4 and 5 added capability/automation contracts, Stop All, recovery, benchmarks, and release proposals; a final hardening pass added parallel execution, the Windows DPAPI vault, operator access control, and the independent ledger verifier — all within the boundaries listed above.
+For the concise capability matrix, see `docs/superpowers/CURRENT_STATE.md`. Design and implementation history live under `docs/superpowers/specs/` and `docs/superpowers/plans/`.

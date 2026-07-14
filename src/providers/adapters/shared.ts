@@ -70,11 +70,53 @@ export const parseStructuredText = (
   provider: ProviderId,
 ): unknown => {
   if (format.type === 'text') return undefined;
+  const trimmed = text.trim();
+  const candidates = [trimmed];
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(trimmed);
+  if (fenced) candidates.push(fenced[1].trim());
+
+  const start = Math.min(
+    ...[trimmed.indexOf('{'), trimmed.indexOf('[')].filter((index) => index >= 0),
+  );
+  if (Number.isFinite(start)) {
+    const opening = trimmed[start];
+    const closing = opening === '{' ? '}' : ']';
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let index = start; index < trimmed.length; index += 1) {
+      const character = trimmed[index];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') quoted = false;
+        continue;
+      }
+      if (character === '"') quoted = true;
+      else if (character === opening) depth += 1;
+      else if (character === closing) {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push(trimmed.slice(start, index + 1));
+          break;
+        }
+      }
+    }
+  }
+
   let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    throw new ProviderError('invalid_response', 'Provider returned invalid JSON output.', { provider, cause: error });
+  let parseError: unknown;
+  for (const candidate of [...new Set(candidates)]) {
+    try {
+      parsed = JSON.parse(candidate);
+      parseError = undefined;
+      break;
+    } catch (error) {
+      parseError = error;
+    }
+  }
+  if (parseError !== undefined) {
+    throw new ProviderError('invalid_response', 'Provider returned invalid JSON output.', { provider, cause: parseError });
   }
   if (format.type === 'json_schema') assertValidStructuredOutput(parsed, format.schema, provider);
   return parsed;

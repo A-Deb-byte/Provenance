@@ -167,10 +167,10 @@ describe('autonomy API', () => {
     expect(proposal.response.status).toBe(201);
 
     const activation = await postJson<{ activationState: string; activationReason: string }>(
-      `/release-proposals/${proposal.body.id}/activate`, {},
+      `/release-proposals/${proposal.body.id}/activate`, { artifactId: 'artifact_release' },
     );
     expect(activation.body.activationState).toBe('blocked');
-    expect(activation.body.activationReason).toMatch(/Unsigned/);
+    expect(activation.body.activationReason).toMatch(/lifecycle is unavailable/i);
   });
 
   it('returns an honest runtime capability report', async () => {
@@ -182,6 +182,7 @@ describe('autonomy API', () => {
     expect(body.features.secretVault.status).toBe('unavailable');
     expect(body.features.osSandbox.status).toBe('unavailable');
     expect(body.features.releaseSigning.status).toBe('unavailable');
+    expect(body.features.releaseDeployment.status).toBe('unavailable');
     expect(body.features.desktopIpc.status).toBe('unavailable');
   });
 

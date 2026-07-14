@@ -4,7 +4,9 @@ Date: 2026-07-13
 Status: Implemented and verified
 Parent: `docs/superpowers/plans/2026-07-12-completion-implementation-record.md`
 
-This session removed the last of the origin boilerplate, gave each agent framework a project-native identity, added parallel worker execution, and implemented the platform-native security layers that were previously documented as out of scope. Every claim is backed by tests (204 across 45 files) or the live capability report.
+> Historical slice: this record preserves what was true at the end of the parallelism pass. Docker/Playwright, cross-platform vault adapters, multi-user auth, dashboard auth, provider-gateway consolidation, approval continuation, snapshot authentication, and staged releases were delivered in later 2026-07-13 records.
+
+This session removed the last of the origin boilerplate, gave each agent framework a project-native identity, added parallel worker execution, and implemented the Windows security layers that were previously documented as out of scope. The 204-test count below is the result for this historical slice; the later pre-hardening baseline is 242 tests across 51 files.
 
 ## 1. De-branding
 
@@ -38,7 +40,7 @@ The default framework is `cartographer`. A persistence test asserts the old `vel
 `src/vault/dpapi.ts` protects secrets at rest with the OS user-scoped DPAPI master key via `System.Security.Cryptography.ProtectedData` (CurrentUser scope), invoked through PowerShell with the payload passed by environment variable (never the command line). This is platform-native protection, not an application-managed encryption key over a file — which is why it is honest to call it an OS vault.
 
 - `PUT/GET/DELETE /api/vault/secrets` and `/api/vault/status`. Values are never returned; only names and status.
-- At startup, allowlisted secrets (`GEMINI_API_KEY`, `RELEASE_SIGNING_PUBLIC_KEY`, `KERNEL_API_TOKEN`) are injected into the environment before the provider runtime and auth guard read them; an already-set environment value always wins.
+- At startup, allowlisted secrets are injected into the environment before the provider runtime and auth guard read them; an already-set environment value always wins. Later provider hardening expanded this allowlist to the supported provider credentials, including OpenRouter.
 - Non-Windows platforms report `unavailable` with an honest reason and refuse to store — no weaker fallback is substituted.
 - The runtime capability report now shows real vault status instead of a hardcoded "unavailable".
 
@@ -52,12 +54,12 @@ Verified live on this Windows host: store → list → retrieve → env-inject �
 
 `scripts/verify-ledger.mjs` (`npm run verify-ledger`) replays the JSONL ledger with zero project imports, recomputing each event hash and link and checking the snapshot head. It is the reference artifact for a future Rust verifier and demonstrates the ledger is replayable outside the TypeScript kernel — the concrete first step of the Rust migration path.
 
-## 7. What Is Still Honestly Out (And Why)
+## 7. Boundaries At The End Of This Historical Slice
 
-- **OS sandbox**: needs OS-level isolation primitives or the Rust runtime; allowlists and tokens bound blast radius but are not isolation. Not faked.
-- **Session-authenticated / desktop / connector workers**: the "hands" that need isolation and per-action permissioning first. The shipped web-inspect worker stays read-only and origin-allowlisted.
-- **Cross-platform vault**: macOS Keychain / Linux Secret Service adapters are not implemented; those platforms report unavailable.
-- **Multi-user accounts**: the operator token is one shared secret, not roles or sessions. Single-user, loopback-only by design.
+- **OS sandbox** was still missing here. A later pass added Docker isolation with an honestly reported trusted-host fallback.
+- **Browser writes and session auth** were still missing here. Later passes added Playwright navigation/click/type, L2 approval gates, redirect rechecks, and dashboard bearer-token integration. Desktop and connector workers remain out.
+- **Cross-platform vault** was Windows-only here. macOS Keychain and Linux Secret Service adapters were added later and still need target-OS live validation.
+- **Multi-user accounts** were still missing here. Roles and revocable sessions were added later; per-user state partitioning and SSO remain out.
 - **Rust/Tauri kernel**: the TypeScript kernel remains the reference; the verifier and replayable ledger are the migration path.
 
 ## 8. Verification

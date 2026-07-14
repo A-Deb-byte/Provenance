@@ -122,7 +122,12 @@ describe('kernel API', () => {
 
     const events = await requestJson<{ events: KernelEvent[] }>('/events');
     expect(events.response.status).toBe(200);
-    expect(events.body.events).toHaveLength(2);
+    expect(events.body.events.map((event) => event.type)).toEqual([
+      'goal.created',
+      'task.created',
+      'system.snapshot_prepared',
+      'system.snapshot_committed',
+    ]);
   });
 
   it('rejects malformed goal input', async () => {
@@ -284,11 +289,16 @@ describe('kernel API', () => {
     expect(evaluated.body.eligibleForCanary).toBe(true);
     const activated = await postJson<SkillActivation>(`/skills/${created.body.id}/canary`, { maxRuns: 1 });
     expect(activated.body.status).toBe('canary');
-    const run = await postJson<{ output: string; passed: boolean }>(`/skills/${created.body.id}/canary-runs`, {
+    const rejectedOracle = await postJson<{ error: string }>(`/skills/${created.body.id}/canary-runs`, {
       input: ' C ',
       expectedOutput: 'C',
     });
+    expect(rejectedOracle.response.status).toBe(400);
+    expect(rejectedOracle.body.error).toMatch(/kernel-owned independent oracle/i);
+    const run = await postJson<{ caseId: string; passed: boolean }>(`/skills/${created.body.id}/canary-runs`, {});
+    expect(run.response.status).toBe(200);
     expect(run.body.passed).toBe(true);
+    expect(run.body.caseId).toBe('kernel_canary_v1_0');
     const promoted = await postJson<SkillPackage>(`/skills/${created.body.id}/promote`, {});
     expect(promoted.body.status).toBe('promoted');
     const invoked = await postJson<{ output: string }>(`/skills/${created.body.id}/invoke`, { input: ' D ' });

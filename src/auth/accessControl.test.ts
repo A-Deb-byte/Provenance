@@ -35,6 +35,11 @@ const post = (p: string, body: unknown, token?: string) => fetch(`${baseUrl}${p}
   body: JSON.stringify(body),
 });
 
+const remove = (p: string, token: string) => fetch(`${baseUrl}${p}`, {
+  method: 'DELETE',
+  headers: { authorization: `Bearer ${token}` },
+});
+
 beforeEach(async () => {
   dir = await mkdtemp(path.join(os.tmpdir(), 'access-'));
   store = await createUserStore(path.join(dir, 'users.json'));
@@ -67,6 +72,9 @@ describe('guard: open and operator-token modes', () => {
 
   it('requires the operator token when configured and no users exist', async () => {
     await startApp('secret-token');
+    expect((await post('/api/auth/operator/verify', {})).status).toBe(401);
+    expect((await post('/api/auth/operator/verify', {}, 'wrong-token')).status).toBe(401);
+    expect((await post('/api/auth/operator/verify', {}, 'secret-token')).status).toBe(204);
     expect((await post('/api/kernel/thing', {})).status).toBe(401);
     expect((await post('/api/kernel/thing', {}, 'secret-token')).status).toBe(200);
     expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(200); // reads open
@@ -74,6 +82,14 @@ describe('guard: open and operator-token modes', () => {
 });
 
 describe('multi-user flow', () => {
+  it('requires the configured operator token for first-admin bootstrap', async () => {
+    await startApp('bootstrap-secret');
+    expect((await post('/api/auth/users', { username: 'admin1', password: 'adminpassword' })).status).toBe(401);
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    }, 'bootstrap-secret')).status).toBe(201);
+  });
+
   it('bootstraps the first admin, logs in, and enforces role-scoped mutations', async () => {
     await startApp(undefined);
 
@@ -91,8 +107,14 @@ describe('multi-user flow', () => {
     const adminToken = (await login.json()).token as string;
     expect((await post('/api/kernel/thing', {}, adminToken)).status).toBe(200);
 
+    // Logout persists a session-generation increment, revoking the token.
+    expect((await post('/api/auth/logout', {}, adminToken)).status).toBe(204);
+    expect((await post('/api/kernel/thing', {}, adminToken)).status).toBe(401);
+    const secondLogin = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
+    const refreshedAdminToken = (await secondLogin.json()).token as string;
+
     // Admin creates a viewer; viewer cannot mutate.
-    const created = await post('/api/auth/users', { username: 'viewer1', password: 'viewerpassword', role: 'viewer' }, adminToken);
+    const created = await post('/api/auth/users', { username: 'viewer1', password: 'viewerpassword', role: 'viewer' }, refreshedAdminToken);
     expect(created.status).toBe(201);
     const viewerToken = (await (await post('/api/auth/login', { username: 'viewer1', password: 'viewerpassword' })).json()).token;
     expect((await post('/api/kernel/thing', {}, viewerToken)).status).toBe(403);
@@ -103,5 +125,9 @@ describe('multi-user flow', () => {
 
     // Wrong password is rejected.
     expect((await post('/api/auth/login', { username: 'admin1', password: 'nope' })).status).toBe(401);
+
+    // The only administrator cannot be removed.
+    const adminId = store.list().find((user) => user.username === 'admin1')!.id;
+    expect((await remove(`/api/auth/users/${adminId}`, refreshedAdminToken)).status).toBe(409);
   });
 });

@@ -41,6 +41,58 @@ export interface SkillAndActivation {
   activation: SkillActivation;
 }
 
+export interface KernelCanaryCase {
+  id: string;
+  input: string;
+  expectedOutput: string;
+}
+
+const KERNEL_CANARY_INPUTS = Object.freeze([
+  '  Alpha   beta  ',
+  'zeta\r\nAlpha\nbeta',
+  '\tMiXeD Case\n',
+  'line 3\nline 1\nline 2',
+]);
+
+// This reference interpreter is intentionally separate from the executable
+// runtime so a canary does not compare the runtime with itself.
+const runReferenceTransform = (program: PureTransformProgram, input: string): string => {
+  let output = input;
+  for (const step of program.steps) {
+    switch (step.operation) {
+      case 'trim':
+        output = output.trim();
+        break;
+      case 'collapse_whitespace':
+        output = output.replace(/\s+/gu, ' ');
+        break;
+      case 'lowercase':
+        output = output.toLowerCase();
+        break;
+      case 'uppercase':
+        output = output.toUpperCase();
+        break;
+      case 'sort_lines':
+        output = output.replace(/\r\n?/gu, '\n').split('\n').sort(compareText).join('\n');
+        break;
+      default:
+        throw new Error('Kernel canary encountered an unsupported transform operation.');
+    }
+  }
+  return output;
+};
+
+export const getKernelCanaryCase = (skill: SkillPackage, runIndex: number): KernelCanaryCase => {
+  if (!Number.isSafeInteger(runIndex) || runIndex < 0) throw new Error('Kernel canary run index is invalid.');
+  const fixture = KERNEL_CANARY_INPUTS[runIndex % KERNEL_CANARY_INPUTS.length];
+  const input = fixture.slice(0, skill.manifest.maxInputChars);
+  return {
+    id: `kernel_canary_v1_${runIndex}`,
+    input,
+    expectedOutput: runReferenceTransform(skill.program, input),
+  };
+};
+
 export interface SkillPackageLedgerMetadata {
   skillId: string;
   name: string;
@@ -57,6 +109,9 @@ export interface SkillPackageLedgerMetadata {
 export interface SkillActivationLedgerMetadata {
   activationId: string;
   skillId: string;
+  evaluationId: string;
+  suiteHash: string;
+  replayCaseIds: string[];
   status: SkillActivation['status'];
   maxRuns: number;
   usedRuns: number;
@@ -236,12 +291,22 @@ export const activateSkillCanary = (
   if (!Number.isInteger(input.maxRuns) || input.maxRuns < 1 || input.maxRuns > 100) {
     throw new Error('Canary maxRuns must be between 1 and 100.');
   }
+  if (evaluation.caseResults.length === 0 || evaluation.caseResults.some((result) => !result.passed)) {
+    throw new Error('Canary activation requires a successful held-out evaluation suite.');
+  }
+  const replayCaseIds = Array.from(
+    { length: input.maxRuns },
+    (_, index) => getKernelCanaryCase(skill, index).id,
+  );
 
   return {
     skill: { ...skill, status: 'canary', updatedAt: input.createdAt },
     activation: {
       id: input.activationId,
       skillId: skill.id,
+      evaluationId: evaluation.id,
+      suiteHash: skill.contentHash,
+      replayCaseIds,
       status: 'canary',
       maxRuns: input.maxRuns,
       usedRuns: 0,
@@ -342,6 +407,9 @@ export const getSkillActivationLedgerMetadata = (
 ): SkillActivationLedgerMetadata => ({
   activationId: activation.id,
   skillId: activation.skillId,
+  evaluationId: activation.evaluationId,
+  suiteHash: activation.suiteHash,
+  replayCaseIds: [...activation.replayCaseIds],
   status: activation.status,
   maxRuns: activation.maxRuns,
   usedRuns: activation.usedRuns,

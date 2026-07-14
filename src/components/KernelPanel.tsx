@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { ApprovalRecord, GoalContract, KernelEvent } from '../kernel/types';
+import { authenticatedFetch } from '../lib/auth';
 
 interface KernelSnapshot {
   goals: GoalContract[];
@@ -18,7 +19,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => (
 );
 
 const fetchCollection = async <T,>(url: string, key: string): Promise<T[]> => {
-  const response = await fetch(url);
+  const response = await authenticatedFetch(url);
   if (!response.ok) {
     throw new Error(`${key} request failed with status ${response.status}.`);
   }

@@ -1,9 +1,12 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { clearAuthSession, useOperatorToken } from '../lib/auth';
 import { ProviderPanel } from './ProviderPanel';
 
 afterEach(() => {
   cleanup();
+  clearAuthSession();
+  sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -90,5 +93,35 @@ describe('ProviderPanel', () => {
     render(<ProviderPanel />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Provider status unavailable');
+  });
+
+  it('retries the protected routing preview as soon as authentication changes', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/status')) {
+        return { ok: true, status: 200, json: async () => ({ providers: statuses }) } as Response;
+      }
+      const authorization = new Headers(init?.headers).get('authorization');
+      if (authorization !== 'Bearer operator-secret') {
+        return { ok: false, status: 401, json: async () => ({ error: 'Authentication required.' }) } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ plan: {
+          mode: 'automatic',
+          selections: [{ provider: 'gemini', model: 'gemini-3.5-flash' }],
+          reason: 'Authenticated preview.',
+        } }),
+      } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<ProviderPanel />);
+
+    expect(await screen.findByText('Routing preview unavailable.')).toBeInTheDocument();
+    await act(async () => { await useOperatorToken('operator-secret'); });
+
+    expect(await screen.findByText('Authenticated preview.')).toBeInTheDocument();
+    const planCalls = fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/plan'));
+    expect(planCalls).toHaveLength(2);
   });
 });

@@ -51,6 +51,8 @@ describe('kernel service', () => {
     expect((await kernel.getEvents()).map((event) => event.type)).toEqual([
       'goal.created',
       'task.created',
+      'system.snapshot_prepared',
+      'system.snapshot_committed',
     ]);
   });
 
@@ -88,18 +90,18 @@ describe('kernel service', () => {
     const events = await kernel.getEvents();
     expect(state.goals).toHaveLength(2);
     expect(state.tasks).toHaveLength(2);
-    expect(events).toHaveLength(4);
+    expect(events).toHaveLength(8);
     events.forEach((event, index) => {
       expect(event.previousHash).toBe(index === 0 ? null : events[index - 1].hash);
     });
   });
 
-  it('fails closed when the snapshot head no longer matches the ledger', async () => {
+  it('repairs a stale primary snapshot from its authenticated replica', async () => {
     const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
     await kernel.createGoal(goalInput('Detect stale snapshot'));
     const state = await kernel.getState();
     await writeKernelState(runtimeDir, { ...state, lastEventHash: null });
 
-    await expect(kernel.getState()).rejects.toThrow('snapshot');
+    expect((await kernel.getState()).lastEventHash).toBe(state.lastEventHash);
   });
 });

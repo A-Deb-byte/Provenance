@@ -24,6 +24,9 @@ export interface KernelRouterOptions {
   readonly accessControlStatus?: () => { status: 'available' | 'unavailable'; reason: string };
   readonly sandbox?: SandboxRunner;
   readonly artifactStore?: import('./artifacts/artifactStore').ArtifactStore;
+  readonly capabilityGrantStore?: import('../capabilities/grantStore').CapabilityGrantStore;
+  readonly releaseLifecycle?: ReturnType<typeof import('./releases/lifecycle').createReleaseLifecycle>;
+  readonly kernelService?: ReturnType<typeof createKernelService>;
 }
 
 type ApprovalDecisionStatus = 'approved' | 'denied';
@@ -47,8 +50,10 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     observationAssessor: options.observationAssessor,
     sandbox: options.sandbox,
     artifactStore: options.artifactStore,
+    capabilityGrantStore: options.capabilityGrantStore,
+    releaseLifecycle: options.releaseLifecycle,
   });
-  const kernel = createKernelService(config);
+  const kernel = options.kernelService ?? createKernelService(config);
   const router = express.Router();
 
   // Interrupted running tasks are recovered into an inspectable blocked
@@ -275,14 +280,12 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
   });
 
   router.post('/skills/:skillId/canary-runs', async (req, res) => {
-    const input = req.body?.input as unknown;
-    const expectedOutput = req.body?.expectedOutput as unknown;
-    if (typeof input !== 'string' || typeof expectedOutput !== 'string') {
-      res.status(400).json({ error: 'Canary input and expectedOutput must be strings.' });
+    if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+      res.status(400).json({ error: 'Canary runs use a kernel-owned independent oracle and accept no caller oracle.' });
       return;
     }
     try {
-      res.json(await kernel.runSkillCanary(req.params.skillId, input, expectedOutput));
+      res.json(await kernel.runSkillCanary(req.params.skillId));
     } catch (error) {
       const message = errorMessage(error);
       res.status(message.endsWith('not found.') ? 404 : 409).json({ error: message });
@@ -472,8 +475,13 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
   });
 
   router.post('/release-proposals/:releaseId/activate', async (req, res) => {
+    const artifactId = req.body?.artifactId as unknown;
+    if (typeof artifactId !== 'string' || !artifactId.trim()) {
+      res.status(400).json({ error: 'Release artifact id is required.' });
+      return;
+    }
     try {
-      res.json(await kernel.activateReleaseProposal(req.params.releaseId));
+      res.json(await kernel.activateReleaseProposal(req.params.releaseId, artifactId.trim()));
     } catch (error) {
       const message = errorMessage(error);
       res.status(message === 'Release proposal not found.' ? 404 : 409).json({ error: message });
@@ -526,12 +534,27 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
       const osSandbox = options.sandbox
         ? (() => { const s = sandboxStatus(options.sandbox!); return { status: s.status, reason: s.reason }; })()
         : undefined;
+      const releaseDeployment = options.releaseLifecycle
+        ? (() => {
+          const status = options.releaseLifecycle!.getProcessStatus();
+          return status.activeReleaseId
+            ? {
+              status: 'available' as const,
+              reason: `Supervised core release ${status.activeReleaseId} is active in process ${String(status.activePid)}.`,
+            }
+            : {
+              status: 'configured' as const,
+              reason: 'The signed core-release supervisor is installed; no release child is active.',
+            };
+        })()
+        : undefined;
       res.json(buildRuntimeCapabilityReport({
         providerStatuses: options.providerStatuses ?? [],
         workerReport: kernel.getWorkers().report,
         stopAll: state.controls.stopAll,
         coreModel,
         releaseSigningConfigured: Boolean(options.releaseSigningPublicKey?.trim()),
+        releaseDeployment,
         secretVault,
         accessControl,
         osSandbox,

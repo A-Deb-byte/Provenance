@@ -63,6 +63,17 @@ export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandl
     res.status(401).json({ error: 'A valid session token is required. Log in at /api/auth/login.' });
     return;
   }
+  const currentUser = deps.userStore.findById(claims.userId);
+  const currentSessionVersion = deps.userStore.sessionVersion(claims.userId);
+  if (
+    !currentUser ||
+    currentUser.username !== claims.username ||
+    currentUser.role !== claims.role ||
+    currentSessionVersion !== claims.sessionVersion
+  ) {
+    res.status(401).json({ error: 'This session has been revoked. Log in again.' });
+    return;
+  }
   if (claims.role === 'viewer') {
     res.status(403).json({ error: 'Your role is read-only and cannot perform this action.' });
     return;

@@ -209,6 +209,7 @@ export const promoteMemoryRecord = (
   records: readonly KernelMemoryRecord[],
   memoryId: string,
   reason: string,
+  validatedEvidenceEventIds: readonly string[],
   now = new Date().toISOString(),
 ): MemoryTransitionResult => {
   requireUniqueRecordIds(records);
@@ -219,6 +220,10 @@ export const promoteMemoryRecord = (
   if (candidate.status !== 'candidate') throw new Error('Only candidate memory can be promoted.');
   if (!isMemoryEvidenceRefArray(candidate.evidenceRefs) || candidate.evidenceRefs.length === 0) {
     throw new Error('Memory promotion requires at least one valid evidence reference.');
+  }
+  const validatedEvidence = new Set(validatedEvidenceEventIds);
+  if (!candidate.evidenceRefs.some((reference) => validatedEvidence.has(reference.eventId))) {
+    throw new Error('Memory promotion requires independent source-backed evidence.');
   }
 
   const supersedes = new Set(candidate.supersedesIds);

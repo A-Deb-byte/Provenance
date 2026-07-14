@@ -1,4 +1,8 @@
 import { existsSync } from 'node:fs';
+import {
+  claimCapabilityDispatchAuthorization,
+  type CapabilityDispatchAuthorization,
+} from '../../capabilities/dispatch';
 import type { ActionIntent, BrowserAction } from '../../capabilities/types';
 
 /**
@@ -50,6 +54,7 @@ export interface BrowserWorkerResult {
 }
 
 const MAX_CONTENT_CHARS = 64 * 1024;
+const MAX_TYPED_PAYLOAD_CHARS = 64 * 1024;
 
 type WriteAction = Extract<BrowserAction, { type: 'browser.navigate' | 'browser.click' | 'browser.type' }>;
 
@@ -64,8 +69,17 @@ const fail = (summary: string, sourceRef: string, errorCode: string): BrowserWor
 export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: ArtifactResolver) => ({
   execute: async (
     intent: ActionIntent,
-    options: { timeoutMs: number },
+    options: { timeoutMs: number; authorization?: CapabilityDispatchAuthorization },
   ): Promise<BrowserWorkerResult> => {
+    const authorization = claimCapabilityDispatchAuthorization(
+      options.authorization,
+      intent,
+      intent.workerId,
+    );
+    if (!authorization.allowed) {
+      return fail(authorization.reason, 'about:invalid', authorization.reasonCode ?? 'authorization_invalid');
+    }
+
     const action = intent.action as BrowserAction;
     if (!isWriteAction(action)) {
       return fail('Browser worker performs only navigate, click, and type actions.', 'about:invalid', 'unsupported_action');
@@ -88,6 +102,9 @@ export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: Ar
       if (!artifactResolver) return fail('No artifact store is configured for text entry.', action.url, 'no_artifact_store');
       const resolved = await artifactResolver(action.payloadArtifactId);
       if (!resolved) return fail('Typed-payload artifact was not found.', action.url, 'artifact_not_found');
+      if (resolved.content.length > MAX_TYPED_PAYLOAD_CHARS) {
+        return fail('Typed-payload artifact exceeds the browser entry limit.', action.url, 'payload_too_large');
+      }
       if (resolved.contentHash !== action.payloadHash) {
         return fail('Typed-payload hash does not match the artifact.', action.url, 'payload_hash_mismatch');
       }
@@ -102,6 +119,14 @@ export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: Ar
       text,
       timeoutMs: Math.min(options.timeoutMs, 30_000),
     });
+
+    try {
+      if (new URL(result.finalUrl).origin !== action.origin) {
+        return fail('Browser origin drifted outside the authorized origin.', result.finalUrl, 'origin_drift');
+      }
+    } catch {
+      return fail('Browser returned an invalid final URL.', result.finalUrl || action.url, 'origin_drift');
+    }
 
     // The typed value itself is never echoed into the summary (it may be
     // sensitive); only its length is recorded.
@@ -154,14 +179,33 @@ const importPlaywright = new Function(
 export interface PlaywrightDriverOptions {
   userDataDir: string;
   headless?: boolean;
+  moduleLoader?: () => Promise<PlaywrightModule>;
 }
+
+class OriginDriftError extends Error {
+  constructor(readonly finalUrl: string) {
+    super('Browser navigated outside the authorized origin.');
+    this.name = 'OriginDriftError';
+  }
+}
+
+const requirePageOrigin = (page: PlaywrightPage, expectedOrigin: string): void => {
+  const finalUrl = page.url();
+  try {
+    if (new URL(finalUrl).origin !== expectedOrigin) throw new OriginDriftError(finalUrl);
+  } catch (error) {
+    if (error instanceof OriginDriftError) throw error;
+    throw new OriginDriftError(finalUrl);
+  }
+};
 
 export const createPlaywrightDriver = (options: PlaywrightDriverOptions): BrowserDriver => {
   let contextPromise: Promise<PlaywrightContext> | undefined;
+  const loadModule = options.moduleLoader ?? importPlaywright;
 
   const getPage = async (): Promise<PlaywrightPage> => {
     if (!contextPromise) {
-      contextPromise = importPlaywright().then((mod) => mod.chromium.launchPersistentContext(options.userDataDir, {
+      contextPromise = loadModule().then((mod) => mod.chromium.launchPersistentContext(options.userDataDir, {
         headless: options.headless ?? true,
       }));
     }
@@ -173,7 +217,7 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
   return {
     isAvailable: async () => {
       try {
-        const mod = await importPlaywright();
+        const mod = await loadModule();
         // executablePath() returns the expected path even when the browser is
         // not downloaded, so confirm the binary actually exists on disk.
         const executable = mod.chromium.executablePath();
@@ -187,24 +231,31 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
         const page = await getPage();
         if (request.type === 'browser.navigate') {
           await page.goto(request.url, { timeout: request.timeoutMs, waitUntil: 'domcontentloaded' });
+          requirePageOrigin(page, request.origin);
         } else {
           if (page.url() !== request.url) {
             await page.goto(request.url, { timeout: request.timeoutMs, waitUntil: 'domcontentloaded' });
           }
+          // A redirect must be rejected before any click or text entry occurs.
+          requirePageOrigin(page, request.origin);
           if (request.type === 'browser.type') {
             await page.fill(request.selector ?? '', request.text ?? '', { timeout: request.timeoutMs });
           } else {
             await page.click(request.selector ?? '', { timeout: request.timeoutMs });
           }
+          // Clicks and page scripts may navigate; re-check before reading data.
+          requirePageOrigin(page, request.origin);
         }
         const content = await page.innerText('body', { timeout: request.timeoutMs }).catch(() => '');
         return { status: 'succeeded', finalUrl: page.url(), content };
       } catch (error) {
         return {
           status: 'failed',
-          finalUrl: request.url,
+          finalUrl: error instanceof OriginDriftError ? error.finalUrl : request.url,
           content: '',
-          errorCode: error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport',
+          errorCode: error instanceof OriginDriftError
+            ? 'origin_drift'
+            : error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport',
         };
       }
     },

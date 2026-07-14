@@ -1,66 +1,74 @@
-# Current State — Capability Matrix
+# Current State - Capability Matrix
 
 Date: 2026-07-13
-Purpose: The single authoritative answer to "what does this product do, and what is still missing."
-Verification basis: `npm run lint` clean, 234 tests across 50 files passing, `npm run build` clean, `npm run verify-ledger` clean, and a live runtime capability report.
+Purpose: the authoritative concise answer to "what does this product do, and what is still missing?"
+
+Verification note: the pre-hardening baseline was **242 tests across 51 files**. The completed trust-boundary pass is `npm run lint` clean, **297 tests across 62 files**, `npm run build` clean, and `npm run verify-ledger` clean.
 
 ## What This Product Is
 
-A **local-first, single-user sovereign-agent control plane** with a browser dashboard. A trusted TypeScript kernel owns goals, evidence, memory, skills, provider routing, capability grants, and an append-only hash-chained ledger. Models — cloud providers or an embedded on-device model — *propose*; the deterministic kernel and the human *decide*. The dashboard projects only recorded kernel state, never generated narrative.
+Provenance is a local-first agent control plane with a browser dashboard and a trusted TypeScript kernel. The kernel owns goals, evidence, budgets, approvals, memory, skills, provider calls, capability dispatch, automations, recovery, snapshot commits, and release records. Models propose content and actions; deterministic policy and explicit human authority decide what can persist or execute.
 
-It is **not** a hardened, multi-user, isolated production runtime. The boundaries below are reported honestly at runtime rather than simulated.
+Multi-user authentication exists, but users share one local kernel state. The product is therefore a loopback-oriented local deployment, not a hardened multi-tenant service.
 
 ## Capability Matrix
 
-Legend: **Done** = implemented and test-covered · **Done*** = also live-verified against the real runtime · **Partial** = works within stated limits · **Boundary** = deliberately not built, reported unavailable with a reason.
+Legend: **Implemented** = present with focused tests; **Live** = also verified against the real local runtime; **Partial** = useful within a documented boundary; **Boundary** = deliberately unavailable rather than simulated.
 
-| Capability | State | Notes |
+| Capability | State | Current boundary |
 | --- | --- | --- |
-| Goal contracts + evidence-gated task lifecycle | Done | Completion requires verifier exit-code evidence, not model claims. |
-| Hash-chained tamper-evident ledger | Done | Verified on every read; independently replayable via `npm run verify-ledger`. |
-| Budgets, approvals, capability tokens | Done | Per-goal operation/runtime/approval/provider caps; single-use exact-scoped tokens. |
-| Durable memory lifecycle | Done | candidate → promoted → superseded/revoked, provenance + evidence refs; content hashes in ledger. |
-| Skill foundry (bounded DSL) | Done | Synthesize/evaluate/canary/promote/rollback; never executes generated code. |
-| Provider routing (6 providers) | Partial | Adapters + automatic/pinned/ensemble routing built; live calls need credentials. Bedrock is an unavailable boundary. |
-| On-device core model (MiniCPM5-1B) | Done | In-process via `node-llama-cpp`; local extraction, chat fallback, tighten-only injection assessment. |
-| Web-inspect worker + executable automations | Partial | Read-only, origin-allowlisted `browser.inspect`; full policy→grant→observation→ledger pipeline. |
-| Write-capable browser worker (Playwright) | Done* | navigate/click/type through the approval pipeline; live-verified via playwright-core/Chromium (navigation and form text entry). Downloads still out. |
-| Hash-addressed artifact store | Done | Stages typed payloads (sha256-addressed); text entry can only enter a value whose hash the intent declares. Ledgered on create; content never in the ledger or listings. |
-| OS process sandbox (Docker) | Done* | Verification commands run in an ephemeral container (no network, read-only root, 2g/512pids/2cpu, workspace-only mount); live-verified (`npm run lint` exit 0 in-container, DNS blocked). Honest host fallback when Docker is absent. |
-| Parallel multi-goal execution | Done | Up to 8 goals; worker commands run in parallel OS processes, state stays serialized. |
-| Recovery + Stop All | Done | Interrupted tasks recover to an inspectable blocked state; Stop All halts execution. |
-| Release proposals + Ed25519 signing | Done | Correctly signed proposals activate; unsigned/keyless/forged stay blocked with reasons. |
-| Cross-platform OS secret vault | Partial | Windows DPAPI, macOS Keychain, Linux Secret Service, selected by platform; each reports unavailable off-target. Values never returned. |
-| Multi-user access control | Done | File-backed accounts (scrypt), signed expiring session tokens, admin/operator/viewer roles; shared-token and open-loopback fallbacks. |
-| Auto-refreshing dashboard | Done | Four panels poll recorded state every 5s. |
+| Goal contracts and evidence-gated tasks | Implemented | Planner executes only allowlisted verification commands. |
+| Budgets and Stop All | Implemented | Budgets are local counters; Stop All is a persisted kernel control. |
+| Provider gateway for chat/extract/mutate/skill draft | Implemented | Uses configured providers only; no direct legacy Gemini bypass. |
+| Provider routing | Partial | Automatic, pinned, and ensemble routes exist; live availability depends on credentials and upstream service. Bedrock remains unavailable without its runtime. |
+| Durable memory lifecycle | Implemented | Promotion requires explicit reason plus independent source-backed ledger evidence; candidate creation cannot attest itself. |
+| Bounded skill foundry | Implemented | Executes only `pure-transform-v1`; canary runs use kernel-generated fixtures and a separate reference interpreter, with no caller oracle at run time. |
+| Authenticated dashboard | Implemented | Supports status, operator token, first-admin bootstrap, login, logout, and revoked-session handling. Viewers are read-only. |
+| Loopback request protection | Implemented | Host/origin and `Sec-Fetch-Site` checks protect mutations; security headers are applied. This is not remote-service hardening. |
+| Browser inspect worker | Partial | L0, origin-allowlisted, bounded read-only fetch. |
+| Playwright browser worker | Live | Navigate/click/type are minimum L2, approval-gated, and origin-checked before and after navigation. Downloads are unavailable. |
+| Approval continuation | Implemented | L2/L3 runs persist an approval; a matching approved record can authorize a later execution. |
+| Capability dispatch gate | Implemented | Grant is persisted and consumed before I/O; a one-use opaque authorization must be claimed immediately before dispatch. |
+| Hash-addressed artifact store | Implemented | Text entry resolves a pre-staged value and verifies the intent-declared hash; payload content is not ledgered. |
+| Docker command sandbox | Live | No network, read-only root, bounded resources, workspace mount. Trusted-host fallback is reported when Docker is absent. |
+| Parallel goal execution | Implemented | Up to eight goal steps; worker commands overlap while kernel state mutations remain serialized. |
+| Event ledger and snapshot integrity | Implemented | Hash-chained ledger plus ledger-authenticated canonical snapshot hash, recovery replica, interrupted-commit repair, and abandoned-tail evidence. Not full event-sourced reconstruction. |
+| Controlled staged releases | Implemented | Canonical authorization signature, evaluation/artifact verification, controlled install, supervised Node readiness, atomic process switch, failure rollback, and startup restoration. Does not rewrite source or hot-replace the trusted parent control plane. |
+| OS secret vault | Partial | Windows DPAPI is live-verified; macOS Keychain and Linux Secret Service are implemented but need target-OS live validation. Values are never returned. |
+| Multi-user access control | Implemented | Scrypt password records, signed expiring/revocable sessions, admin/operator/viewer roles; no per-user data partitioning. |
+| Kernel-backed dashboard state | Implemented | Authoritative memory/skill/provider state comes from APIs. `localStorage` retains presentation-only chat state and lens selection; `sessionStorage` may hold the transient active bearer, whose validity remains server-authoritative. |
+| Optional on-device core model | Partial | Advisory tighten-only injection assessment; it cannot bypass provider routing or kernel authority. |
 
-## What Is Still Missing (Boundaries, With Reasons)
+## Security-Critical Flows
 
-- **Sandbox depends on Docker being installed** — live-verified with Docker Desktop present (container isolation + `--network none` confirmed). When no container runtime is present, verification falls back to the trusted host (reported honestly). Native OS-primitive isolation (job objects/namespaces/seccomp) without Docker still needs a compiled/native runtime.
-- **Desktop and connector workers, and browser downloads** — the browser "hand" now navigates, clicks, and enters form text (via the hash-addressed artifact store), but desktop automation (UIA/AX/AT-SPI), OAuth connectors, and browser file downloads remain unbuilt.
-- **Cross-platform vault is unverified off-Windows** — the macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but were validated only by construction/unit tests on Windows; they need a real run on those OSes.
-- **Multi-user is single shared deployment** — accounts, roles, and sessions exist, but there is no per-user data partitioning of goals/memory yet, and no external identity provider (SSO/OIDC).
-- **Rust/Tauri kernel** — the TypeScript kernel is the reference implementation. Its validated contracts and the zero-import ledger verifier (`npm run verify-ledger`) are the concrete migration path to a compiled kernel.
-- **Live cloud provider execution** — requires operator-supplied credentials (env or vault); no keys ship with the repo.
+### Application AI
 
-## Live Runtime Report (representative)
+`/api/chat`, `/api/extract`, `/api/mutate`, and `/api/self-improve` pass through the application AI router, the configured provider policy, kernel provider-call accounting, ledger evidence, and the unified mutation access guard. Provider results include route provenance. Extraction creates candidates; it does not promote memory.
 
-With core-model weights installed, the web-inspect origin allowlist set, an operator token configured, and no cloud provider key:
+### Browser automation
 
-| Feature | Status |
-| --- | --- |
-| verificationCommands | available |
-| coreModel | available |
-| secretVault | available (windows_dpapi) |
-| accessControl | available |
-| backgroundAutomation | configured (web-inspect worker) |
-| providerCalls | unavailable (no credentials) |
-| osSandbox | unavailable (boundary) |
-| releaseSigning | unavailable until a public key is configured |
-| desktopIpc | unavailable (boundary) |
+`browser.inspect` remains L0. Navigation, clicking, typing, and downloads have an L2 minimum. Redirected or script-navigated pages are checked against the authorized origin before any click/type and again after the action. Approval-gated runs can resume only with their matching approved record. The persisted capability grant is consumed before the worker is allowed to perform I/O.
 
-Statuses move with configuration: add a provider key and `providerCalls` becomes available; set `RELEASE_SIGNING_PUBLIC_KEY` and `releaseSigning` becomes configured. Nothing here is hardcoded — it is all derived from recorded state.
+### Persistence
 
-## One-Line Summary
+Every committed snapshot has a canonical content hash referenced by ledgered prepare/commit events. Startup accepts only a matching primary or authenticated recovery copy, completes interrupted publication, and marks abandoned ledger tails. The snapshot is authenticated by the ledger; domain-event payloads are not claimed to form a complete replay database.
 
-The **trust substrate is complete and verified**: contracts, evidence, memory, skills, routing, capabilities, recovery, an embedded local model, at-rest secret protection, access control, and parallel execution — everything feasible in a local TypeScript workspace. What remains is **isolation and reach**: the OS-level sandbox and the session-carrying "hands," which need a compiled/OS-native runtime to ship honestly.
+### Releases
+
+The Ed25519 signature binds target version, package hash, sorted evaluation references, and rollback instructions. Activation verifies the artifact and installed files, starts only the package's declared controlled `.cjs` entrypoint with a fixed Node invocation and minimal environment, then requires a nonce/version/hash IPC readiness proof and stability window. The previous supervised child remains active until commit; candidate failure terminates and removes only the candidate. Startup revalidates the complete authorization, artifact, installed hashes, and health before restoring the active child.
+
+The trusted parent Express control plane remains stable and owns policy, signatures, and rollback. A signed child does not rewrite repository source, inherit arbitrary parent secrets, or hot-replace the parent listener.
+
+## What Is Still Missing
+
+- Rust/Tauri process isolation and authenticated desktop IPC.
+- Native non-Docker command isolation.
+- Desktop automation, OAuth connector workers, and browser downloads.
+- Live macOS/Linux vault verification.
+- Per-user goal/memory partitioning and SSO/OIDC.
+- Stable-port reverse proxying or an external blue/green cutover that replaces the trusted parent control-plane process.
+- Arbitrary shell authority or arbitrary autonomous core self-modification; both are intentionally outside the security model.
+
+## Configuration-Dependent Status
+
+The runtime capability report is the source of truth for local availability. Provider calls become available only when a supported server-side credential is configured. Browser workers require an installed browser engine plus origin allowlists. Docker isolation requires a reachable daemon. Release activation requires a verification key, signed authorization, evaluation references, and a staged matching executable package; the report distinguishes an idle supervisor from an active child. Unavailable integrations remain explicit instead of being simulated.

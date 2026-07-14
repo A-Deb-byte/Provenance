@@ -5,6 +5,7 @@ export interface SessionClaims {
   userId: string;
   username: string;
   role: UserRole;
+  sessionVersion: number;
   exp: number;
 }
 
@@ -46,7 +47,13 @@ export const verifySession = (
   try {
     const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as SessionClaims;
     if (typeof claims.exp !== 'number' || claims.exp <= now) return undefined;
-    if (typeof claims.userId !== 'string' || typeof claims.role !== 'string') return undefined;
+    if (
+      typeof claims.userId !== 'string' ||
+      typeof claims.username !== 'string' ||
+      !['admin', 'operator', 'viewer'].includes(claims.role) ||
+      !Number.isSafeInteger(claims.sessionVersion) ||
+      claims.sessionVersion < 0
+    ) return undefined;
     return claims;
   } catch {
     return undefined;

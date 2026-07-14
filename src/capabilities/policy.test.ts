@@ -1,19 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import { browserIntent, browserScope, browserWorker } from './testFixtures';
-import { decideActionPolicy } from './policy';
+import { decideActionPolicy, minimumRiskForAction } from './policy';
 import { createWorkerRegistry } from './registry';
 import { ActionIntent, WorkerRegistration } from './types';
 
 describe('capability policy', () => {
-  it('allows L0 and L1 only for an available worker and configured scope', () => {
+  it('allows L0 inspection but requires approval for browser state changes', () => {
     const registry = createWorkerRegistry([browserWorker]);
     expect(decideActionPolicy(browserIntent(), registry).kind).toBe('allow');
-    expect(decideActionPolicy(browserIntent({
-      riskLevel: 'L1',
+    const navigation = browserIntent({
+      riskLevel: 'L2',
       action: {
         type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/next',
       },
-    }), registry).kind).toBe('allow');
+    });
+    expect(decideActionPolicy(navigation, registry).kind).toBe('approval_required');
+    expect(decideActionPolicy({
+      ...navigation,
+      authority: { kind: 'approval', referenceId: 'approval_1' },
+    }, registry).kind).toBe('allow');
+
+    expect([
+      { type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/' } as const,
+      { type: 'browser.click', origin: 'https://example.com', url: 'https://example.com/', selector: '#ok' } as const,
+      { type: 'browser.type', origin: 'https://example.com', url: 'https://example.com/', selector: '#q', payloadArtifactId: 'artifact_1', payloadHash: 'a'.repeat(64) } as const,
+      { type: 'browser.download', origin: 'https://example.com', url: 'https://example.com/a', downloadRoot: 'C:\\Downloads', fileName: 'a.txt' } as const,
+    ].map(minimumRiskForAction)).toEqual(['L2', 'L2', 'L2', 'L2']);
 
     const configured: WorkerRegistration = { ...browserWorker, availability: 'configured' };
     expect(decideActionPolicy(browserIntent(), createWorkerRegistry([configured]))).toMatchObject({

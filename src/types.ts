@@ -40,6 +40,7 @@ export interface ResearchMutation {
   novelInsight: string;
   mathematicalBounds: string;
   suggestedActionItems: string[];
+  evidenceEventId: string;
   createdAt: string;
 }
 

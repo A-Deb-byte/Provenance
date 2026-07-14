@@ -3,9 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { browserScope, browserWorker } from '../capabilities/testFixtures';
+import { createMemoryCapabilityGrantStore } from '../capabilities/grantStore';
 import { createFileArtifactStore, hashArtifactContent } from './artifacts/artifactStore';
 import { createKernelService } from './kernel';
-import { writeKernelState } from './store';
+import { appendKernelEvent } from './ledger';
+import { hashKernelStateContent, writeKernelRecoveryState, writeKernelState } from './store';
+import type { KernelState } from './types';
 
 let runtimeDir = '';
 let workspaceRoot = '';
@@ -49,6 +52,34 @@ const releaseInput = (evaluationEventIds: string[], signature?: string) => ({
   rollbackInstructions: 'Reinstall the previous bundle from the artifact store.',
   signature,
 });
+
+const persistAuthenticatedState = async (state: KernelState): Promise<void> => {
+  const stateHash = hashKernelStateContent(state);
+  const prepared = await appendKernelEvent(runtimeDir, state.lastEventHash, {
+    actor: 'system',
+    type: 'system.snapshot_prepared',
+    entityId: 'kernel-state',
+    entityType: 'system',
+    payload: { schemaVersion: 1, baseEventHash: state.lastEventHash, stateHash },
+  });
+  const committed = await appendKernelEvent(runtimeDir, prepared.hash, {
+    actor: 'system',
+    type: 'system.snapshot_committed',
+    entityId: 'kernel-state',
+    entityType: 'system',
+    payload: {
+      schemaVersion: 1,
+      baseEventHash: prepared.hash,
+      preparedEventHash: prepared.hash,
+      stateHash,
+    },
+  });
+  const committedState = { ...state, lastEventHash: committed.hash };
+  await Promise.all([
+    writeKernelState(runtimeDir, committedState),
+    writeKernelRecoveryState(runtimeDir, committedState),
+  ]);
+};
 
 beforeEach(async () => {
   runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'kernel-autonomy-'));
@@ -166,7 +197,7 @@ describe('recovery', () => {
     const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
     const goal = await kernel.createGoal(goalInput());
     const state = await kernel.getState();
-    await writeKernelState(runtimeDir, {
+    await persistAuthenticatedState({
       ...state,
       tasks: state.tasks.map((task) => ({ ...task, status: 'running' as const })),
     });
@@ -178,7 +209,7 @@ describe('recovery', () => {
     expect(recovered.tasks[0].status).toBe('blocked');
     expect(recovered.goals.find((candidate) => candidate.id === goal.id)?.status).toBe('blocked');
     const events = await kernel.getEvents();
-    expect(events.at(-1)?.type).toBe('task.recovered');
+    expect(events.map((event) => event.type)).toContain('task.recovered');
   });
 
   it('is a no-op when no task was interrupted', async () => {
@@ -194,19 +225,32 @@ describe('recovery', () => {
 
 describe('release proposals', () => {
   it('records proposals, blocks unsigned activation, and blocks signed activation without a key', async () => {
-    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    const releaseLifecycle = {
+      activate: async (proposal: { signature?: string }) => proposal.signature
+        ? { status: 'blocked' as const, reasonCode: 'signature_invalid' as const, reason: 'Release signature failed verification.' }
+        : { status: 'blocked' as const, reasonCode: 'signature_missing' as const, reason: 'Release proposal has no Ed25519 signature.' },
+      restoreActive: async () => ({
+        status: 'blocked' as const,
+        reasonCode: 'active_manifest_missing' as const,
+        reason: 'No active release to restore.',
+      }),
+      getActiveManifest: async () => undefined,
+      getProcessStatus: () => ({ pendingReleaseIds: [] }),
+      shutdown: async () => undefined,
+    };
+    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot, releaseLifecycle });
     await kernel.createGoal(goalInput());
     const events = await kernel.getEvents();
 
     const unsigned = await kernel.createReleaseProposal(releaseInput([events[0].id]));
     expect(unsigned.activationState).toBe('proposed');
-    const blockedUnsigned = await kernel.activateReleaseProposal(unsigned.id);
+    const blockedUnsigned = await kernel.activateReleaseProposal(unsigned.id, 'artifact_unsigned');
     expect(blockedUnsigned.activationState).toBe('blocked');
-    expect(blockedUnsigned.activationReason).toMatch(/Unsigned release proposals/);
+    expect(blockedUnsigned.activationReason).toMatch(/signature_missing/);
 
     const signed = await kernel.createReleaseProposal(releaseInput([events[0].id], 'deadbeef'));
-    const blockedSigned = await kernel.activateReleaseProposal(signed.id);
-    expect(blockedSigned.activationReason).toMatch(/No release signing verification key/);
+    const blockedSigned = await kernel.activateReleaseProposal(signed.id, 'artifact_signed');
+    expect(blockedSigned.activationReason).toMatch(/signature_invalid/);
   });
 
   it('refuses proposals referencing evaluation events outside the ledger', async () => {
@@ -223,7 +267,7 @@ describe('release proposals', () => {
 
     const rejected = await kernel.rejectRelease(proposal.id, 'Superseded by a newer proposal.');
     expect(rejected.activationState).toBe('rejected');
-    await expect(kernel.activateReleaseProposal(proposal.id))
+    await expect(kernel.activateReleaseProposal(proposal.id, 'artifact_rejected'))
       .rejects.toThrow(/Rejected release proposals/);
   });
 });
@@ -264,6 +308,61 @@ describe('automation execution', () => {
     ]));
     const state = await kernel.getState();
     expect(state.goals.find((candidate) => candidate.id === goal.id)?.usage.operations).toBe(1);
+  });
+
+  it('consumes an L2 approval and persisted grant before browser dispatch', async () => {
+    const grantStore = createMemoryCapabilityGrantStore();
+    let workerCalls = 0;
+    const observedGrantStatuses: string[] = [];
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      capabilityGrantStore: grantStore,
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async (_intent, options) => {
+            workerCalls += 1;
+            observedGrantStatuses.push(...(await grantStore.list()).map((grant) => grant.status));
+            expect(options.authorization).toBeDefined();
+            return {
+              status: 'succeeded',
+              summary: 'Navigated fixture page.',
+              sourceRef: 'https://example.com/account',
+              content: 'Approved page.',
+            };
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      ...automationInput(goal.id),
+      riskLevel: 'L2' as const,
+      action: {
+        type: 'browser.navigate' as const,
+        origin: 'https://example.com',
+        url: 'https://example.com/account',
+      },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable approved browser navigation.');
+
+    const blocked = await kernel.runAutomation(automation.id);
+    expect(blocked).toMatchObject({ decision: { kind: 'approval_required' } });
+    expect(blocked.approvalId).toMatch(/^approval_/);
+    expect(workerCalls).toBe(0);
+
+    await kernel.decideApproval(blocked.approvalId!, 'approved', 'Approve this exact navigation once.');
+    const executed = await kernel.runAutomation(automation.id);
+
+    expect(executed.decision.kind).toBe('allow');
+    expect(executed.approvalId).toBe(blocked.approvalId);
+    expect(executed.dispatch?.status).toBe('succeeded');
+    expect(workerCalls).toBe(1);
+    expect(observedGrantStatuses).toEqual(['consumed']);
+    const state = await kernel.getState();
+    expect(state.approvals.find((approval) => approval.id === blocked.approvalId)?.status).toBe('consumed');
+    expect((await grantStore.list())[0].status).toBe('consumed');
   });
 
   it('enforces the automation run budget from recorded events', async () => {
@@ -369,25 +468,44 @@ describe('artifact store integration', () => {
 });
 
 describe('release signing integration', () => {
-  it('activates a correctly signed proposal when a verification key is configured', async () => {
-    const crypto = await import('node:crypto');
-    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
-    const publicKeyBase64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
-    const contentHash = 'a'.repeat(64);
-    const signature = crypto.sign(null, Buffer.from(contentHash, 'utf8'), privateKey).toString('base64');
-
+  it('marks a proposal activated only after the staged lifecycle succeeds', async () => {
+    const releaseLifecycle = {
+      activate: async () => ({
+        status: 'activated' as const,
+        reasonCode: 'activated' as const,
+        reason: 'Signed staged release installed and passed its health check.',
+        manifest: {
+          schemaVersion: 1 as const,
+          releaseId: 'release_fixture',
+          artifactId: 'artifact_release',
+          targetVersion: '0.2.0',
+          contentHash: 'a'.repeat(64),
+          releaseDirectory: '0.2.0-aaaaaaaaaaaa',
+          entrypoint: 'core/index.cjs',
+          activatedAt: '2026-07-13T00:00:00.000Z',
+        },
+      }),
+      restoreActive: async () => ({
+        status: 'blocked' as const,
+        reasonCode: 'active_manifest_missing' as const,
+        reason: 'No active release to restore.',
+      }),
+      getActiveManifest: async () => undefined,
+      getProcessStatus: () => ({ pendingReleaseIds: [] }),
+      shutdown: async () => undefined,
+    };
     const kernel = createKernelService({
       runtimeDir,
       allowedWorkspaceRoot: workspaceRoot,
-      releaseSigningPublicKey: publicKeyBase64,
+      releaseLifecycle,
     });
     await kernel.createGoal(goalInput());
     const events = await kernel.getEvents();
-    const proposal = await kernel.createReleaseProposal(releaseInput([events[0].id], signature));
+    const proposal = await kernel.createReleaseProposal(releaseInput([events[0].id], 'signed'));
 
-    const activated = await kernel.activateReleaseProposal(proposal.id);
+    const activated = await kernel.activateReleaseProposal(proposal.id, 'artifact_release');
     expect(activated.activationState).toBe('activated');
-    expect((await kernel.getEvents()).at(-1)?.type).toBe('release.activated');
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('release.activated');
   });
 });
 

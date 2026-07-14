@@ -38,6 +38,7 @@ export const minimumRiskForAction = (action: CapabilityAction): CapabilityRiskLe
     case 'browser.click':
     case 'browser.type':
     case 'browser.download':
+      return 'L2';
     case 'desktop.click':
     case 'desktop.type':
     case 'desktop.shortcut':
@@ -91,6 +92,14 @@ export const decideActionPolicy = (
     return deny(validIntent.riskLevel, 'scope_not_configured', 'Intent scope is outside the worker configuration.');
   }
   if (validIntent.riskLevel === 'L2' || validIntent.riskLevel === 'L3') {
+    if (validIntent.authority.kind === 'approval') {
+      return {
+        kind: 'allow',
+        reasonCode: 'allowed',
+        reason: `${validIntent.riskLevel} action is bound to an explicit approval.`,
+        riskLevel: validIntent.riskLevel,
+      };
+    }
     return {
       kind: 'approval_required',
       reasonCode: 'approval_required',

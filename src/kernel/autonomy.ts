@@ -220,6 +220,7 @@ export const buildAutomationContract = (
 export const buildAutomationIntent = (
   automation: AutomationContract,
   now = new Date().toISOString(),
+  approvalId?: string,
 ): ActionIntent => ({
   schemaVersion: 1,
   id: createKernelId('intent'),
@@ -229,7 +230,9 @@ export const buildAutomationIntent = (
   riskLevel: automation.riskLevel,
   action: automation.action,
   scope: automation.scope,
-  authority: { kind: 'kernel_policy', referenceId: automation.id },
+  authority: approvalId
+    ? { kind: 'approval', referenceId: approvalId }
+    : { kind: 'kernel_policy', referenceId: automation.id },
   untrustedObservationIds: [],
   createdAt: now,
 });
@@ -243,14 +246,47 @@ export interface ReleaseProposalInput {
   signature?: string;
 }
 
+export const RELEASE_AUTHORIZATION_SCHEMA_VERSION = 1 as const;
+
+export interface ReleaseAuthorizationPayload {
+  schemaVersion: typeof RELEASE_AUTHORIZATION_SCHEMA_VERSION;
+  targetVersion: string;
+  contentHash: string;
+  evaluationEventIds: string[];
+  rollbackInstructions: string;
+}
+
+export type ReleaseAuthorizationSource = Pick<
+  ReleaseProposalInput,
+  'targetVersion' | 'contentHash' | 'evaluationEventIds' | 'rollbackInstructions'
+>;
+
+const normalizeEvaluationEventIds = (value: readonly string[]): string[] => {
+  if (value.length === 0) throw new Error('At least one release evaluation event id is required.');
+  const normalized = value.map((eventId) => eventId.trim());
+  if (normalized.some((eventId) => eventId.length === 0)) {
+    throw new Error('Release evaluation event ids cannot be blank.');
+  }
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error('Release evaluation event ids must be unique.');
+  }
+  return normalized.sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+};
+
+const isEvaluationEventIdSet = (value: unknown): value is string[] => {
+  if (!Array.isArray(value) || value.length === 0 || !value.every(isNonEmptyString)) return false;
+  const normalized = value.map((eventId) => eventId.trim());
+  return normalized.every((eventId, index) => eventId === value[index]) &&
+    new Set(normalized).size === normalized.length;
+};
+
 export const isReleaseProposalInput = (value: unknown): value is ReleaseProposalInput => {
   if (!isRecord(value)) return false;
   return (
     isNonEmptyString(value.title) &&
     isNonEmptyString(value.targetVersion) &&
     isSha256(value.contentHash) &&
-    Array.isArray(value.evaluationEventIds) &&
-    value.evaluationEventIds.every(isNonEmptyString) &&
+    isEvaluationEventIdSet(value.evaluationEventIds) &&
     isNonEmptyString(value.rollbackInstructions) &&
     (value.signature === undefined || isNonEmptyString(value.signature))
   );
@@ -264,13 +300,39 @@ export const buildReleaseProposal = (
   title: input.title.trim(),
   targetVersion: input.targetVersion.trim(),
   contentHash: input.contentHash,
-  evaluationEventIds: [...input.evaluationEventIds],
+  evaluationEventIds: normalizeEvaluationEventIds(input.evaluationEventIds),
   rollbackInstructions: input.rollbackInstructions.trim(),
   signature: input.signature,
   activationState: 'proposed',
   createdAt: now,
   updatedAt: now,
 });
+
+/**
+ * Builds the complete authorization document covered by a release signature.
+ * Fixed property order plus a sorted evaluation set makes the UTF-8 JSON
+ * representation deterministic across callers and runtimes.
+ */
+export const buildReleaseAuthorizationPayload = (
+  release: ReleaseAuthorizationSource,
+): ReleaseAuthorizationPayload => {
+  const targetVersion = release.targetVersion.trim();
+  const rollbackInstructions = release.rollbackInstructions.trim();
+  if (!targetVersion) throw new Error('Release target version is required.');
+  if (!isSha256(release.contentHash)) throw new Error('Release content hash must be a SHA-256 digest.');
+  if (!rollbackInstructions) throw new Error('Release rollback instructions are required.');
+  return {
+    schemaVersion: RELEASE_AUTHORIZATION_SCHEMA_VERSION,
+    targetVersion,
+    contentHash: release.contentHash,
+    evaluationEventIds: normalizeEvaluationEventIds(release.evaluationEventIds),
+    rollbackInstructions,
+  };
+};
+
+export const serializeReleaseAuthorizationPayload = (
+  release: ReleaseAuthorizationSource,
+): string => JSON.stringify(buildReleaseAuthorizationPayload(release));
 
 const parseReleasePublicKey = (configuredKey: string): crypto.KeyObject => {
   if (configuredKey.includes('BEGIN')) return crypto.createPublicKey(configuredKey);
@@ -283,13 +345,13 @@ const parseReleasePublicKey = (configuredKey: string): crypto.KeyObject => {
 
 export const verifyReleaseSignature = (
   configuredKey: string,
-  contentHash: string,
+  release: ReleaseAuthorizationSource,
   signatureBase64: string,
 ): boolean => {
   try {
     return crypto.verify(
       null,
-      Buffer.from(contentHash, 'utf8'),
+      Buffer.from(serializeReleaseAuthorizationPayload(release), 'utf8'),
       parseReleasePublicKey(configuredKey),
       Buffer.from(signatureBase64, 'base64'),
     );
@@ -300,10 +362,10 @@ export const verifyReleaseSignature = (
 
 /**
  * Activation succeeds only when a user-controlled verification key is
- * configured and the proposal's Ed25519 signature over its content hash
- * verifies against it. Every other case is blocked with a recorded reason:
- * unsigned proposals cannot activate core changes, and signed ones stay
- * blocked when no key is installed or the signature fails verification.
+ * configured and the proposal's Ed25519 signature covers the complete,
+ * versioned release authorization payload. Every other case is blocked with a
+ * recorded reason: unsigned proposals cannot activate core changes, and signed
+ * ones stay blocked when no key is installed or verification fails.
  */
 export const decideReleaseActivation = (
   proposal: ReleaseProposal,
@@ -329,7 +391,7 @@ export const decideReleaseActivation = (
       updatedAt: now,
     };
   }
-  if (!verifyReleaseSignature(configuredPublicKey.trim(), proposal.contentHash, proposal.signature)) {
+  if (!verifyReleaseSignature(configuredPublicKey.trim(), proposal, proposal.signature)) {
     return {
       ...proposal,
       activationState: 'blocked',
@@ -340,7 +402,7 @@ export const decideReleaseActivation = (
   return {
     ...proposal,
     activationState: 'activated',
-    activationReason: 'Ed25519 signature verified against the configured release signing key.',
+    activationReason: 'Ed25519 signature verified for the canonical release authorization payload.',
     updatedAt: now,
   };
 };
@@ -416,6 +478,7 @@ export interface RuntimeReportInput {
   stopAll: boolean;
   coreModel?: { status: 'available' | 'unavailable'; reason: string };
   releaseSigningConfigured?: boolean;
+  releaseDeployment?: RuntimeFeatureStatus;
   secretVault?: { status: 'available' | 'unavailable'; reason: string };
   accessControl?: { status: 'available' | 'unavailable'; reason: string };
   osSandbox?: { status: 'available' | 'unavailable'; reason: string };
@@ -474,6 +537,10 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
       reason: input.releaseSigningConfigured
         ? 'A release signing verification key is installed; correctly signed proposals can activate.'
         : 'No release signing verification key is installed; release proposals cannot activate.',
+    },
+    releaseDeployment: input.releaseDeployment ?? {
+      status: 'unavailable',
+      reason: 'No supervised core-release process runtime is installed.',
     },
     desktopIpc: {
       status: 'unavailable',

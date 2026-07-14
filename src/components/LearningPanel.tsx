@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { KernelMemoryRecord, SkillEvaluation, SkillPackage } from '../kernel/types';
+import { authenticatedFetch } from '../lib/auth';
 
 interface LearningSnapshot {
   memories: KernelMemoryRecord[];
@@ -59,7 +60,7 @@ const fetchCollection = async <T,>(
   key: string,
   guard: (value: unknown) => value is T,
 ): Promise<T[]> => {
-  const response = await fetch(url);
+  const response = await authenticatedFetch(url);
   if (!response.ok) throw new Error(`${key} request failed with status ${response.status}.`);
   const payload: unknown = await response.json();
   if (!isRecord(payload) || !Array.isArray(payload[key]) || !payload[key].every(guard)) {
@@ -144,7 +145,7 @@ export const LearningPanel: React.FC = () => {
     setIsSubmitting(true);
     setActionError(null);
     try {
-      const response = await fetch(
+      const response = await authenticatedFetch(
         `/api/kernel/memories/${encodeURIComponent(action.memoryId)}/${action.kind}`,
         {
           method: 'POST',

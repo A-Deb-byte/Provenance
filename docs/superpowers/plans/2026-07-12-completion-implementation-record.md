@@ -4,6 +4,8 @@ Date: 2026-07-12
 Status: Implemented and verified
 Parent design: `docs/superpowers/specs/2026-07-12-completion-architecture.md`
 
+> Historical slice: this record describes the July 12 implementation. The July 13 trust-boundary hardening replaced direct application AI handlers, added dashboard auth and pre-dispatch grants, authenticated snapshot contents, and changed release activation from metadata-only state to controlled staged installation. See `2026-07-13-trust-boundary-hardening-record.md` for current behavior.
+
 This document records what was implemented, verified, and deliberately left out during the completion session of 2026-07-12. Every claim below is backed by tests or by live evidence recorded in `.agent-kernel/events.jsonl`.
 
 ## 1. Starting State And Repair
@@ -46,15 +48,15 @@ Design rules, enforced by construction and tests (`src/core-model/`):
 
 Capabilities delivered:
 
-- **Local memory extraction**: `/api/extract` runs fully on-device when weights are installed, with no silent cloud fallback. A few-shot system prompt materially improved 1B extraction quality (distilled facts instead of copied sentences; assistant lines ignored). Measured ~18–29 s per extraction on CPU.
-- **Local chat fallback**: `/api/chat` is served on-device when `GEMINI_API_KEY` is absent (`servedBy: 'core_model'`).
+- **Local memory extraction (historical)**: this slice let `/api/extract` run through the core model when weights were installed. The hardened application routes now use the shared provider gateway so extraction cannot bypass provider routing, kernel budgets, or access control.
+- **Local chat fallback (historical)**: this slice used the core model when Gemini was absent. The hardened `/api/chat` route now uses the shared provider gateway; the core model remains advisory rather than an authority bypass.
 - **Observation assessment**: automation-run observations pass through the tighten-only assessor.
 
 ## 5. Final Slice: Giving It One Careful Hand
 
 - **Web-inspect worker** (`src/kernel/workers/webInspectWorker.ts`): the only worker runtime that ships. Read-only `browser.inspect` (L0) over plain fetch — manual redirect blocking, origin pinning, 64 KB stripped-text cap, bounded timeout, no clicks/typing/downloads/cookies. Disabled until the operator sets the `WEB_INSPECT_ORIGINS` allowlist.
-- **Automation execution** (`POST /api/kernel/automations/:id/run`): policy decision → intent-hash-bound single-use capability grant → dispatch → untrusted observation with injection assessment → grant consumption → `automation.run_completed`/`run_failed` ledger evidence. Run budgets and consecutive-failure halts are enforced by counting recorded events, and goal operation budgets are reserved per run.
-- **Release signing**: Ed25519 verification (`RELEASE_SIGNING_PUBLIC_KEY`, PEM or base64 SPKI DER). Correctly signed proposals now reach `activated` (`release.activated` event); unsigned, unverifiable, or keyless activation stays blocked with recorded reasons. Operator tooling: `scripts/release-signing.mjs` (generate / sign).
+- **Automation execution (historical)**: this slice validated and consumed the grant after dispatch. The hardened path persists and consumes the grant before I/O, then requires the worker to claim an opaque one-use authorization. L2/L3 runs can continue after their matching approval is granted.
+- **Release signing (historical)**: Ed25519 verification changed proposal state to `activated`, but did not install software. The hardened release lifecycle additionally resolves the staged hash-matching package, installs beneath a controlled directory, switches an atomic active manifest, health-checks it, and restores the previous manifest on failure.
 - **Dashboard liveness**: all four panels poll every 5 s with unmount cleanup; the provider panel keeps array identity stable so polling does not refire the routing preview.
 
 ## 6. Verification
@@ -62,12 +64,12 @@ Capabilities delivered:
 - `npm run lint` clean; `npm test` green across the full suite; `npm run build` (Vite client + esbuild CJS server bundle) succeeds.
 - Live session evidence recorded in the kernel ledger: a goal contract that ran `npm run lint` on this repository through a scoped capability token (passed, exit 0, ~10 s); a full skill-foundry lifecycle (synthesized `trim → collapse_whitespace → lowercase`, evaluation 100% vs 0% baseline, promotion refused until all 3 canary runs passed, then promoted and invoked); memory candidate → promotion with reason; Stop All / resume; a benchmark record; on-device extraction and chat.
 
-## 7. Deliberately Not Implemented (And Why)
+## 7. Boundaries At The End Of This Historical Slice
 
-- **OS credential vault**: requires platform-native keychain integration; faking it with an encrypted file would misrepresent the protection boundary. Credentials remain environment variables the operator must protect.
-- **OS sandbox**: verification commands and the web-inspect fetch run on the trusted host; a real sandbox needs OS-level primitives (or the Rust runtime) that a TypeScript workspace cannot honestly provide.
-- **Session-authenticated browser / desktop / connector workers**: these are the "hands" that require explicit permissioning infrastructure and isolation before they are safe to ship.
-- **Multi-user access control**: the API is single-user and loopback-only by design.
+- **OS credential vault** was missing in this slice. Later passes added Windows DPAPI, macOS Keychain, and Linux Secret Service adapters; the latter two still need target-OS live validation.
+- **OS sandbox** was missing in this slice. Docker isolation was added later with an explicitly reported trusted-host fallback when Docker is absent.
+- **Session-authenticated browser workers** were missing in this slice. Later passes added dashboard sessions and Playwright navigation/click/type with L2 approval and origin rechecks. Desktop and connector workers remain out.
+- **Multi-user access control** was missing in this slice. Roles and revocable sessions were added later; per-user data partitioning and SSO remain out.
 - **Rust/Tauri kernel**: the TypeScript kernel remains the reference implementation; its contracts and replayable ledger are the migration path.
 
 These appear in the runtime capability report as unavailable, with reasons, rather than being simulated.

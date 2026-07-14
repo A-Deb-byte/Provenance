@@ -21,8 +21,13 @@ export interface ArtifactStore {
   list(): Promise<ArtifactMetadata[]>;
 }
 
-const MAX_ARTIFACT_CHARS = 16 * 1024;
+const DEFAULT_MAX_ARTIFACT_CHARS = 16 * 1024;
+const MAX_CONFIGURED_ARTIFACT_CHARS = 32 * 1024 * 1024;
 const FILE_SUFFIX = '.artifact.json';
+
+export interface FileArtifactStoreOptions {
+  maxArtifactChars?: number;
+}
 
 export const hashArtifactContent = (content: string): string => (
   crypto.createHash('sha256').update(content, 'utf8').digest('hex')
@@ -40,19 +45,25 @@ const isArtifactFile = (value: unknown): value is ArtifactFile => (
 );
 
 /**
- * File-backed store for typed payloads (e.g. the text a browser worker will
- * enter into a form field). Payloads are addressed by id and verified by a
- * sha256 content hash, so an action intent can only cause a known, staged
- * value to be typed — untrusted page content cannot inject keystrokes.
+ * File-backed content-addressed store for staged payloads. Individual
+ * consumers enforce their own tighter size and content constraints. A
+ * sha256 content hash ensures a resolved payload still matches its record.
  */
-export const createFileArtifactStore = (dir: string): ArtifactStore => {
+export const createFileArtifactStore = (
+  dir: string,
+  options: FileArtifactStoreOptions = {},
+): ArtifactStore => {
   const artifactsDir = path.resolve(dir);
+  const maxArtifactChars = options.maxArtifactChars ?? DEFAULT_MAX_ARTIFACT_CHARS;
+  if (!Number.isSafeInteger(maxArtifactChars) || maxArtifactChars < 1 || maxArtifactChars > MAX_CONFIGURED_ARTIFACT_CHARS) {
+    throw new Error(`Artifact store limit must be between 1 and ${MAX_CONFIGURED_ARTIFACT_CHARS} characters.`);
+  }
   const filePath = (id: string) => path.join(artifactsDir, `${id}${FILE_SUFFIX}`);
 
   return {
     create: async (content) => {
-      if (typeof content !== 'string' || content.length === 0 || content.length > MAX_ARTIFACT_CHARS) {
-        throw new Error(`Artifact content must be 1-${MAX_ARTIFACT_CHARS} characters.`);
+      if (typeof content !== 'string' || content.length === 0 || content.length > maxArtifactChars) {
+        throw new Error(`Artifact content must be 1-${maxArtifactChars} characters.`);
       }
       const record: ArtifactFile = {
         id: createKernelId('artifact'),

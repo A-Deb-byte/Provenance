@@ -5,6 +5,7 @@ import { isWorkerRegistration } from '../capabilities/validators';
 import {
   buildAutomationContract,
   buildBenchmarkRun,
+  buildReleaseAuthorizationPayload,
   buildReleaseProposal,
   buildRuntimeCapabilityReport,
   decideReleaseActivation,
@@ -12,6 +13,7 @@ import {
   isAutomationContractInput,
   isReleaseProposalInput,
   rejectReleaseProposal,
+  serializeReleaseAuthorizationPayload,
 } from './autonomy';
 import { BenchmarkRun, GoalContract, KernelTask } from './types';
 
@@ -115,6 +117,26 @@ describe('release proposals', () => {
     expect(isReleaseProposalInput(releaseInput())).toBe(true);
     expect(isReleaseProposalInput({ ...releaseInput(), contentHash: 'not-a-hash' })).toBe(false);
     expect(isReleaseProposalInput({ ...releaseInput(), rollbackInstructions: ' ' })).toBe(false);
+    expect(isReleaseProposalInput({ ...releaseInput(), evaluationEventIds: [] })).toBe(false);
+    expect(isReleaseProposalInput({ ...releaseInput(), evaluationEventIds: ['event_1', 'event_1'] })).toBe(false);
+    expect(isReleaseProposalInput({ ...releaseInput(), evaluationEventIds: ['event_1', ' '] })).toBe(false);
+  });
+
+  it('serializes a deterministic, versioned authorization payload', () => {
+    const input = { ...releaseInput(), evaluationEventIds: ['event_2', 'event_1'] };
+    expect(buildReleaseProposal(input).evaluationEventIds).toEqual(['event_1', 'event_2']);
+    const expectedPayload = {
+      schemaVersion: 1,
+      targetVersion: '0.2.0',
+      contentHash: 'a'.repeat(64),
+      evaluationEventIds: ['event_1', 'event_2'],
+      rollbackInstructions: 'Reinstall the 0.1 bundle from the artifact store.',
+    };
+    expect(buildReleaseAuthorizationPayload(input)).toEqual(expectedPayload);
+    expect(serializeReleaseAuthorizationPayload(input)).toBe(JSON.stringify(expectedPayload));
+    expect(serializeReleaseAuthorizationPayload(input)).toBe(
+      serializeReleaseAuthorizationPayload({ ...input, evaluationEventIds: ['event_1', 'event_2'] }),
+    );
   });
 
   it('blocks unsigned activation with an explicit reason', () => {
@@ -134,11 +156,15 @@ describe('release proposals', () => {
   it('activates only when the Ed25519 signature verifies against the configured key', () => {
     const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
     const publicKeyBase64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
-    const contentHash = releaseInput().contentHash;
-    const signature = crypto.sign(null, Buffer.from(contentHash, 'utf8'), privateKey).toString('base64');
+    const input = releaseInput();
+    const signature = crypto.sign(
+      null,
+      Buffer.from(serializeReleaseAuthorizationPayload(input), 'utf8'),
+      privateKey,
+    ).toString('base64');
 
     const activated = decideReleaseActivation(
-      buildReleaseProposal({ ...releaseInput(), signature }),
+      buildReleaseProposal({ ...input, signature }),
       publicKeyBase64,
     );
     expect(activated.activationState).toBe('activated');
@@ -150,6 +176,17 @@ describe('release proposals', () => {
     );
     expect(forged.activationState).toBe('blocked');
     expect(forged.activationReason).toMatch(/failed verification/);
+
+    const proposal = buildReleaseProposal({ ...input, signature });
+    const alteredAuthorizations = [
+      { ...proposal, targetVersion: '0.2.1' },
+      { ...proposal, contentHash: 'b'.repeat(64) },
+      { ...proposal, evaluationEventIds: ['event_2'] },
+      { ...proposal, rollbackInstructions: 'Do not restore the previous release.' },
+    ];
+    for (const altered of alteredAuthorizations) {
+      expect(decideReleaseActivation(altered, publicKeyBase64).activationState).toBe('blocked');
+    }
   });
 
   it('rejects proposals with a reason and refuses activation afterwards', () => {
@@ -195,6 +232,7 @@ describe('runtime capability report', () => {
     expect(report.features.secretVault.status).toBe('unavailable');
     expect(report.features.osSandbox.status).toBe('unavailable');
     expect(report.features.releaseSigning.status).toBe('unavailable');
+    expect(report.features.releaseDeployment.status).toBe('unavailable');
   });
 
   it('projects the core model status when one is supplied', () => {
@@ -203,6 +241,7 @@ describe('runtime capability report', () => {
       workerReport: { available: [], configured: [], unavailable: [] },
       stopAll: false,
       coreModel: { status: 'available', reason: 'MiniCPM5-1B weights are loaded.' },
+      releaseDeployment: { status: 'configured', reason: 'Supervisor installed.' },
     });
     const defaulted = buildRuntimeCapabilityReport({
       providerStatuses,
@@ -211,6 +250,7 @@ describe('runtime capability report', () => {
     });
 
     expect(report.features.coreModel.status).toBe('available');
+    expect(report.features.releaseDeployment.status).toBe('configured');
     expect(defaulted.features.coreModel.status).toBe('unavailable');
     expect(defaulted.features.coreModel.reason).toContain('No core model runtime');
   });

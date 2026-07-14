@@ -3,40 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { MemoryItem, UserProfile, ChatSession } from '../types';
+import { UserProfile, ChatSession } from '../types';
 
 export const INITIAL_PROFILE: UserProfile = {
-  bio: "Local demo profile. Add real facts manually or through chat extraction before relying on personalization.",
-  extractedName: "Demo User",
-  lastSummaryUpdate: new Date().toISOString()
+  bio: 'No authoritative user profile is configured. Personalization comes only from promoted kernel memory.',
+  extractedName: 'Presentation context',
 };
-
-export const INITIAL_MEMORIES: MemoryItem[] = [
-  {
-    id: "mem_1",
-    content: "Prefers local-first software with inspectable state",
-    category: "preferences",
-    source: "Demo Knowledgebase Entry",
-    createdAt: new Date(Date.now() - 4 * 3600000).toISOString(),
-    importance: 5
-  },
-  {
-    id: "mem_2",
-    content: "Evaluates agents by verified task completion, recovery, and evidence quality",
-    category: "technical",
-    source: "Demo Knowledgebase Entry",
-    createdAt: new Date(Date.now() - 3.5 * 3600000).toISOString(),
-    importance: 5
-  },
-  {
-    id: "mem_3",
-    content: "Wants security claims to match the actual storage and runtime model",
-    category: "preferences",
-    source: "Demo Knowledgebase Entry",
-    createdAt: new Date(Date.now() - 2.5 * 3600000).toISOString(),
-    importance: 4
-  }
-];
 
 export const INITIAL_SESSIONS: ChatSession[] = [
   {
@@ -52,18 +24,8 @@ export const INITIAL_SESSIONS: ChatSession[] = [
       {
         id: "msg_2",
         role: "assistant",
-        content: "A practical agent knowledgebase starts with a small profile summary plus atomic memory records. Keep each memory inspectable, timestamped, and editable before relying on it for personalization.",
+        content: "A practical agent knowledgebase starts with atomic, provenance-aware records. In this cockpit, only promoted kernel memory is used for personalization; the browser conversation is presentation state.",
         timestamp: new Date(Date.now() - 9 * 60000).toISOString(),
-        retrievedMemories: [
-          {
-            id: "mem_1",
-            content: "Prefers local-first software with inspectable state",
-            category: "preferences",
-            source: "Demo Knowledgebase Entry",
-            createdAt: new Date().toISOString(),
-            importance: 5
-          }
-        ]
       }
     ],
     updatedAt: new Date(Date.now() - 9 * 60000).toISOString()
@@ -72,7 +34,7 @@ export const INITIAL_SESSIONS: ChatSession[] = [
 
 export const EXAMPLE_SUGGESTIONS = [
   "Explain how this local memory dashboard works.",
-  "Add a memory that I prefer inspectable local state.",
+  "Submit a memory candidate that I prefer inspectable local state.",
   "What does this prototype currently store in the browser?",
   "Let's explore designing an associative retrieval framework."
 ];

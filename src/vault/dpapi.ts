@@ -128,15 +128,15 @@ export const createDpapiVault = (options: DpapiVaultOptions): SecretVault => {
       if (typeof value !== 'string' || value.length === 0 || value.length > MAX_SECRET_CHARS) {
         throw new Error(`Secret values must be 1-${MAX_SECRET_CHARS} characters.`);
       }
-      await requireAvailable();
       const target = secretPath(name);
+      await requireAvailable();
       await mkdir(vaultDir, { recursive: true });
       const ciphertext = await runDpapi('Protect', Buffer.from(value, 'utf8').toString('base64'));
       await writeFile(target, ciphertext, 'utf8');
     },
     retrieve: async (name) => {
-      await requireAvailable();
       const target = secretPath(name);
+      await requireAvailable();
       try {
         const ciphertext = await readFile(target, 'utf8');
         const plaintext = await runDpapi('Unprotect', ciphertext.trim());

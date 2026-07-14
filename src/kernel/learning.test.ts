@@ -43,12 +43,60 @@ describe('kernel learning service', () => {
 
     expect(candidate.status).toBe('candidate');
     expect(candidate.evidenceRefs).toHaveLength(1);
+    const candidateEvents = await kernel.getEvents();
+    const sourceEvidence = candidateEvents.find((event) => event.id === candidate.evidenceRefs[0].eventId);
+    expect(sourceEvidence?.type).toBe('memory.source_attested');
+    expect(sourceEvidence?.entityId).not.toBe(candidate.id);
+    expect(candidate.evidenceRefs.map((reference) => reference.eventId)).not.toContain(
+      candidateEvents.find((event) => event.type === 'memory.candidate_created')?.id,
+    );
     const promoted = await kernel.promoteMemory(candidate.id, 'User confirmed this workspace procedure.');
     expect(promoted.status).toBe('promoted');
 
     const restarted = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
     expect((await restarted.getState()).memories[0].status).toBe('promoted');
     expect(JSON.stringify(await restarted.getEvents())).not.toContain(content);
+  });
+
+  it('rejects candidate-creation events as promotion evidence', async () => {
+    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    await kernel.createMemoryCandidate({
+      kind: 'semantic',
+      content: 'Unverified provider claim.',
+      confidence: 0.5,
+      scope: { kind: 'global' },
+      sensitivity: 'internal',
+      retention: { kind: 'durable' },
+      provenance: {
+        sourceType: 'provider_candidate',
+        sourceId: 'provider_output_1',
+        actor: 'provider',
+        observedAt: '2026-07-12T00:00:00.000Z',
+      },
+      contradictionIds: [],
+      supersedesIds: [],
+    });
+    const candidateEvent = (await kernel.getEvents()).find((event) => event.type === 'memory.candidate_created')!;
+    const derived = await kernel.createMemoryCandidate({
+      kind: 'semantic',
+      content: 'A candidate event is not independent evidence.',
+      confidence: 0.5,
+      scope: { kind: 'global' },
+      sensitivity: 'internal',
+      retention: { kind: 'durable' },
+      provenance: {
+        sourceType: 'kernel_event',
+        sourceId: candidateEvent.id,
+        actor: 'kernel',
+        observedAt: '2026-07-12T00:01:00.000Z',
+      },
+      contradictionIds: [],
+      supersedesIds: [],
+    });
+
+    expect(derived.evidenceRefs).toEqual([{ eventId: candidateEvent.id }]);
+    await expect(kernel.promoteMemory(derived.id, 'Attempt circular promotion.'))
+      .rejects.toThrow(/independent source-backed evidence/i);
   });
 
   it('revokes memory without deleting its audit record', async () => {
@@ -121,14 +169,16 @@ describe('kernel learning service', () => {
     expect(evaluation.eligibleForCanary).toBe(true);
     const activation = await kernel.startSkillCanary(skill.id, 1);
     expect(activation.status).toBe('canary');
-    const run = await kernel.runSkillCanary(skill.id, ' D ', 'D');
+    const run = await kernel.runSkillCanary(skill.id);
     expect(run.passed).toBe(true);
+    expect(run.caseId).toBe('kernel_canary_v1_0');
+    expect(run).not.toHaveProperty('output');
     const promoted = await kernel.promoteSkillPackage(skill.id);
     expect(promoted.status).toBe('promoted');
     expect(await kernel.invokeSkill(skill.id, ' E ')).toBe('E');
 
     const ledger = JSON.stringify(await kernel.getEvents());
-    expect(ledger).not.toContain(' D ');
+    expect(ledger).not.toContain(' C ');
     expect(ledger).not.toContain(' E ');
   });
 });

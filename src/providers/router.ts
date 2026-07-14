@@ -171,7 +171,14 @@ export class ProviderRouter {
     const errors = outcomes.flatMap((outcome) => outcome.error
       ? [serializeProviderError(outcome.error, outcome.selection.provider)] : []);
     if (!results.length) {
-      throw new ProviderError('unavailable', 'All routed provider calls failed.', { retryable: errors.some((error) => error.retryable) });
+      const summary = errors.map((error) => (
+        `${error.provider}:${error.code}${error.status ? `(${error.status})` : ''} [${error.message}]`
+      )).join(', ') || 'unknown';
+      throw new ProviderError(
+        'unavailable',
+        `All routed provider calls failed: ${summary}.`,
+        { retryable: errors.some((error) => error.retryable) },
+      );
     }
     return {
       plan,

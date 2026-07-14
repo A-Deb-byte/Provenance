@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import type { ProviderPublicStatus, ProviderRoutePlan } from '../providers/types';
+import { authenticatedFetch, subscribeAuth } from '../lib/auth';
 
 type RoutingPreviewMode = 'automatic' | 'pinned';
 
@@ -21,13 +22,16 @@ export const ProviderPanel: React.FC = () => {
   const [previewMode, setPreviewMode] = useState<RoutingPreviewMode>('automatic');
   const [plan, setPlan] = useState<ProviderRoutePlan | null>(null);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [authRevision, setAuthRevision] = useState(0);
+
+  useEffect(() => subscribeAuth(() => setAuthRevision((revision) => revision + 1)), []);
 
   useEffect(() => {
     let isDisposed = false;
 
     const loadStatuses = async () => {
       try {
-        const response = await fetch('/api/providers/status');
+        const response = await authenticatedFetch('/api/providers/status');
         if (!response.ok) throw new Error(`Provider status request failed with status ${response.status}.`);
         const payload: unknown = await response.json();
         if (!isRecord(payload) || !Array.isArray(payload.providers)) {
@@ -73,7 +77,7 @@ export const ProviderPanel: React.FC = () => {
         ? { mode: 'pinned', provider: firstConfigured.id }
         : { mode: 'automatic' };
       try {
-        const response = await fetch('/api/providers/plan', {
+        const response = await authenticatedFetch('/api/providers/plan', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ request: previewRequestBody, policy }),
@@ -97,7 +101,7 @@ export const ProviderPanel: React.FC = () => {
     return () => {
       isDisposed = true;
     };
-  }, [firstConfigured, previewMode]);
+  }, [authRevision, firstConfigured, previewMode]);
 
   return (
     <section

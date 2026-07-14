@@ -2,14 +2,21 @@ import { AgentFramework, AgentProviderConfig, ChatSession, MemoryItem, ProviderN
 
 export const STORAGE_KEYS = {
   sessions: 'agent_kb_sessions_v2',
-  memories: 'agent_kb_memories_v2',
-  profile: 'agent_kb_profile_v2',
   activeSessionId: 'agent_kb_active_sid_v2',
   framework: 'agent_kb_framework',
-  skills: 'agent_autonomous_skills',
-  providers: 'agent_provider_labels_v1',
-  skillDrafts: 'agent_skill_draft_activities',
 } as const;
+
+const LEGACY_AUTHORITATIVE_KEYS = [
+  'agent_kb_memories_v2',
+  'agent_kb_profile_v2',
+  'agent_autonomous_skills',
+  'agent_provider_labels_v1',
+  'agent_skill_draft_activities',
+] as const;
+
+export const purgeLegacyAuthoritativeStorage = (): void => {
+  for (const key of LEGACY_AUTHORITATIVE_KEYS) localStorage.removeItem(key);
+};
 
 const memoryCategories = new Set(['personal', 'technical', 'work', 'preferences', 'general']);
 const frameworks = new Set(['cartographer', 'prover', 'archivist', 'sentinel']);

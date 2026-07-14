@@ -73,22 +73,25 @@ describe('kernel memory domain', () => {
   it('promotes only candidates with an explicit reason and confirmed evidence', () => {
     const record = candidate();
 
-    expect(() => promoteMemoryRecord([record], record.id, ' ', later)).toThrow(/reason/i);
+    expect(() => promoteMemoryRecord([record], record.id, ' ', ['event_1'], later)).toThrow(/reason/i);
     const withoutEvidence = candidate({ evidenceRefs: [] });
-    expect(() => promoteMemoryRecord([withoutEvidence], withoutEvidence.id, 'Confirmed.', later))
+    expect(() => promoteMemoryRecord([withoutEvidence], withoutEvidence.id, 'Confirmed.', ['event_1'], later))
       .toThrow(/evidence/i);
+    expect(() => promoteMemoryRecord([record], record.id, 'Confirmed.', [], later))
+      .toThrow(/independent source-backed evidence/i);
 
     const { record: promoted, records } = promoteMemoryRecord(
       [record],
       record.id,
       'Confirmed by verification.',
+      ['event_1'],
       later,
     );
     expect(promoted.status).toBe('promoted');
     expect(promoted.promotedAt).toBe(later);
     expect(promoted.lifecycleReason).toBe('Confirmed by verification.');
     expect(records[0]).toEqual(promoted);
-    expect(() => promoteMemoryRecord([promoted], promoted.id, 'Try twice.', later)).toThrow(/candidate/i);
+    expect(() => promoteMemoryRecord([promoted], promoted.id, 'Try twice.', ['event_1'], later)).toThrow(/candidate/i);
   });
 
   it('blocks unresolved promoted contradictions and resolves explicit supersession', () => {
@@ -97,6 +100,7 @@ describe('kernel memory domain', () => {
       [priorCandidate],
       priorCandidate.id,
       'Previously verified.',
+      ['event_1'],
       createdAt,
     );
     const conflicting = candidate({
@@ -105,7 +109,7 @@ describe('kernel memory domain', () => {
       evidenceRefs: [{ eventId: 'event_2' }],
     });
 
-    expect(() => promoteMemoryRecord([prior, conflicting], conflicting.id, 'New verification.', later))
+    expect(() => promoteMemoryRecord([prior, conflicting], conflicting.id, 'New verification.', ['event_2'], later))
       .toThrow(/contradiction/i);
 
     const replacement = { ...conflicting, supersedesIds: [prior.id] };
@@ -113,6 +117,7 @@ describe('kernel memory domain', () => {
       [prior, replacement],
       replacement.id,
       'New verification supersedes the old fact.',
+      ['event_2'],
       later,
     );
     expect(records.find((record) => record.id === prior.id)?.status).toBe('superseded');
@@ -132,16 +137,23 @@ describe('kernel memory domain', () => {
       [priorCandidate],
       priorCandidate.id,
       'Prior evidence.',
+      ['event_1'],
       createdAt,
     );
 
-    expect(() => promoteMemoryRecord([prior, incoming], incoming.id, 'Incoming evidence.', later))
+    expect(() => promoteMemoryRecord([prior, incoming], incoming.id, 'Incoming evidence.', ['event_2'], later))
       .toThrow(/contradiction/i);
   });
 
   it('revokes without deletion and lists only non-revoked, non-superseded, unexpired records', () => {
     const promotedCandidate = candidate();
-    const { record: promoted } = promoteMemoryRecord([promotedCandidate], promotedCandidate.id, 'Verified.', createdAt);
+    const { record: promoted } = promoteMemoryRecord(
+      [promotedCandidate],
+      promotedCandidate.id,
+      'Verified.',
+      ['event_1'],
+      createdAt,
+    );
     const revoked = revokeMemoryRecord([promoted], promoted.id, 'User revoked this fact.', later);
     expect(revoked.records).toHaveLength(1);
     expect(revoked.record).toMatchObject({ status: 'revoked', revokedAt: later, content: promoted.content });

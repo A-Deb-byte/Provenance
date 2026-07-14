@@ -37,7 +37,7 @@ const definitions: readonly ProviderDefinition[] = Object.freeze([
   },
   {
     id: 'openrouter', protocol: 'openai_chat', endpoint: 'https://openrouter.ai/api/v1',
-    defaultModels: ['openai/gpt-5.6', 'google/gemini-3.5-flash', 'deepseek/deepseek-v4-pro'],
+    defaultModels: ['openrouter/free', 'openai/gpt-5.6', 'google/gemini-3.5-flash', 'deepseek/deepseek-v4-pro'],
     modelEnvironmentVariable: 'OPENROUTER_MODEL', modelsEnvironmentVariable: 'OPENROUTER_MODELS',
     capabilities: ['text', 'streaming', 'json_object', 'json_schema', 'tools'],
     credentialSource: 'server_env', credentialEnvironmentVariable: 'OPENROUTER_API_KEY', routingPriority: 30,
