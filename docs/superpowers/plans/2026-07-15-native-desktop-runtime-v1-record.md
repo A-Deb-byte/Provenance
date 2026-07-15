@@ -1,7 +1,7 @@
 # Native Desktop Runtime v1 Implementation Record
 
 Date: 2026-07-15
-Status: TypeScript integration and Rust/Tauri source implemented; Windows native compilation and live validation pending
+Status: TypeScript integration and Rust/Tauri source implemented; Windows native CI passing; live interactive UI Automation validation pending
 Parent design: `docs/superpowers/specs/2026-07-12-completion-architecture.md`
 
 This milestone adds a bounded Windows desktop path without moving policy authority into a model, a webview, or UI Automation. The TypeScript kernel still owns intent validation, risk floors, approvals, budgets, one-use capability dispatch, transient payload staging, Stop All, and ledger evidence. The native host owns one local runtime process and performs only the desktop operations admitted by that control plane.
@@ -92,9 +92,9 @@ The development and build commands first produce `dist` so the host can supervis
 
 The TypeScript integration includes focused tests for configuration parsing, loopback-only IPC, HMAC response authentication, worker translation and payload hashing, risk floors, worker availability, kernel approval continuation, runtime ownership/readiness, runtime reporting, API behavior, and cockpit flows. The complete suite passes 455 tests across 78 files; lint, production build, dependency audit, ledger verification, diff checking, and scoped secret scanning also pass.
 
-Rust/Cargo 1.97 generated the committed dependency lock. WSL `rustfmt` verification, locked `cargo check --all-targets`, and Clippy with warnings denied pass while targeting `x86_64-pc-windows-msvc`, which type-checks the Windows modules and test targets. Direct Windows compilation reached the missing MSVC `link.exe`/SDK import-library boundary; Windows Application Control also blocks the locally installed Windows `rustfmt`. Consequently, the host has not completed a native link or live UI Automation execution here; WebView2 alone does not close that gate.
+Rust/Cargo 1.97 generated the committed dependency lock. A clean WSL target directory passes `rustfmt` verification, locked `cargo check --all-targets`, and Clippy with warnings denied for `x86_64-pc-windows-msvc`, type-checking the Windows modules and test targets. This development machine still lacks the local MSVC/Windows SDK link environment, and Windows Application Control blocks its locally installed Windows `rustfmt`. Those local constraints do not substitute for the prepared Windows runner, which supplies the native link environment.
 
-`.github/workflows/native-desktop.yml` adds a `windows-latest` verification job that runs `npm ci`, TypeScript lint, the npm test suite, the production web/server build, Rust formatting, Rust tests, Cargo checking across all targets, and Clippy with warnings denied. This record documents the workflow definition only; it does not claim that GitHub Actions has passed until a real run completes.
+`.github/workflows/native-desktop.yml` adds a `windows-latest` verification job that runs `npm ci`, TypeScript lint, the npm test suite, the production web/server build, Rust formatting, Rust tests, Cargo checking across all targets, and Clippy with warnings denied. [Native desktop verification run 29398628867](https://github.com/A-Deb-byte/Provenance/actions/runs/29398628867) completed that entire job successfully on commit `bafb660`. This establishes native compilation, linking, and unit-test evidence; the hosted job does not drive a real allowlisted application in an interactive desktop session.
 
 ## 8. Remaining Boundaries
 

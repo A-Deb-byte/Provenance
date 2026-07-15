@@ -3,7 +3,7 @@
 Date: 2026-07-15
 Purpose: the authoritative concise answer to "what does this product do, and what is still missing?"
 
-Verification note: the pre-hardening baseline was **242 tests across 51 files**, the trust-boundary pass closed at **297 tests across 62 files**, and Durable Recurring Research v1 closed at **410 tests across 70 files**. Native Desktop Runtime v1 is `npm run lint` clean, **455 tests across 78 files**, `npm run build` clean, `npm audit` reports zero vulnerabilities, and `npm run verify-ledger` authenticates **252 hash-chained events** on 2026-07-15. The ledger count is timestamped runtime evidence and will grow with use. Rust/Cargo generated the locked graph; WSL formatting, locked cross-target all-target checking, and Clippy with warnings denied pass for `x86_64-pc-windows-msvc`. Direct Windows linking still lacks MSVC/Windows SDK libraries, and the new Windows CI workflow has not yet produced a passing run, so no native-build or live UIA success is claimed here.
+Verification note: the pre-hardening baseline was **242 tests across 51 files**, the trust-boundary pass closed at **297 tests across 62 files**, and Durable Recurring Research v1 closed at **410 tests across 70 files**. Native Desktop Runtime v1 is `npm run lint` clean, **455 tests across 78 files**, `npm run build` clean, `npm audit` reports zero vulnerabilities, and `npm run verify-ledger` authenticates **252 hash-chained events** on 2026-07-15. The ledger count is timestamped runtime evidence and will grow with use. Rust/Cargo generated the locked graph; clean WSL formatting, locked cross-target all-target checking, and Clippy with warnings denied pass for `x86_64-pc-windows-msvc`. The prepared Windows runner also passed Rust tests, native all-target checking, formatting, and Clippy in [run 29398628867](https://github.com/A-Deb-byte/Provenance/actions/runs/29398628867). That is native compilation/link/test evidence, not live interactive UI Automation evidence.
 
 ## What This Product Is
 
@@ -29,8 +29,8 @@ Legend: **Implemented** = present with focused tests; **Live** = also verified a
 | Loopback request protection | Implemented | Host/origin and `Sec-Fetch-Site` checks protect mutations; security headers are applied. This is not remote-service hardening. |
 | Browser inspect worker | Partial | L0, origin-allowlisted, bounded read-only fetch. |
 | Playwright browser worker | Live | Navigate/click/type are minimum L2, approval-gated, and origin-checked before and after navigation. Downloads are unavailable. |
-| Windows native host | Partial | Tauri/Rust source acquires exclusive runtime ownership, records only a hash of the private child proof, supervises the fixed Node entrypoint, publishes proof-bound readiness, exposes a loopback HMAC bridge, and closes the webview if Node/bridge/UIA health is lost. Native compilation and live validation still require MSVC build tools and a Windows SDK. |
-| Desktop UI Automation v1 | Partial | TypeScript integration and focused tests cover health-gated registration, exact application scope, L0 discovery/inspection, and L2 approval-gated click/type. The Rust implementation is source-present but not locally compiled; shortcuts, elevation, shell, plugins, downloads, installer, and updater are unavailable. |
+| Windows native host | Partial | Tauri/Rust source acquires exclusive runtime ownership, records only a hash of the private child proof, supervises the fixed Node entrypoint, publishes proof-bound readiness, exposes a loopback HMAC bridge, and closes the webview if Node/bridge/UIA health is lost. Windows CI compiles, links, and tests the Rust slice; live interactive validation is still pending. |
+| Desktop UI Automation v1 | Partial | TypeScript integration and focused tests cover health-gated registration, exact application scope, L0 discovery/inspection, and L2 approval-gated click/type. The Rust implementation passes native CI but has not driven a real application in an interactive session; shortcuts, elevation, shell, plugins, downloads, installer, and updater are unavailable. |
 | Approval continuation | Implemented | L2/L3 runs persist an approval; a matching approved record can authorize a later execution. |
 | Capability dispatch gate | Implemented | Grant is persisted and consumed before I/O; a one-use opaque authorization must be claimed immediately before dispatch. |
 | Hash-addressed artifact store | Implemented | General evidence and release artifacts are content-addressed and authenticated before use. |
@@ -95,7 +95,7 @@ The trusted parent Express control plane remains stable and owns policy, signatu
 ## What Is Still Missing
 
 - Native non-Docker command isolation.
-- Native-host compilation and live Windows UI Automation validation on a prepared MSVC/Windows SDK machine; the source and TypeScript integration exist, but native success is not yet evidenced.
+- Live Windows UI Automation validation against real allowlisted applications in an interactive prepared environment; CI compiles, links, and tests the native slice but does not exercise an interactive desktop.
 - Desktop shortcuts, elevation, shell authority, plugins, installers, automatic updates, OAuth connector workers, and browser downloads.
 - Generic web search, source discovery, crawling, redirect following, and autonomous expansion beyond operator-supplied research seed URLs.
 - Generic cron/event scheduling or recurring command, connector, email, communications, download, and desktop missions; the durable scheduler currently runs only fixed-source research reports.
