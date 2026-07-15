@@ -87,15 +87,6 @@ pub enum DesktopAction {
 }
 
 impl DesktopAction {
-    pub fn action_type(&self) -> &'static str {
-        match self {
-            Self::Discover { .. } => "desktop.discover",
-            Self::Inspect { .. } => "desktop.inspect",
-            Self::Click { .. } => "desktop.click",
-            Self::Type { .. } => "desktop.type",
-        }
-    }
-
     pub fn app_id(&self) -> &str {
         match self {
             Self::Discover { app_id }

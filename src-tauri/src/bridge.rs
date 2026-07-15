@@ -48,13 +48,6 @@ impl BridgeSecret {
         Self(Arc::from(URL_SAFE_NO_PAD.encode(bytes)))
     }
 
-    pub fn from_string(value: String) -> Result<Self, BridgeError> {
-        if value.len() < 32 || !value.is_ascii() {
-            return Err(BridgeError::WeakSecret);
-        }
-        Ok(Self(Arc::from(value)))
-    }
-
     pub fn expose_to_supervised_child(&self) -> &str {
         &self.0
     }
@@ -72,8 +65,6 @@ impl fmt::Debug for BridgeSecret {
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
-    #[error("desktop bridge token must contain at least 32 ASCII characters")]
-    WeakSecret,
     #[error("desktop bridge could not bind loopback: {0}")]
     Bind(#[from] std::io::Error),
 }
@@ -506,6 +497,10 @@ mod tests {
 
     struct UnusedExecutor;
 
+    fn secret() -> BridgeSecret {
+        BridgeSecret(Arc::from("s".repeat(43)))
+    }
+
     impl DesktopExecutor for UnusedExecutor {
         fn allowed_app_ids(&self) -> Vec<String> {
             Vec::new()
@@ -521,14 +516,14 @@ mod tests {
 
     fn state() -> BridgeState {
         BridgeState {
-            secret: BridgeSecret::from_string("s".repeat(43)).unwrap(),
+            secret: secret(),
             host_instance_id: Arc::from("host-test"),
             desktop: Arc::new(UnusedExecutor),
             replay: Arc::new(Mutex::new(ReplayCache::default())),
         }
     }
 
-    fn headers(state: &BridgeState, body: &[u8], now: u64, request_id: &str) -> HeaderMap {
+    fn signed_headers(state: &BridgeState, body: &[u8], now: u64, request_id: &str) -> HeaderMap {
         let issued_at = now;
         let expires_at = now + 5_000;
         let content_hash = sha256_hex(body);
@@ -559,7 +554,7 @@ mod tests {
         let state = state();
         let now = 1_000_000;
         let body = br#"{"schemaVersion":1}"#;
-        let headers = headers(&state, body, now, "request-1");
+        let headers = signed_headers(&state, body, now, "request-1");
         assert_eq!(
             authenticate(&state, &Method::POST, "/v1/actions", &headers, body, now),
             Ok("request-1".into())
@@ -575,7 +570,7 @@ mod tests {
         let state = state();
         let now = 1_000_000;
         let body = b"trusted";
-        let headers = headers(&state, body, now, "request-2");
+        let headers = signed_headers(&state, body, now, "request-2");
         assert_eq!(
             authenticate(
                 &state,
@@ -588,7 +583,7 @@ mod tests {
             Err(AuthError::InvalidContentHash)
         );
 
-        let headers = headers(&state, body, now, "request-3");
+        let headers = signed_headers(&state, body, now, "request-3");
         assert_eq!(
             authenticate(&state, &Method::GET, "/v1/actions", &headers, body, now),
             Err(AuthError::InvalidSignature)
@@ -599,7 +594,7 @@ mod tests {
     fn rejects_requests_outside_the_thirty_second_window() {
         let state = state();
         let issued = 1_000_000;
-        let headers = headers(&state, b"", issued, "request-4");
+        let headers = signed_headers(&state, b"", issued, "request-4");
         assert_eq!(
             authenticate(
                 &state,
@@ -615,7 +610,7 @@ mod tests {
 
     #[test]
     fn response_signature_binds_request_status_and_body_hash() {
-        let secret = BridgeSecret::from_string("s".repeat(43)).unwrap();
+        let secret = secret();
         let body_hash = sha256_hex(b"body");
         let canonical = response_canonical("request-5", 200, &body_hash);
         let signature = sign_hex(secret.bytes(), canonical.as_bytes());

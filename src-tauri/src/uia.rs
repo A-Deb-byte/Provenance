@@ -282,8 +282,8 @@ mod windows_worker {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::path::{Path, PathBuf};
-    use windows::core::{BSTR, PWSTR};
-    use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT};
+    use windows::core::{BOOL, BSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
@@ -641,7 +641,7 @@ mod windows_worker {
                 .filter(|target| target.app_id == app_id)
                 .cloned()
                 .ok_or(DesktopExecutionError::WindowStale)?;
-            if !unsafe { IsWindow(target.hwnd()) }.as_bool()
+            if !unsafe { IsWindow(Some(target.hwnd())) }.as_bool()
                 || window_pid(target.hwnd()) != Some(target.pid)
                 || process_path(target.pid)
                     .map(|path| !paths_equal(&path, &target.executable_path))

@@ -212,10 +212,7 @@ fn publish_owner_atomically(
     ));
     let mut temporary = create_owner_file(&temporary_path).map_err(|error| match error {
         RuntimeOwnershipError::CreateOwner(source) => PublishOwnerError::Io(source),
-        other => PublishOwnerError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            other.to_string(),
-        )),
+        other => PublishOwnerError::Io(std::io::Error::other(other.to_string())),
     })?;
     if let Err(error) = temporary
         .write_all(payload)
@@ -257,7 +254,7 @@ fn read_existing_owner(path: &Path) -> Result<ExistingOwnerRecord, RuntimeOwners
     }
     let mut content = Vec::with_capacity(metadata.len() as usize);
     File::open(path)
-        .and_then(|mut file| file.take(MAX_OWNER_BYTES + 1).read_to_end(&mut content))
+        .and_then(|file| file.take(MAX_OWNER_BYTES + 1).read_to_end(&mut content))
         .map_err(|_| RuntimeOwnershipError::InvalidOwner)?;
     if content.len() as u64 > MAX_OWNER_BYTES {
         return Err(RuntimeOwnershipError::InvalidOwner);
