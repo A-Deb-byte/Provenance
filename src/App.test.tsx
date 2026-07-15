@@ -8,6 +8,7 @@ vi.mock('./components/KernelPanel', () => ({ KernelPanel: () => <div data-testid
 vi.mock('./components/LearningPanel', () => ({ LearningPanel: () => <div>Learning</div> }));
 vi.mock('./components/ProviderPanel', () => ({ ProviderPanel: () => <div>Providers</div> }));
 vi.mock('./components/RuntimePanel', () => ({ RuntimePanel: () => <div>Runtime</div> }));
+vi.mock('./components/DesktopPanel', () => ({ DesktopPanel: () => <div data-testid="desktop-panel">Desktop Cockpit</div> }));
 vi.mock('./components/ResearchMissionPanel', () => ({
   ResearchMissionPanel: ({ initialMissionId }: { initialMissionId?: string | null }) => (
     <div data-testid="research-mission-panel">Research Mission Cockpit {initialMissionId ?? 'default'}</div>
@@ -71,5 +72,25 @@ describe('App mission workspace', () => {
 
     await user.click(screen.getByRole('button', { name: 'Open linked mission' }));
     expect(screen.getByTestId('research-mission-panel')).toHaveTextContent('mission_linked');
+  });
+
+  it('opens the native desktop cockpit with authentication in the same tab', async () => {
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: vi.fn(),
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(screen.queryByTestId('desktop-panel')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Desktop' }));
+
+    expect(screen.getByTestId('desktop-panel')).toHaveTextContent('Desktop Cockpit');
+    expect(screen.getByTestId('auth-panel')).toHaveTextContent('Authentication');
+    expect(screen.getByText('Desktop Authority')).toBeInTheDocument();
+    expect(screen.getByText('Approval-gated native worker')).toBeInTheDocument();
+    expect(screen.queryByTestId('kernel-panel')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('research-mission-panel')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('recurring-research-panel')).not.toBeInTheDocument();
   });
 });

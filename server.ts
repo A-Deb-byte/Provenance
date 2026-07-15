@@ -10,19 +10,26 @@ import dotenv from 'dotenv';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { createApplicationAiRouter } from './src/app-ai/router';
-import { accessControlStatus, createAccessGuard } from './src/auth/accessControl';
+import { accessControlStatus, createAccessGuard, resolveAccessMode } from './src/auth/accessControl';
 import { createAuthApi } from './src/auth/api';
 import { createLoopbackRequestGuard, createSecurityHeaders } from './src/auth/loopbackGuard';
 import { resolveSessionSecret } from './src/auth/session';
 import { createUserStore } from './src/auth/users';
 import { createFileCapabilityGrantStore } from './src/capabilities/grantStore';
 import { createCoreModelRuntime } from './src/core-model/runtime';
+import { resolveDesktopBridgeConfiguration } from './src/desktop/config';
+import { createDesktopBridgeClient } from './src/desktop/ipc';
+import { createMemoryDesktopPayloadStore, type DesktopPayloadStore } from './src/desktop/payloadStore';
 import { createKernelRouter } from './src/kernel/api';
 import { createFileArtifactStore } from './src/kernel/artifacts/artifactStore';
 import {
   BROWSER_WRITE_WORKER_ID,
   buildBrowserWriteWorkerRegistration,
+  buildDesktopWorkerRegistration,
   buildWorkerRegistrations,
+  DESKTOP_V1_ACTIONS,
+  DESKTOP_WORKER_ID,
+  type RuntimeFeatureStatus,
   WEB_INSPECT_WORKER_ID,
 } from './src/kernel/autonomy';
 import { createKernelService, type KernelActionWorker } from './src/kernel/kernel';
@@ -36,21 +43,25 @@ import {
   detectDockerSandbox,
 } from './src/kernel/sandbox/sandbox';
 import { createBrowserWorker, createPlaywrightDriver } from './src/kernel/workers/browserWorker';
+import { createDesktopWorker } from './src/kernel/workers/desktopWorker';
 import { createWebInspectWorker } from './src/kernel/workers/webInspectWorker';
 import { createProviderApi } from './src/providers/api';
 import { createProviderRuntime } from './src/providers/runtime';
 import { PROVIDER_IDS, type ProviderId, type ProviderRoutingPolicy } from './src/providers/types';
+import { createDesktopReadyPublisher } from './src/runtime/desktopReadiness';
+import { acquireRuntimeOwnership } from './src/runtime/ownership';
 import { createVaultApi } from './src/vault/api';
 import { createPlatformVault, injectVaultSecretsIntoEnvironment } from './src/vault/index';
 
-dotenv.config();
+const PROJECT_ROOT = path.resolve(process.env.PROVENANCE_PROJECT_ROOT?.trim() || process.cwd());
+dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
 
 const app = express();
 const configuredPort = Number.parseInt(process.env.PORT || '3000', 10);
 const PORT = Number.isSafeInteger(configuredPort) && configuredPort >= 0 && configuredPort <= 65_535
   ? configuredPort
   : 3000;
-const RUNTIME_DIR = path.join(process.cwd(), '.agent-kernel');
+const RUNTIME_DIR = path.resolve(process.env.PROVENANCE_RUNTIME_DIR?.trim() || path.join(PROJECT_ROOT, '.agent-kernel'));
 const IS_DEVELOPMENT = process.env.NODE_ENV === 'development' || /\.[cm]?tsx?$/iu.test(process.argv[1] || '');
 const IS_RELEASE_CHILD = process.env.RELEASE_CHILD_MODE === '1';
 const recurringResearchSchedulerSetting = process.env.RECURRING_RESEARCH_SCHEDULER_ENABLED?.trim().toLowerCase();
@@ -113,22 +124,72 @@ const createServerContext = async () => {
   const browserWriteRegistration = browserWorkerAvailable
     ? buildBrowserWriteWorkerRegistration(process.env.BROWSER_WRITE_ORIGINS)
     : undefined;
+  const desktopConfiguration = resolveDesktopBridgeConfiguration(process.env);
+  const desktopAuthorityConfigured = resolveAccessMode(userStore.count(), operatorToken) !== 'open';
+  let desktopIpcStatus: RuntimeFeatureStatus = {
+    status: desktopConfiguration.status,
+    reason: desktopConfiguration.reason,
+  };
+  let desktopRegistration = desktopConfiguration.configuration
+    ? buildDesktopWorkerRegistration(
+      desktopConfiguration.configuration.applications.map((application) => application.id),
+      { available: false, reason: 'The configured native desktop bridge has not passed its authenticated health check.' },
+    )
+    : undefined;
+  let desktopWorker: KernelActionWorker | undefined;
+  let desktopPayloadStore: DesktopPayloadStore | undefined;
+  if (desktopConfiguration.configuration && !desktopAuthorityConfigured) {
+    desktopIpcStatus = {
+      status: 'blocked',
+      reason: 'Native desktop execution is blocked until an operator token or multi-user access control is configured.',
+    };
+  } else if (desktopConfiguration.configuration) {
+    const bridge = createDesktopBridgeClient({
+      baseUrl: desktopConfiguration.configuration.baseUrl,
+      token: desktopConfiguration.configuration.token,
+    });
+    try {
+      const health = await bridge.health();
+      const expectedApps = desktopConfiguration.configuration.applications.map((application) => application.id).sort();
+      const healthyApps = [...new Set(health.allowedAppIds)].sort();
+      const capabilitiesMatch = DESKTOP_V1_ACTIONS.every((action) => health.capabilities.includes(action));
+      const allowlistMatches = expectedApps.length === healthyApps.length &&
+        expectedApps.every((appId, index) => appId === healthyApps[index]);
+      if (!capabilitiesMatch || !allowlistMatches) {
+        throw new Error('Native host capabilities or application allowlist do not match the server configuration.');
+      }
+      desktopRegistration = buildDesktopWorkerRegistration(expectedApps, { available: true });
+      desktopPayloadStore = createMemoryDesktopPayloadStore();
+      desktopWorker = createDesktopWorker(bridge, (id) => desktopPayloadStore!.consume(id));
+      desktopIpcStatus = {
+        status: 'available',
+        reason: `An authenticated Windows desktop host is available for ${expectedApps.length} allowlisted application(s).`,
+      };
+    } catch {
+      desktopIpcStatus = {
+        status: 'configured',
+        reason: 'Native desktop bridge settings are present, but its authenticated health check failed.',
+      };
+    }
+  }
   const baseRegistrations = buildWorkerRegistrations(process.env);
-  const workerRegistrations = browserWriteRegistration
-    ? [
-      ...baseRegistrations.filter((registration) => !(
-        registration.family === 'browser' && registration.availability === 'unavailable'
-      )),
-      browserWriteRegistration,
-    ]
-    : baseRegistrations;
+  const workerRegistrations = [
+    ...baseRegistrations.filter((registration) => !(
+      (browserWriteRegistration && registration.family === 'browser' && registration.availability === 'unavailable') ||
+      (desktopRegistration && registration.family === 'desktop')
+    )),
+    ...(browserWriteRegistration ? [browserWriteRegistration] : []),
+    ...(desktopRegistration ? [desktopRegistration] : []),
+  ];
   const actionWorkers: Record<string, KernelActionWorker> = {
     [WEB_INSPECT_WORKER_ID]: createWebInspectWorker(),
     ...(browserWriteRegistration
       ? { [BROWSER_WRITE_WORKER_ID]: createBrowserWorker(browserDriver, (id) => artifactStore.resolve(id)) }
       : {}),
+    ...(desktopWorker ? { [DESKTOP_WORKER_ID]: desktopWorker } : {}),
   };
   if (browserWorkerAvailable) console.log('[Browser] Write-capable Playwright worker registered.');
+  if (desktopWorker) console.log('[Desktop] Authenticated Windows UI Automation worker registered.');
 
   const capabilityGrantStore = await createFileCapabilityGrantStore(
     path.join(RUNTIME_DIR, 'capability-grants.json'),
@@ -208,7 +269,7 @@ const createServerContext = async () => {
   );
   const kernelConfig = {
     runtimeDir: RUNTIME_DIR,
-    allowedWorkspaceRoot: process.cwd(),
+    allowedWorkspaceRoot: PROJECT_ROOT,
     providerRouter: providerRuntime.router,
     releaseSigningPublicKey: process.env.RELEASE_SIGNING_PUBLIC_KEY,
     workerRegistrations,
@@ -284,7 +345,7 @@ const createServerContext = async () => {
       successCriteria: ['Every application AI call is provider-routed and ledgered with provenance.'],
       constraints: ['Pinned provider/model policy', 'No application route may bypass the kernel call budget'],
       autonomyLevel: 'bounded',
-      workspaceRoot: process.cwd(),
+      workspaceRoot: PROJECT_ROOT,
       verificationCommands: ['npm run lint'],
       budget: {
         maxOperations: maxProviderCalls,
@@ -319,6 +380,8 @@ const createServerContext = async () => {
       tickInProgress: false,
       tickIntervalMs: RECURRING_RESEARCH_TICK_MS,
     },
+    desktopIpcStatus: () => desktopIpcStatus,
+    desktopPayloadStore,
     recoverOnStart: false,
   }));
   app.use('/api', createApplicationAiRouter({
@@ -342,46 +405,67 @@ const createServerContext = async () => {
 };
 
 async function start() {
-  const { recurringResearchScheduler, releaseLifecycle } = await createServerContext();
-
-  if (IS_DEVELOPMENT) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  await recurringResearchScheduler?.start();
-
-  const httpServer = app.listen(PORT, '127.0.0.1', () => {
-    const address = httpServer.address();
-    const listeningPort = typeof address === 'object' && address ? address.port : PORT;
-    console.log(`[Server] Persistent Agent Knowledgebase running on http://localhost:${listeningPort}`);
-    const nonce = process.env.RELEASE_SUPERVISOR_NONCE;
-    const targetVersion = process.env.RELEASE_TARGET_VERSION;
-    const contentHash = process.env.RELEASE_CONTENT_HASH;
-    if (process.send && nonce && targetVersion && contentHash) {
-      process.send({ type: 'release.ready', nonce, targetVersion, contentHash });
-    }
+  const desktopHostPid = Number.parseInt(process.env.DESKTOP_RUNTIME_OWNER_PID ?? '', 10);
+  const runtimeOwnership = await acquireRuntimeOwnership(RUNTIME_DIR, {
+    desktopOwnerNonce: process.env.DESKTOP_RUNTIME_OWNER_NONCE,
+    desktopHostPid: Number.isSafeInteger(desktopHostPid) && desktopHostPid > 0 ? desktopHostPid : undefined,
   });
+  let desktopReady: ReturnType<typeof createDesktopReadyPublisher> | undefined;
+  try {
+    desktopReady = createDesktopReadyPublisher(RUNTIME_DIR, process.env);
+    const { recurringResearchScheduler, releaseLifecycle } = await createServerContext();
 
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    await recurringResearchScheduler?.stop();
-    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
-    await releaseLifecycle.shutdown();
-  };
-  process.once('SIGINT', () => void shutdown().finally(() => process.exit(0)));
-  process.once('SIGTERM', () => void shutdown().finally(() => process.exit(0)));
+    if (IS_DEVELOPMENT) {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(PROJECT_ROOT, 'dist');
+      app.use(express.static(distPath));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
+
+    await recurringResearchScheduler?.start();
+
+    let shuttingDown = false;
+    let httpServer: ReturnType<typeof app.listen>;
+    const shutdown = async () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      await recurringResearchScheduler?.stop();
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await releaseLifecycle.shutdown();
+      await desktopReady!.cleanup();
+      await runtimeOwnership.release();
+    };
+
+    httpServer = app.listen(PORT, '127.0.0.1', () => {
+      const address = httpServer.address();
+      const listeningPort = typeof address === 'object' && address ? address.port : PORT;
+      console.log(`[Server] Persistent Agent Knowledgebase running on http://localhost:${listeningPort}`);
+      const nonce = process.env.RELEASE_SUPERVISOR_NONCE;
+      const targetVersion = process.env.RELEASE_TARGET_VERSION;
+      const contentHash = process.env.RELEASE_CONTENT_HASH;
+      if (process.send && nonce && targetVersion && contentHash) {
+        process.send({ type: 'release.ready', nonce, targetVersion, contentHash });
+      }
+      void desktopReady!.publish(listeningPort).catch((error) => {
+        console.error('[Desktop] Failed to publish authenticated host readiness:', error instanceof Error ? error.message : error);
+        void shutdown().finally(() => { process.exitCode = 1; });
+      });
+    });
+
+    process.once('SIGINT', () => void shutdown().finally(() => process.exit(0)));
+    process.once('SIGTERM', () => void shutdown().finally(() => process.exit(0)));
+  } catch (error) {
+    await desktopReady?.cleanup().catch(() => undefined);
+    await runtimeOwnership.release().catch(() => undefined);
+    throw error;
+  }
 }
 
 void start().catch((error) => {

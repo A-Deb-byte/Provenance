@@ -34,6 +34,8 @@ export interface KernelRouterOptions {
   readonly recurringResearchSchedulerEnabled?: boolean;
   readonly recurringResearchTickMs?: number;
   readonly recurringResearchSchedulerStatus?: () => RecurringResearchSchedulerStatus;
+  readonly desktopIpcStatus?: () => import('./autonomy').RuntimeFeatureStatus;
+  readonly desktopPayloadStore?: import('../desktop/payloadStore').DesktopPayloadStore;
   readonly recoverOnStart?: boolean;
   readonly kernelService?: ReturnType<typeof createKernelService>;
 }
@@ -551,6 +553,25 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
   });
 
+  router.post('/desktop/typed-payloads', async (req, res) => {
+    const content = req.body?.content as unknown;
+    if (typeof content !== 'string' || content.length === 0) {
+      res.status(400).json({ error: 'Desktop typing payload must be a non-empty string.' });
+      return;
+    }
+    if (!options.desktopPayloadStore) {
+      res.status(503).json({ error: 'Desktop typed-payload staging is unavailable.' });
+      return;
+    }
+    try {
+      // Only metadata crosses back to the cockpit. The content remains in the
+      // process-local, consume-once store until the authorized worker resolves it.
+      res.status(201).json(await options.desktopPayloadStore.stage(content));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
   router.post('/artifacts', async (req, res) => {
     const content = req.body?.content as unknown;
     if (typeof content !== 'string' || content.length === 0) {
@@ -618,7 +639,8 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
       const message = errorMessage(error);
       const status = message.endsWith('not found.')
         ? 404
-        : message.includes('disabled') || message.includes('Stop All') || message.includes('budget') || message.includes('halted')
+        : message.includes('disabled') || message.includes('Stop All') || message.includes('budget') ||
+          message.includes('halted') || message.includes('in-flight') || message.includes('uncertain')
           ? 409 : 400;
       res.status(status).json({ error: message });
     }
@@ -782,6 +804,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
           lastOutcome: recurringResearchSchedulerStatus?.lastOutcome,
           lastError: recurringResearchSchedulerStatus?.lastError,
         },
+        desktopIpc: options.desktopIpcStatus?.(),
       }));
     } catch {
       res.status(500).json({ error: 'Runtime capability report is unavailable.' });

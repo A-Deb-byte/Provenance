@@ -1,0 +1,53 @@
+[package]
+name = "provenance-desktop"
+version = "0.1.0"
+description = "Native Windows host and bounded UI Automation bridge for Provenance"
+authors = ["Provenance contributors"]
+edition = "2021"
+rust-version = "1.85"
+license = "UNLICENSED"
+
+[lib]
+name = "provenance_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "provenance-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "tokio"] }
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+thiserror = "2"
+time = { version = "=0.3.36", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

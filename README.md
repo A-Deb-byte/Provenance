@@ -18,6 +18,7 @@ Provenance now provides:
 - A Docker command sandbox when Docker is available, with an explicitly reported trusted-host fallback when it is not.
 - Windows DPAPI, macOS Keychain, and Linux Secret Service vault adapters, selected and reported by platform.
 - Dashboard authentication for operator-token, bootstrap, login, role-scoped sessions, logout, and session revocation.
+- A Windows Native Desktop Runtime v1 source slice: a Tauri/Rust host owns and supervises the local Node control plane, an authenticated loopback bridge exposes bounded UI Automation, and the dashboard routes desktop work through kernel policy, approval, capability, and ledger boundaries.
 - Controlled staged releases with canonical authorization signatures, evaluation gates, verified installation, supervised process readiness, restart restoration, and rollback on activation failure.
 
 This is a substantial local control plane, not an unrestricted self-modifying agent. Remaining deployment boundaries are listed below.
@@ -71,6 +72,16 @@ The skill foundry synthesizes an allowlisted text-transform DSL, compares it wit
 `browser.inspect` is read-only L0. Browser navigation, clicking, typing, and downloads have a minimum L2 risk and require explicit approval. The browser driver checks the allowlisted origin before an action, after navigation, and after click/script-driven navigation; redirects cannot silently widen scope.
 
 For approval-gated automations, the first run creates a persisted approval. A later run may consume the matching approved record and execute within that exact intent. Capability grants are persisted and consumed before worker I/O; the worker must claim the resulting opaque one-use dispatch authorization immediately before acting.
+
+### Native desktop runtime v1
+
+The Windows desktop source slice places a Tauri/Rust host above the existing TypeScript control plane. The host acquires exclusive ownership of the `.agent-kernel` runtime before Node opens it, supervises the fixed `dist/server.cjs` entrypoint under a kill-on-close Windows job, and accepts readiness only from a per-launch nonce-bound file. A standalone Node launch uses the same owner record and refuses to open a runtime already held by a live owner. This is single-owner fencing, not multi-process shared-state coordination.
+
+The native bridge binds to an ephemeral `127.0.0.1` port. Requests and responses are HMAC-SHA256 authenticated with a per-launch secret; request ids, bounded timestamps, body hashes, response status, and nonce replay protection are part of the protocol. The Node process registers the Windows worker only after authenticated health reports the exact expected capabilities and application allowlist. Bridge credentials and runtime-owner nonces are generated for one supervised launch and are neither dashboard configuration nor persisted authority.
+
+Desktop use requires `operator_token` or `multi_user` access control; it is blocked in loopback `open` mode. `desktop.discover` and `desktop.inspect` are L0 read-only operations. `desktop.click` and `desktop.type` are minimum L2 and execute only after the matching approval is consumed and a one-use capability dispatch is claimed. Every request remains scoped to an allowlisted executable identity; mutations additionally bind the discovered window, UI tree revision, and node id. Text is resolved from a hash-addressed artifact rather than accepted from an observation. UI Automation output is untrusted evidence and cannot grant authority.
+
+The v1 worker does not expose shortcuts, elevation, arbitrary shell execution, plugins, downloads, an installer, or an updater. Native availability is health-gated and remains unavailable when the host, access mode, allowlist, or authenticated bridge is not ready.
 
 ### Snapshots and recovery
 
@@ -137,6 +148,15 @@ RECURRING_RESEARCH_TICK_MS=15000
 
 The clock interval is clamped to 1-60 seconds; durable mission intervals remain independently bounded to 15 minutes through 365 days.
 
+On Windows, Native Desktop Runtime v1 additionally requires Rust stable MSVC 1.85 or newer, the Visual Studio 2022 Desktop development with C++ workload, a Windows 10/11 SDK, WebView2 Evergreen, and a canonical `node.exe`. Configure an operator token or bootstrap a multi-user account, then add a narrow executable allowlist to `.env`:
+
+```dotenv
+KERNEL_API_TOKEN=choose-a-long-random-value
+DESKTOP_APP_ALLOWLIST='[{"appId":"windows.notepad","executablePath":"C:\\Windows\\System32\\notepad.exe"}]'
+```
+
+The JSON must contain 1-32 unique objects with only `appId` and `executablePath`. Application ids use lowercase letters, digits, `.`, `_`, or `-`; each path must already be an absolute normalized `.exe` path. `npm run desktop:dev` preloads `.env` before it starts Tauri; a directly launched host binary must receive `DESKTOP_APP_ALLOWLIST` in its process environment. `PROVENANCE_PROJECT_ROOT` and `PROVENANCE_NODE_EXECUTABLE` may override the canonical repository and Node paths for native development. Native runtime state is placed under Tauri's per-user local application-data directory, outside the repository command workspace; standalone Node retains the repository-local `.agent-kernel` default. The native host generates the bridge secret, a private runtime-owner proof, its expected host PID, runtime path, and readiness values for the supervised child. Only the owner's SHA-256 proof hash is written to disk. Do not place any per-launch value in `.env`.
+
 Run the development server:
 
 ```bash
@@ -150,6 +170,15 @@ npm run build
 npm start
 ```
 
+Build the web/server artifacts and launch or compile the native host on a prepared Windows machine:
+
+```bash
+npm run desktop:dev
+npm run desktop:build
+```
+
+Bundling is intentionally disabled in v1. `desktop:build` verifies the host binary; it does not create an installer or configure automatic updates.
+
 ## Verification
 
 ```bash
@@ -157,18 +186,24 @@ npm run lint
 npm test
 npm run build
 npm run verify-ledger
+npm run desktop:test
+npm run desktop:check
 ```
 
-The last baseline before the 2026-07-13 trust-boundary hardening was **242 tests across 51 files**, and that hardening closed at **297 tests across 62 files**. The completed Durable Recurring Research v1 milestone passes **410 tests across 70 files**; `npm test` remains the source of truth as the suite evolves. The final 2026-07-15 ledger check authenticated **252 events**; that count is timestamped runtime evidence, not a fixed product invariant.
+The last baseline before the 2026-07-13 trust-boundary hardening was **242 tests across 51 files**, and that hardening closed at **297 tests across 62 files**. Durable Recurring Research v1 closed at **410 tests across 70 files**. Native Desktop Runtime v1 currently passes **455 tests across 78 files**; `npm test` remains the source of truth as the suite evolves. The 2026-07-15 ledger check authenticated **252 events**; that count is timestamped runtime evidence, not a fixed product invariant.
+
+Native Desktop Runtime v1 has TypeScript integration and focused tests in this source tree. Rust/Cargo produced the committed `Cargo.lock`; WSL formatting and locked cross-target `cargo check --all-targets` plus Clippy with warnings denied pass for `x86_64-pc-windows-msvc`. Direct Windows linking still stops at the missing MSVC/Windows SDK import libraries, and local Windows `rustfmt` is blocked by Application Control. `.github/workflows/native-desktop.yml` therefore runs formatting, tests, native all-target checking, and Clippy on a prepared Windows runner. No passing native CI run is claimed until that workflow actually completes.
 
 ## Deployment Boundaries
 
-- No Rust/Tauri kernel or authenticated desktop IPC channel ships yet; the TypeScript kernel remains the reference implementation.
-- Docker supplies real command isolation when available. Without Docker, the runtime reports and uses a trusted-host fallback; native Windows job-object or Linux namespace/seccomp isolation is not implemented.
-- Desktop automation, OAuth connector runtimes, and browser downloads are not implemented.
+- The Rust/Tauri host and authenticated desktop IPC exist as a Windows source implementation, but have not been compiled or live-validated on this development machine. Availability stays health-gated; the TypeScript kernel remains the policy authority.
+- Docker supplies real command isolation when available. Without Docker, the runtime reports and uses a trusted-host fallback; the desktop host's child-process job does not provide a general command sandbox, and native Windows command isolation or Linux namespace/seccomp isolation is not implemented.
+- Desktop v1 is limited to allowlisted discovery, inspection, click, and hash-bound typing. Typed text lives only in a bounded, expiring, consume-once in-memory store; it is not written to the general artifact directory. A timeout, Stop All, transport loss, executor loss, or failed post-write observation after native mutation dispatch is recorded as `automation.run_uncertain` and blocks retry of that automation. Stop All cannot undo an OS side effect already accepted by UI Automation.
+- The host watches the Node child, bridge task, and UI Automation broker. Loss of any one clears web storage and closes the dashboard instead of leaving its loopback page active. The v1 browser-facing listener is still the supervised Node listener rather than a Rust-owned reverse proxy, so this is fail-closed monitoring rather than a formal proof against every same-user local port-rebinding race.
+- Shortcuts, elevation, shell authority, downloads, OAuth connector runtimes, plugins, installers, automatic updates, and arbitrary desktop missions are not implemented.
 - Research missions do not provide generic web search, source discovery, crawling, redirect following, or automatic expansion beyond the explicit seed URLs.
 - Durable scheduling is currently limited to the fixed-source Research to Verified Report workflow; there is no generic cron, arbitrary command, connector, email, or desktop mission scheduler.
-- Exactly one trusted parent server may own a given `.agent-kernel` runtime directory. Mutation and ledger queues are process-local; multi-process or high-availability sharing of one runtime is not supported.
+- Exactly one native host or standalone Node server may own a given `.agent-kernel` runtime directory. Mutation and ledger queues are process-local; multi-process or high-availability sharing of one runtime is not supported.
 - macOS Keychain and Linux Secret Service adapters need live validation on their target operating systems.
 - Accounts share one local kernel state. There is no per-user goal/memory partitioning or SSO/OIDC.
 - Supervised releases do not hot-replace or proxy the trusted parent Express control plane; stable-port traffic switching remains a deployment concern.

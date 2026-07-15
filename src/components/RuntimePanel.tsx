@@ -25,6 +25,7 @@ const featureLabels: Record<string, string> = {
   releaseSigning: 'Release signing',
   releaseDeployment: 'Supervised core releases',
   desktopIpc: 'Desktop shell IPC',
+  desktopAutomation: 'Windows UI Automation',
 };
 
 export const RuntimePanel: React.FC = () => {

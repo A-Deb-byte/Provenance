@@ -72,6 +72,23 @@ describe('capability policy', () => {
     }, registry).kind).toBe('approval_required');
   });
 
+  it('allows desktop discovery and inspection but requires L2 approval for every desktop mutation', () => {
+    expect(minimumRiskForAction({ type: 'desktop.discover', appId: 'notepad' })).toBe('L0');
+    expect(minimumRiskForAction({
+      type: 'desktop.inspect', appId: 'notepad', windowId: 'window_1', treeRevision: 'rev_1',
+    })).toBe('L0');
+    expect(minimumRiskForAction({
+      type: 'desktop.click', appId: 'notepad', windowId: 'window_1', treeRevision: 'rev_1', nodeId: 'node_1',
+    })).toBe('L2');
+    expect(minimumRiskForAction({
+      type: 'desktop.type', appId: 'notepad', windowId: 'window_1', treeRevision: 'rev_1', nodeId: 'node_1',
+      payloadArtifactId: 'artifact_1', payloadHash: 'a'.repeat(64),
+    })).toBe('L2');
+    expect(minimumRiskForAction({
+      type: 'desktop.shortcut', appId: 'notepad', windowId: 'window_1', treeRevision: 'rev_1', keys: ['CTRL', 'S'],
+    })).toBe('L2');
+  });
+
   it('denies L4, understated risk, and forged untrusted authority', () => {
     const registry = createWorkerRegistry([browserWorker]);
     expect(decideActionPolicy(browserIntent({ riskLevel: 'L4' }), registry).reasonCode).toBe('forbidden_risk');

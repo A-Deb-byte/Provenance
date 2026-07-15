@@ -9,3 +9,6 @@ coverage/
 .superpowers/
 .claude/
 .agent-kernel/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/resources/node.exe

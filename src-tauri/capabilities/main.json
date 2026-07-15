@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Minimal authority for the bundled startup view. The supervised remote dashboard receives no Tauri remote capability.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

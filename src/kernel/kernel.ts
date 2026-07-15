@@ -143,7 +143,7 @@ import type { createReleaseLifecycle } from './releases/lifecycle';
 import { runKernelCommand } from './workers/commandWorker';
 
 export interface KernelActionWorkerResult {
-  status: 'succeeded' | 'failed';
+  status: 'succeeded' | 'failed' | 'uncertain';
   summary: string;
   sourceRef: string;
   content?: string;
@@ -168,13 +168,15 @@ export interface AutomationRunOutcome {
   decision: CapabilityPolicyDecision;
   approvalId?: string;
   dispatch?: {
-    status: 'succeeded' | 'failed';
+    status: 'succeeded' | 'failed' | 'uncertain';
     summary: string;
     sourceRef: string;
     errorCode?: string;
   };
   observation?: {
     id: string;
+    source: 'web' | 'screen';
+    artifactId?: string;
     contentHash: string;
     risk: 'none' | 'medium' | 'high';
     injectionSignalCodes: PromptInjectionSignalCode[];
@@ -3962,7 +3964,33 @@ export const createKernelService = (options: KernelServiceOptions) => {
     return decision;
   });
 
-  const runAutomation = (automationId: string): Promise<AutomationRunOutcome> => withMutation(async () => {
+  interface PreparedAutomationRun {
+    kind: 'dispatch';
+    automationId: string;
+    automationUpdatedAt: string;
+    intent: ActionIntent;
+    decision: CapabilityPolicyDecision;
+    approvalId?: string;
+    grantId: string;
+    grantStatus: 'active' | 'revoked' | 'consumed';
+    authorization: CapabilityDispatchAuthorization;
+    worker: KernelActionWorker;
+    controller: AbortController;
+    timeoutMs: number;
+    runStartedEventId: string;
+  }
+
+  type AutomationRunPreparation = PreparedAutomationRun | {
+    kind: 'result';
+    result: AutomationRunOutcome;
+  };
+
+  interface AutomationObservationAssessment {
+    risk: 'none' | 'medium' | 'high';
+    codes: PromptInjectionSignalCode[];
+  }
+
+  const prepareAutomationRun = (automationId: string): Promise<AutomationRunPreparation> => withMutation(async () => {
     let state = await readConsistentState();
     const automation = state.automations.find((candidate) => candidate.id === automationId);
     if (!automation) throw new Error('Automation not found.');
@@ -3972,8 +4000,27 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!goal) throw new Error('Goal not found.');
 
     const events = await readKernelEvents(options.runtimeDir);
+    const terminalRunTypes = new Set([
+      'automation.run_completed', 'automation.run_failed', 'automation.run_uncertain',
+    ]);
+    const finishedIntentIds = new Set(events
+      .filter((event) => (
+        terminalRunTypes.has(event.type) &&
+        event.payload.automationId === automationId && typeof event.payload.intentId === 'string'
+      ))
+      .map((event) => event.payload.intentId as string));
+    const hasInFlightRun = events.some((event) => (
+      event.type === 'automation.run_started' && event.payload.automationId === automationId &&
+      typeof event.payload.intentId === 'string' && !finishedIntentIds.has(event.payload.intentId)
+    ));
+    if (hasInFlightRun) throw new Error('Automation already has an in-flight or uncertain run.');
+    if (events.some((event) => (
+      event.type === 'automation.run_uncertain' && event.payload.automationId === automationId
+    ))) {
+      throw new Error('Automation has an unresolved uncertain desktop outcome and cannot be retried.');
+    }
     const runEvents = events.filter((event) => (
-      (event.type === 'automation.run_completed' || event.type === 'automation.run_failed') &&
+      terminalRunTypes.has(event.type) &&
       event.payload.automationId === automationId
     ));
     if (runEvents.length >= automation.budget.maxRuns) {
@@ -4045,7 +4092,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
             : candidate),
         });
       }
-      return { decision, approvalId: approval.id };
+      return { kind: 'result', result: { decision, approvalId: approval.id } };
     }
 
     const approvalId = approval?.status === 'approved' ? approval.id : undefined;
@@ -4062,7 +4109,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         payload: { automationId, intentId: intent.id, reasonCode: decision.reasonCode, reason: decision.reason },
       });
       await commitState(appended.state);
-      return { decision, approvalId };
+      return { kind: 'result', result: { decision, approvalId } };
     }
 
     const worker = options.actionWorkers?.[automation.workerId];
@@ -4115,6 +4162,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       payload: { automationId, intentId: intent.id, grantId: grant.id, approvalId, actionType: automation.action.type },
     });
     state = appended.state;
+    const runStartedEventId = appended.event.id;
     const consumedAt = new Date().toISOString();
     await commitState({
       ...state,
@@ -4128,38 +4176,106 @@ export const createKernelService = (options: KernelServiceOptions) => {
         : candidate),
     });
 
-    const timeoutMs = Math.min(automation.budget.maxRuntimeMsPerRun, 30_000);
-    let dispatch: KernelActionWorkerResult;
-    try {
-      dispatch = await worker.execute(intent, { timeoutMs, authorization: authorized.authorization });
-    } catch {
-      dispatch = {
-        status: 'failed',
-        summary: 'Worker execution failed after capability authorization.',
-        sourceRef: `automation:${automationId}`,
-        errorCode: 'worker_exception',
-      };
+    const controller = new AbortController();
+    activeActionControllers.set(intent.id, controller);
+    return {
+      kind: 'dispatch',
+      automationId,
+      automationUpdatedAt: automation.updatedAt,
+      intent,
+      decision,
+      approvalId,
+      grantId: grant.id,
+      grantStatus: authorized.grant.status,
+      authorization: authorized.authorization,
+      worker,
+      controller,
+      timeoutMs: Math.max(1, Math.min(automation.budget.maxRuntimeMsPerRun, 30_000)),
+      runStartedEventId,
+    };
+  });
+
+  const recordAutomationRunOutcome = (
+    prepared: PreparedAutomationRun,
+    dispatched: KernelActionWorkerResult,
+    assessed: AutomationObservationAssessment,
+    timedOut: boolean,
+    persistedObservation?: ArtifactMetadata,
+  ): Promise<AutomationRunOutcome> => withMutation(async () => {
+    let state = await readConsistentState();
+    const events = await readKernelEvents(options.runtimeDir);
+    const currentAutomation = state.automations.find((candidate) => candidate.id === prepared.automationId);
+    const runStarted = events.find((event) => (
+      event.id === prepared.runStartedEventId &&
+      event.type === 'automation.run_started' &&
+      event.payload.automationId === prepared.automationId &&
+      event.payload.intentId === prepared.intent.id &&
+      event.payload.grantId === prepared.grantId
+    ));
+    const alreadyFinished = events.some((event) => (
+      (event.type === 'automation.run_completed' || event.type === 'automation.run_failed' ||
+        event.type === 'automation.run_uncertain') &&
+      event.payload.automationId === prepared.automationId &&
+      event.payload.intentId === prepared.intent.id
+    ));
+    if (alreadyFinished) throw new Error('Automation run outcome has already been recorded.');
+
+    let fenceReason: string | undefined;
+    let fenceErrorCode: string | undefined;
+    if (activeActionControllers.get(prepared.intent.id) !== prepared.controller || !runStarted) {
+      fenceReason = 'Automation dispatch ownership changed before result commit.';
+      fenceErrorCode = 'stale_dispatch';
+    } else if (prepared.controller.signal.aborted) {
+      fenceReason = timedOut
+        ? 'Automation dispatch exceeded its bounded runtime before result commit.'
+        : 'Automation dispatch was cancelled before result commit.';
+      fenceErrorCode = timedOut ? 'timeout' : 'cancelled';
+    } else if (state.controls.stopAll) {
+      fenceReason = 'Stop All became active before automation result commit.';
+      fenceErrorCode = 'cancelled';
+    } else if (!currentAutomation?.enabled || currentAutomation.updatedAt !== prepared.automationUpdatedAt) {
+      fenceReason = 'Automation authority changed before result commit.';
+      fenceErrorCode = 'stale_dispatch';
     }
 
-    const content = dispatch.content ?? '';
-    const heuristic = analyzePromptInjection(content);
-    let assessment: { risk: 'none' | 'medium' | 'high'; codes: PromptInjectionSignalCode[] } = {
-      risk: heuristic.risk,
-      codes: heuristic.signals.map((signal) => signal.code),
-    };
-    if (options.observationAssessor) {
-      try {
-        const assessed = await assessObservation(content);
-        if (!assessed) throw new Error('Observation assessor is unavailable.');
-        assessment = { risk: assessed.risk, codes: assessed.signals.map((signal) => signal.code) };
-      } catch {
-        // The heuristic floor stands when the advisory model fails.
+    const desktopMutation = prepared.intent.action.type === 'desktop.click' ||
+      prepared.intent.action.type === 'desktop.type' || prepared.intent.action.type === 'desktop.shortcut';
+    let dispatch: KernelActionWorkerResult = fenceReason
+      ? {
+        status: desktopMutation ? 'uncertain' : 'failed',
+        summary: desktopMutation
+          ? `${fenceReason} The desktop mutation may have completed and must not be retried automatically.`
+          : fenceReason,
+        sourceRef: `automation:${prepared.automationId}`,
+        errorCode: desktopMutation ? 'desktop_outcome_uncertain' : fenceErrorCode,
+      }
+      : dispatched;
+    let content = dispatch.content ?? '';
+    let assessment = fenceReason
+      ? { risk: 'none' as const, codes: [] as PromptInjectionSignalCode[] }
+      : assessed;
+    const observationSource = prepared.intent.action.type.startsWith('desktop.') ? 'screen' as const : 'web' as const;
+    let observationArtifact = fenceReason ? undefined : persistedObservation;
+    if (observationSource === 'screen' && content.length > 0) {
+      const contentHash = analyzePromptInjection(content).contentHash;
+      const artifactMatches = observationArtifact?.contentHash === contentHash &&
+        observationArtifact.byteLength === Buffer.byteLength(content, 'utf8');
+      if (!artifactMatches) {
+        dispatch = {
+          status: 'failed',
+          summary: 'Desktop observation content was not authenticated in the artifact store.',
+          sourceRef: dispatch.sourceRef,
+          errorCode: 'artifact_authentication_failed',
+        };
+        content = '';
+        assessment = { risk: 'none', codes: [] };
+        observationArtifact = undefined;
       }
     }
     const observation = {
       ...createUntrustedObservation({
         id: createKernelId('obs'),
-        source: 'web' as const,
+        source: observationSource,
         sourceRef: dispatch.sourceRef,
         content,
         capturedAt: new Date().toISOString(),
@@ -4168,31 +4284,56 @@ export const createKernelService = (options: KernelServiceOptions) => {
     };
 
     const succeeded = dispatch.status === 'succeeded';
-    state = await readConsistentState();
-    appended = await appendEvent(state, {
+    if (observationArtifact) {
+      const artifactAppended = await appendEvent(state, {
+        actor: 'worker',
+        type: 'artifact.created',
+        entityId: observationArtifact.id,
+        entityType: 'artifact',
+        payload: {
+          artifactId: observationArtifact.id,
+          contentHash: observationArtifact.contentHash,
+          byteLength: observationArtifact.byteLength,
+          automationId: prepared.automationId,
+          intentId: prepared.intent.id,
+          observationId: observation.id,
+          role: 'desktop_observation',
+        },
+      });
+      state = artifactAppended.state;
+    }
+    const terminalEventType = dispatch.status === 'succeeded'
+      ? 'automation.run_completed'
+      : dispatch.status === 'uncertain'
+        ? 'automation.run_uncertain'
+        : 'automation.run_failed';
+    const appended = await appendEvent(state, {
       actor: 'worker',
-      type: succeeded ? 'automation.run_completed' : 'automation.run_failed',
-      entityId: automationId,
+      type: terminalEventType,
+      entityId: prepared.automationId,
       entityType: 'automation',
       payload: {
-        automationId,
-        intentId: intent.id,
-        grantId: grant.id,
-        approvalId,
-        grantStatus: authorized.grant.status,
+        automationId: prepared.automationId,
+        intentId: prepared.intent.id,
+        grantId: prepared.grantId,
+        approvalId: prepared.approvalId,
+        grantStatus: prepared.grantStatus,
         summary: dispatch.summary,
         errorCode: dispatch.errorCode,
         observationId: observation.id,
+        observationSource,
+        artifactId: observationArtifact?.id,
         contentHash: observation.contentHash,
         injectionSignalCodes: observation.injectionSignalCodes,
         risk: assessment.risk,
+        fenceReason,
       },
     });
     await commitState(appended.state);
 
     return {
-      decision,
-      approvalId,
+      decision: prepared.decision,
+      approvalId: prepared.approvalId,
       dispatch: {
         status: dispatch.status,
         summary: dispatch.summary,
@@ -4201,6 +4342,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
       },
       observation: {
         id: observation.id,
+        source: observationSource,
+        artifactId: observationArtifact?.id,
         contentHash: observation.contentHash,
         risk: assessment.risk,
         injectionSignalCodes: observation.injectionSignalCodes,
@@ -4208,6 +4351,117 @@ export const createKernelService = (options: KernelServiceOptions) => {
       content,
     };
   });
+
+  const executePreparedAutomationRun = async (
+    prepared: PreparedAutomationRun,
+  ): Promise<AutomationRunOutcome> => {
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      prepared.controller.abort();
+    }, prepared.timeoutMs);
+    timeout.unref?.();
+
+    try {
+      let dispatch: KernelActionWorkerResult;
+      try {
+        const operation = prepared.worker.execute(prepared.intent, {
+          timeoutMs: prepared.timeoutMs,
+          authorization: prepared.authorization,
+          signal: prepared.controller.signal,
+        });
+        dispatch = await awaitAbortable(
+          operation,
+          prepared.controller.signal,
+          'Automation dispatch was cancelled before completion.',
+        );
+      } catch {
+        const desktopMutation = prepared.intent.action.type === 'desktop.click' ||
+          prepared.intent.action.type === 'desktop.type' || prepared.intent.action.type === 'desktop.shortcut';
+        const uncertain = desktopMutation && (timedOut || prepared.controller.signal.aborted);
+        dispatch = {
+          status: uncertain ? 'uncertain' : 'failed',
+          summary: uncertain
+            ? 'Desktop dispatch was interrupted after authorization; its native side effect may have completed and must not be retried automatically.'
+            : timedOut
+            ? 'Worker execution timed out after capability authorization.'
+            : prepared.controller.signal.aborted
+              ? 'Worker execution was cancelled after capability authorization.'
+              : 'Worker execution failed after capability authorization.',
+          sourceRef: `automation:${prepared.automationId}`,
+          errorCode: uncertain
+            ? 'desktop_outcome_uncertain'
+            : timedOut ? 'timeout' : prepared.controller.signal.aborted ? 'cancelled' : 'worker_exception',
+        };
+      }
+
+      let observationArtifact: ArtifactMetadata | undefined;
+      if (
+        prepared.intent.action.type.startsWith('desktop.') &&
+        (dispatch.content?.length ?? 0) > 0 &&
+        !prepared.controller.signal.aborted
+      ) {
+        try {
+          if (!options.artifactStore) throw new Error('Artifact store is unavailable.');
+          observationArtifact = await options.artifactStore.create(dispatch.content!);
+          const expectedHash = analyzePromptInjection(dispatch.content!).contentHash;
+          if (
+            observationArtifact.contentHash !== expectedHash ||
+            observationArtifact.byteLength !== Buffer.byteLength(dispatch.content!, 'utf8')
+          ) {
+            throw new Error('Artifact metadata did not authenticate the desktop observation.');
+          }
+        } catch {
+          const mutation = prepared.intent.action.type === 'desktop.click' ||
+            prepared.intent.action.type === 'desktop.type' || prepared.intent.action.type === 'desktop.shortcut';
+          dispatch = {
+            status: mutation ? 'uncertain' : 'failed',
+            summary: mutation
+              ? 'The desktop mutation completed, but its observation could not be persisted; do not retry it automatically.'
+              : 'Desktop observation could not be persisted before result commit.',
+            sourceRef: dispatch.sourceRef,
+            errorCode: mutation ? 'desktop_outcome_uncertain' : 'artifact_persistence_failed',
+          };
+          observationArtifact = undefined;
+        }
+      }
+
+      const content = dispatch.content ?? '';
+      const heuristic = analyzePromptInjection(content);
+      let assessment: AutomationObservationAssessment = {
+        risk: heuristic.risk,
+        codes: heuristic.signals.map((signal) => signal.code),
+      };
+      if (options.observationAssessor && !prepared.controller.signal.aborted) {
+        try {
+          const result = await assessObservation(content, prepared.controller.signal);
+          if (!result) throw new Error('Observation assessor is unavailable.');
+          assessment = { risk: result.risk, codes: result.signals.map((signal) => signal.code) };
+        } catch {
+          // The heuristic floor stands when the advisory model fails.
+        }
+      }
+
+      clearTimeout(timeout);
+      return await recordAutomationRunOutcome(
+        prepared,
+        dispatch,
+        assessment,
+        timedOut,
+        observationArtifact,
+      );
+    } finally {
+      clearTimeout(timeout);
+      if (activeActionControllers.get(prepared.intent.id) === prepared.controller) {
+        activeActionControllers.delete(prepared.intent.id);
+      }
+    }
+  };
+
+  const runAutomation = async (automationId: string): Promise<AutomationRunOutcome> => {
+    const prepared = await prepareAutomationRun(automationId);
+    return prepared.kind === 'result' ? prepared.result : executePreparedAutomationRun(prepared);
+  };
 
   const setStopAll = (stopAll: boolean, reason: string): Promise<KernelControls> => withMutation(async () => {
     if (!reason.trim()) throw new Error('Stop All state change reason is required.');
