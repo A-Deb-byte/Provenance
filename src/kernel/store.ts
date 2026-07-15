@@ -25,6 +25,8 @@ export const createEmptyKernelState = (): KernelState => ({
   automations: [],
   releaseProposals: [],
   benchmarkRuns: [],
+  contentSchemaVersion: 2,
+  recurringResearch: { schemaVersion: 1, schedules: [], occurrences: [] },
   controls: { stopAll: false },
   lastEventHash: null,
 });
@@ -40,6 +42,17 @@ const normalizeKernelState = (parsed: Partial<KernelState>): KernelState => ({
   automations: Array.isArray(parsed.automations) ? parsed.automations : [],
   releaseProposals: Array.isArray(parsed.releaseProposals) ? parsed.releaseProposals : [],
   benchmarkRuns: Array.isArray(parsed.benchmarkRuns) ? parsed.benchmarkRuns : [],
+  ...(parsed.contentSchemaVersion === 2
+    ? {
+      contentSchemaVersion: 2 as const,
+      recurringResearch: parsed.recurringResearch &&
+        parsed.recurringResearch.schemaVersion === 1 &&
+        Array.isArray(parsed.recurringResearch.schedules) &&
+        Array.isArray(parsed.recurringResearch.occurrences)
+        ? parsed.recurringResearch
+        : { schemaVersion: 1 as const, schedules: [], occurrences: [] },
+    }
+    : {}),
   controls: parsed.controls && typeof parsed.controls === 'object' && !Array.isArray(parsed.controls)
     ? {
       stopAll: parsed.controls.stopAll === true,

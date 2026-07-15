@@ -35,13 +35,14 @@ setTimeout(() => process.exit(8), 20);
 `;
 
 const unstableSource = `
-process.send?.({
+const readiness = {
   type: 'release.ready',
   nonce: process.env.RELEASE_SUPERVISOR_NONCE,
   targetVersion: process.env.RELEASE_TARGET_VERSION,
   contentHash: process.env.RELEASE_CONTENT_HASH,
-});
-setTimeout(() => process.exit(7), 20);
+};
+if (process.send) process.send(readiness, () => process.exit(7));
+else process.exit(7);
 `;
 
 const candidate = async (

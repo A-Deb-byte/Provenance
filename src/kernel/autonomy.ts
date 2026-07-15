@@ -117,10 +117,10 @@ export const buildBrowserWriteWorkerRegistration = (
     id: BROWSER_WRITE_WORKER_ID,
     family: 'browser',
     availability: 'available',
-    supportedActions: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
+    supportedActions: ['browser.navigate', 'browser.click', 'browser.type'],
     configuredScopes: [{
       family: 'browser',
-      operations: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
+      operations: ['browser.navigate', 'browser.click', 'browser.type'],
       origins,
       downloadRoots: [],
     }],
@@ -482,6 +482,17 @@ export interface RuntimeReportInput {
   secretVault?: { status: 'available' | 'unavailable'; reason: string };
   accessControl?: { status: 'available' | 'unavailable'; reason: string };
   osSandbox?: { status: 'available' | 'unavailable'; reason: string };
+  recurringResearchScheduler?: {
+    available: boolean;
+    enabled: boolean;
+    running: boolean;
+    tickInProgress: boolean;
+    tickIntervalMs: number;
+    reason: string;
+    lastTickAt?: string;
+    lastOutcome?: string;
+    lastError?: string;
+  };
   now?: string;
 }
 
@@ -491,6 +502,36 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
     .filter((status) => !status.configured)
     .map((status) => ({ id: status.id, reason: status.unavailableReason ?? 'Server-side credentials are not configured.' }));
   const hasAvailableWorker = input.workerReport.available.length > 0;
+  const hasResearchWorker = input.workerReport.available.includes(WEB_INSPECT_WORKER_ID);
+  const recurringScheduler = input.recurringResearchScheduler;
+  const recurringSchedulerStatus: RuntimeFeatureStatus = !recurringScheduler
+    ? {
+      status: 'unavailable',
+      reason: 'No durable recurring research scheduler is installed in this server process.',
+    }
+    : input.stopAll
+      ? {
+        status: 'blocked',
+        reason: 'Stop All is active; recurring research dispatch and in-flight work are halted.',
+      }
+      : !recurringScheduler.enabled || !recurringScheduler.available
+        ? { status: 'unavailable', reason: recurringScheduler.reason }
+        : !recurringScheduler.running
+          ? {
+            status: 'configured',
+            reason: `The durable scheduler is configured at ${recurringScheduler.tickIntervalMs} ms but its clock is stopped.`,
+          }
+          : recurringScheduler.lastError
+            ? {
+              status: 'blocked',
+              reason: `The durable scheduler clock is running but its last tick failed: ${recurringScheduler.lastError}`,
+            }
+            : {
+              status: 'available',
+              reason: `Durable interval scheduling is running every ${recurringScheduler.tickIntervalMs} ms${
+                recurringScheduler.tickInProgress ? ' with a tick in progress' : ''
+              }${recurringScheduler.lastOutcome ? `; last outcome: ${recurringScheduler.lastOutcome}` : ''}.`,
+            };
 
   const features: Record<string, RuntimeFeatureStatus> = {
     verificationCommands: {
@@ -515,6 +556,7 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
           : 'A registered worker is available; automations still require explicit enablement.'
         : 'No capability worker runtime is available, so automations cannot execute.',
     },
+    recurringResearchScheduler: recurringSchedulerStatus,
     coreModel: input.coreModel
       ? { status: input.coreModel.status, reason: input.coreModel.reason }
       : { status: 'unavailable', reason: 'No core model runtime is configured.' },
@@ -537,6 +579,18 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
       reason: input.releaseSigningConfigured
         ? 'A release signing verification key is installed; correctly signed proposals can activate.'
         : 'No release signing verification key is installed; release proposals cannot activate.',
+    },
+    verifiedResearchReports: {
+      status: input.stopAll
+        ? 'blocked'
+        : configuredProviders.length > 0 && hasResearchWorker ? 'available' : 'unavailable',
+      reason: input.stopAll
+        ? 'Stop All is active; research missions cannot dispatch provider or source steps.'
+        : configuredProviders.length === 0
+          ? 'No configured provider can plan, synthesize, and critique a report.'
+          : !hasResearchWorker
+            ? 'No allowlisted read-only web inspection worker is available for source capture.'
+            : 'Explicit allowlisted sources can be captured, citation-checked, critiqued, and published as authenticated reports.',
     },
     releaseDeployment: input.releaseDeployment ?? {
       status: 'unavailable',

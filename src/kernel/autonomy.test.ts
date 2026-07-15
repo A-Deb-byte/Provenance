@@ -14,6 +14,7 @@ import {
   isReleaseProposalInput,
   rejectReleaseProposal,
   serializeReleaseAuthorizationPayload,
+  WEB_INSPECT_WORKER_ID,
 } from './autonomy';
 import { BenchmarkRun, GoalContract, KernelTask } from './types';
 
@@ -229,6 +230,7 @@ describe('runtime capability report', () => {
     expect(report.providers.unavailable[0].id).toBe('openai');
     expect(report.features.providerCalls.status).toBe('available');
     expect(report.features.backgroundAutomation.status).toBe('unavailable');
+    expect(report.features.recurringResearchScheduler.status).toBe('unavailable');
     expect(report.features.secretVault.status).toBe('unavailable');
     expect(report.features.osSandbox.status).toBe('unavailable');
     expect(report.features.releaseSigning.status).toBe('unavailable');
@@ -265,5 +267,53 @@ describe('runtime capability report', () => {
     expect(report.features.verificationCommands.status).toBe('blocked');
     expect(report.features.providerCalls.status).toBe('blocked');
     expect(report.features.backgroundAutomation.status).toBe('blocked');
+  });
+
+  it('reports the durable scheduler clock separately from generic automations', () => {
+    const running = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: true,
+        tickInProgress: false,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+        lastOutcome: 'completed',
+      },
+    });
+    const stopped = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: false,
+        tickInProgress: false,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+      },
+    });
+    const halted = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: true,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: true,
+        tickInProgress: true,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+      },
+    });
+
+    expect(running.features.recurringResearchScheduler.status).toBe('available');
+    expect(running.features.recurringResearchScheduler.reason).toContain('last outcome: completed');
+    expect(stopped.features.recurringResearchScheduler.status).toBe('configured');
+    expect(halted.features.recurringResearchScheduler.status).toBe('blocked');
   });
 });

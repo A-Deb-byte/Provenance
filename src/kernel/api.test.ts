@@ -100,6 +100,28 @@ afterEach(async () => {
 });
 
 describe('kernel API', () => {
+  it('reports research mission dependencies honestly and rejects creation when they are unavailable', async () => {
+    const config = await requestJson<{
+      available: boolean;
+      reason: string;
+      allowedOrigins: string[];
+      maxSources: number;
+    }>('/research-missions/config');
+    expect(config.response.status).toBe(200);
+    expect(config.body).toMatchObject({
+      available: false,
+      allowedOrigins: [],
+      maxSources: 5,
+    });
+
+    const created = await postJson<{ error: string }>('/research-missions', {
+      objective: 'Summarize the supplied source.',
+      sourceUrls: ['https://example.com/'],
+    });
+    expect(created.response.status).toBe(503);
+    expect(created.body.error).toMatch(/provider routing is unavailable/i);
+  });
+
   it('creates, lists, and returns a goal with tasks and events', async () => {
     const created = await postJson<GoalContract>('/goals', goalInput());
     expect(created.response.status).toBe(201);

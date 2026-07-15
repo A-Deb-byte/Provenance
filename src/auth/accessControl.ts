@@ -30,15 +30,31 @@ export const resolveAccessMode = (userCount: number, operatorToken: string | und
 };
 
 /**
- * Unified guard for mutating (non-GET) requests. Precedence:
+ * Unified guard for mutations and authoritative kernel reads. Precedence:
  * - multi_user (any users exist): a valid, unexpired session token whose role
  *   is admin or operator is required; viewers are read-only.
  * - operator_token (no users, token configured): the shared bearer token.
  * - open (neither): allowed, single-user loopback default.
- * Reads (GET/HEAD/OPTIONS) are always allowed on loopback.
+ * Sanitized runtime/provider status reads remain available on loopback.
+ * Kernel state reads can cross-reference objectives, source URLs, reports,
+ * worker scopes, and event history, so every /api/kernel read except the
+ * runtime capability report requires a valid credential whenever access
+ * control is configured. Viewers may read them.
  */
 export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandler => (req, res, next) => {
-  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+  const readOnly = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+  const originalPath = req.originalUrl.split('?', 1)[0];
+  const kernelRead = readOnly && (
+    req.path === '/kernel' ||
+    req.path.startsWith('/kernel/') ||
+    originalPath === '/api/kernel' ||
+    originalPath.startsWith('/api/kernel/')
+  );
+  const publicRuntimeRead = (
+    req.path === '/kernel/runtime-report' ||
+    originalPath === '/api/kernel/runtime-report'
+  );
+  if (readOnly && (!kernelRead || publicRuntimeRead)) return next();
 
   const mode = resolveAccessMode(deps.userStore.count(), deps.operatorToken);
   if (mode === 'open') return next();
@@ -74,7 +90,7 @@ export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandl
     res.status(401).json({ error: 'This session has been revoked. Log in again.' });
     return;
   }
-  if (claims.role === 'viewer') {
+  if (!readOnly && claims.role === 'viewer') {
     res.status(403).json({ error: 'Your role is read-only and cannot perform this action.' });
     return;
   }
@@ -90,11 +106,11 @@ export const accessControlStatus = (
   if (mode === 'multi_user') {
     return {
       status: 'available',
-      reason: `Multi-user access control is active with ${userCount} account(s); mutating requests require a role-scoped session token.`,
+      reason: `Multi-user access control is active with ${userCount} account(s); authoritative kernel reads and all mutations require a role-scoped session token.`,
     };
   }
   if (mode === 'operator_token') {
-    return { status: 'available', reason: 'Mutating requests require the shared operator bearer token.' };
+    return { status: 'available', reason: 'Authoritative kernel reads and all mutations require the shared operator bearer token.' };
   }
-  return { status: 'unavailable', reason: 'No accounts or operator token configured; mutating requests are open on loopback.' };
+  return { status: 'unavailable', reason: 'No accounts or operator token configured; kernel reads and mutations are open on loopback.' };
 };

@@ -8,6 +8,7 @@ import {
   logout,
   subscribeAuth,
   useOperatorToken,
+  verifySessionCredential,
   type AuthSession,
   type AuthStatus,
 } from '../lib/auth';
@@ -45,6 +46,17 @@ export const AuthPanel: React.FC = () => {
               : 'Stored operator token verification failed.');
             return;
           }
+        }
+      } else if (currentSession?.kind === 'session') {
+        try {
+          await verifySessionCredential(currentSession);
+        } catch (verificationError) {
+          clearAuthSession();
+          setStatus(nextStatus);
+          setError(verificationError instanceof Error
+            ? verificationError.message
+            : 'Stored session verification failed.');
+          return;
         }
       }
       setStatus(nextStatus);
@@ -116,7 +128,7 @@ export const AuthPanel: React.FC = () => {
           <p className="text-[10px] uppercase tracking-[0.35em] text-emerald-400 font-mono">Operator Access</p>
           <h2 id="auth-panel-title" className="mt-1 text-xl font-black tracking-tight text-white">Cockpit Authentication</h2>
           <p className="mt-2 max-w-2xl text-xs leading-relaxed text-slate-400">
-            Reads remain available on loopback. Every cockpit mutation uses the active bearer credential automatically.
+            Sanitized runtime status remains available on loopback. Kernel state reads and every mutation use the active bearer credential automatically.
           </p>
         </div>
         <span className="shrink-0 rounded-full border border-slate-700 px-3 py-1 text-[10px] font-mono text-slate-300">

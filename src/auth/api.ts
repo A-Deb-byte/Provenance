@@ -70,6 +70,14 @@ export const createAuthApi = (options: AuthApiOptions) => {
     res.status(204).end();
   });
 
+  router.post('/session/verify', (req, res) => {
+    if (!validClaims(req, options)) {
+      res.status(401).json({ error: 'A valid session token is required. Log in again.' });
+      return;
+    }
+    res.status(204).end();
+  });
+
   router.post('/login', (req, res) => {
     const username = req.body?.username as unknown;
     const password = req.body?.password as unknown;

@@ -1,3 +1,8 @@
+import type {
+  RecurringResearchOccurrence,
+  RecurringResearchSchedule,
+} from './scheduler/types';
+
 export type AutonomyLevel = 'manual' | 'supervised' | 'bounded';
 export type RiskLevel = 'L0' | 'L1' | 'L2' | 'L3' | 'L4';
 export type KernelActor = 'user' | 'kernel' | 'worker' | 'provider' | 'system';
@@ -171,6 +176,8 @@ export interface GoalContractInput {
 export interface GoalContract extends GoalContractInput {
   id: string;
   status: GoalStatus;
+  kind?: 'research_report';
+  research?: ResearchMission;
   createdAt: string;
   updatedAt: string;
   usage: BudgetUsage;
@@ -187,6 +194,8 @@ export interface KernelTask {
   dependsOn: string[];
   expectedEvidence: string;
   commandRequest?: KernelCommandRequest;
+  missionStep?: ResearchMissionStage | 'publish';
+  outputArtifactIds?: string[];
   approvalId?: string;
   evidenceEventIds: string[];
   createdAt: string;
@@ -216,7 +225,7 @@ export interface KernelEvent {
   actor: KernelActor;
   type: string;
   entityId: string;
-  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark' | 'artifact';
+  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark' | 'artifact' | 'mission' | 'schedule' | 'occurrence';
   payload: Record<string, unknown>;
   previousHash: string | null;
   hash: string;
@@ -297,6 +306,173 @@ export interface BenchmarkRun {
   createdAt: string;
 }
 
+export type ResearchMissionStage = 'planning' | 'collecting' | 'synthesizing' | 'verifying';
+export type ResearchMissionStatus = ResearchMissionStage | 'blocked' | 'completed' | 'cancelled';
+export type ResearchSourceStatus = 'pending' | 'running' | 'captured' | 'quarantined' | 'failed';
+
+export interface ResearchSourceChunk {
+  id: string;
+  charStart: number;
+  charEnd: number;
+  contentHash: string;
+}
+
+export interface ResearchMissionSource {
+  id: string;
+  url: string;
+  origin: string;
+  status: ResearchSourceStatus;
+  artifactId?: string;
+  contentHash?: string;
+  byteLength?: number;
+  chunks: ResearchSourceChunk[];
+  observationId?: string;
+  observationRisk?: 'none' | 'medium' | 'high';
+  injectionSignalCodes: string[];
+  evidenceEventId?: string;
+  failureReason?: string;
+  capturedAt?: string;
+}
+
+export interface ResearchMissionPlan {
+  title: string;
+  researchQuestions: string[];
+  reportOutline: string[];
+}
+
+export interface ResearchClaimEvidence {
+  sourceId: string;
+  chunkId: string;
+  quote: string;
+}
+
+export interface ResearchMissionClaim {
+  id: string;
+  statement: string;
+  confidence: 'high' | 'medium' | 'low';
+  evidence: ResearchClaimEvidence[];
+}
+
+export interface ResearchMissionDraft {
+  title: string;
+  executiveSummary: string;
+  claims: ResearchMissionClaim[];
+  limitations: string[];
+}
+
+export interface ResearchMissionProviderRun {
+  purpose: 'plan' | 'synthesis' | 'critique';
+  requestId: string;
+  evidenceEventId: string;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  completedAt: string;
+}
+
+export interface ResearchMissionVerification {
+  status: 'passed' | 'failed';
+  deterministicIssues: string[];
+  criticVerdict: 'pass' | 'fail';
+  criticSummary: string;
+  criticIssues: Array<{
+    claimId: string;
+    severity: 'error' | 'warning';
+    reason: string;
+  }>;
+  verifiedAt: string;
+}
+
+export interface ResearchMissionActiveStep {
+  id: string;
+  stage: ResearchMissionStage;
+  kind: 'provider' | 'source';
+  attempt: number;
+  startedAt: string;
+  requestId?: string;
+  sourceId?: string;
+  intentId?: string;
+}
+
+export interface ResearchMissionTaskIds {
+  plan: string;
+  collect: string;
+  synthesize: string;
+  verify: string;
+  publish: string;
+}
+
+export interface ResearchMission {
+  id: string;
+  goalId: string;
+  objective: string;
+  status: ResearchMissionStatus;
+  revision: number;
+  checkpoint: number;
+  taskIds: ResearchMissionTaskIds;
+  sources: ResearchMissionSource[];
+  plan?: ResearchMissionPlan;
+  draft?: ResearchMissionDraft;
+  verification?: ResearchMissionVerification;
+  providerRuns: ResearchMissionProviderRun[];
+  synthesisAttempts: number;
+  lastVerificationIssues: string[];
+  activeStep?: ResearchMissionActiveStep;
+  resumeStage?: ResearchMissionStage;
+  retryable?: boolean;
+  lastError?: string;
+  reportArtifactId?: string;
+  reportContentHash?: string;
+  schedulerOwnership?: {
+    scheduleId: string;
+    occurrenceId: string;
+    leaseId: string;
+    leaseFence: number;
+  };
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface RecurringResearchScheduleRecord {
+  contract: RecurringResearchSchedule;
+  maxRuns: number;
+  maxConsecutiveFailures: number;
+  runsClaimed: number;
+  consecutiveFailures: number;
+  nextDueAt: string;
+  scheduledThrough?: string;
+  activeOccurrenceId?: string;
+  lastOccurrenceId?: string;
+  haltedReason?: string;
+}
+
+export interface RecurringResearchOccurrenceRecord extends RecurringResearchOccurrence {
+  leaseId: string;
+  leaseFence: number;
+  deadlineAt: string;
+  goalId: string;
+  missionId: string;
+  attempt: number;
+  /** Cumulative wall-clock runtime charged across every attempt. */
+  runtimeUsedMs?: number;
+  /** Start of the current attempt, used to charge runtime on every exit path. */
+  attemptStartedAt?: string;
+  /** Persisted pre-dispatch source-fetch charges across every attempt. */
+  sourceFetchesUsed?: number;
+  reportArtifactId?: string;
+  reportContentHash?: string;
+}
+
+export interface RecurringResearchKernelState {
+  schemaVersion: 1;
+  schedules: RecurringResearchScheduleRecord[];
+  occurrences: RecurringResearchOccurrenceRecord[];
+}
+
 export interface KernelState {
   goals: GoalContract[];
   tasks: KernelTask[];
@@ -308,6 +484,8 @@ export interface KernelState {
   automations: import('../capabilities/types').AutomationContract[];
   releaseProposals: ReleaseProposal[];
   benchmarkRuns: BenchmarkRun[];
+  contentSchemaVersion?: 2;
+  recurringResearch?: RecurringResearchKernelState;
   controls: KernelControls;
   lastEventHash: string | null;
 }

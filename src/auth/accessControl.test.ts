@@ -22,6 +22,10 @@ const startApp = async (operatorToken?: string): Promise<void> => {
   app.use('/api/kernel', createAccessGuard({ userStore: store, operatorToken, sessionSecret }));
   app.post('/api/kernel/thing', (_req, res) => res.json({ mutated: true }));
   app.get('/api/kernel/thing', (_req, res) => res.json({ read: true }));
+  app.get('/api/kernel/runtime-report', (_req, res) => res.json({ safe: true }));
+  app.get('/api/kernel/research-missions', (_req, res) => res.json({ missions: [] }));
+  app.get('/api/kernel/recurring-research', (_req, res) => res.json({ schedules: [] }));
+  app.post('/api/kernel/recurring-research/tick', (_req, res) => res.json({ outcome: 'idle' }));
   server = await new Promise<Server>((resolve, reject) => {
     const listening = app.listen(0, '127.0.0.1', () => resolve(listening));
     listening.once('error', reject);
@@ -77,7 +81,19 @@ describe('guard: open and operator-token modes', () => {
     expect((await post('/api/auth/operator/verify', {}, 'secret-token')).status).toBe(204);
     expect((await post('/api/kernel/thing', {})).status).toBe(401);
     expect((await post('/api/kernel/thing', {}, 'secret-token')).status).toBe(200);
-    expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(200); // reads open
+    expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/thing`, {
+      headers: { authorization: 'Bearer secret-token' },
+    })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/runtime-report`)).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/research-missions`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/research-missions`, {
+      headers: { authorization: 'Bearer secret-token' },
+    })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/recurring-research`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/recurring-research`, {
+      headers: { authorization: 'Bearer secret-token' },
+    })).status).toBe(200);
   });
 });
 
@@ -105,10 +121,12 @@ describe('multi-user flow', () => {
     const login = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
     expect(login.status).toBe(200);
     const adminToken = (await login.json()).token as string;
+    expect((await post('/api/auth/session/verify', {}, adminToken)).status).toBe(204);
     expect((await post('/api/kernel/thing', {}, adminToken)).status).toBe(200);
 
     // Logout persists a session-generation increment, revoking the token.
     expect((await post('/api/auth/logout', {}, adminToken)).status).toBe(204);
+    expect((await post('/api/auth/session/verify', {}, adminToken)).status).toBe(401);
     expect((await post('/api/kernel/thing', {}, adminToken)).status).toBe(401);
     const secondLogin = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
     const refreshedAdminToken = (await secondLogin.json()).token as string;
@@ -118,6 +136,21 @@ describe('multi-user flow', () => {
     expect(created.status).toBe(201);
     const viewerToken = (await (await post('/api/auth/login', { username: 'viewer1', password: 'viewerpassword' })).json()).token;
     expect((await post('/api/kernel/thing', {}, viewerToken)).status).toBe(403);
+    expect((await fetch(`${baseUrl}/api/kernel/research-missions`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/research-missions`, {
+      headers: { authorization: `Bearer ${viewerToken}` },
+    })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/recurring-research`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/recurring-research`, {
+      headers: { authorization: `Bearer ${viewerToken}` },
+    })).status).toBe(200);
+    expect((await post('/api/kernel/recurring-research/tick', {}, viewerToken)).status).toBe(403);
+    expect((await post('/api/kernel/recurring-research/tick', {}, refreshedAdminToken)).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/thing`, {
+      headers: { authorization: `Bearer ${viewerToken}` },
+    })).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/kernel/runtime-report`)).status).toBe(200);
 
     // A non-admin cannot create accounts.
     const forbidden = await post('/api/auth/users', { username: 'x2', password: 'password12', role: 'operator' }, viewerToken);

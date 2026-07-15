@@ -8,6 +8,7 @@ import {
   logout,
   setAuthSession,
   useOperatorToken,
+  verifySessionCredential,
 } from './auth';
 
 afterEach(() => {
@@ -117,5 +118,29 @@ describe('authenticated browser transport', () => {
 
     await expect(logout()).rejects.toThrow('offline');
     expect(getAuthSession()).toBeNull();
+  });
+
+  it('clears a loaded credential when an authenticated request is rejected', async () => {
+    setAuthSession({ token: 'stale-session', kind: 'session', role: 'operator', expiresAt: '2099-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 401 } as Response)));
+
+    expect((await authenticatedFetch('/api/kernel/research-missions')).status).toBe(401);
+    expect(getAuthSession()).toBeNull();
+  });
+
+  it('asks the server to verify a stored signed session without exposing it in the URL', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 204 } as Response));
+    vi.stubGlobal('fetch', fetchMock);
+    const session = {
+      token: 'signed-session', kind: 'session' as const, username: 'admin1', role: 'admin' as const,
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    };
+
+    await verifySessionCredential(session);
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/auth/session/verify', {
+      method: 'POST',
+      headers: { authorization: 'Bearer signed-session' },
+    });
   });
 });

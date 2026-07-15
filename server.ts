@@ -29,6 +29,7 @@ import { createKernelService, type KernelActionWorker } from './src/kernel/kerne
 import { readKernelEvents } from './src/kernel/ledger';
 import { createReleaseLifecycle } from './src/kernel/releases/lifecycle';
 import { createNodeReleaseSupervisor } from './src/kernel/releases/supervisor';
+import { createRecurringResearchScheduler } from './src/kernel/scheduler/service';
 import {
   createHostSandbox,
   DEFAULT_DOCKER_SANDBOX_CONFIG,
@@ -51,6 +52,17 @@ const PORT = Number.isSafeInteger(configuredPort) && configuredPort >= 0 && conf
   : 3000;
 const RUNTIME_DIR = path.join(process.cwd(), '.agent-kernel');
 const IS_DEVELOPMENT = process.env.NODE_ENV === 'development' || /\.[cm]?tsx?$/iu.test(process.argv[1] || '');
+const IS_RELEASE_CHILD = process.env.RELEASE_CHILD_MODE === '1';
+const recurringResearchSchedulerSetting = process.env.RECURRING_RESEARCH_SCHEDULER_ENABLED?.trim().toLowerCase();
+const RECURRING_RESEARCH_SCHEDULER_ENABLED = !IS_RELEASE_CHILD &&
+  !['0', 'false', 'no', 'off'].includes(recurringResearchSchedulerSetting ?? '');
+const configuredRecurringResearchTickMs = Number.parseInt(
+  process.env.RECURRING_RESEARCH_TICK_MS || '15000',
+  10,
+);
+const RECURRING_RESEARCH_TICK_MS = Number.isSafeInteger(configuredRecurringResearchTickMs)
+  ? Math.min(60_000, Math.max(1_000, configuredRecurringResearchTickMs))
+  : 15_000;
 const VAULT_INJECTED_SECRETS = [
   'GEMINI_API_KEY',
   'OPENAI_API_KEY',
@@ -175,6 +187,25 @@ const createServerContext = async () => {
   const observationAssessor = process.env.CORE_MODEL_INJECTION_ASSESSMENT?.trim()
     ? async (content: string) => (await coreModelPromise).assessObservation(content)
     : undefined;
+  const providerName = process.env.AI_PROVIDER?.trim() || 'openrouter';
+  if (!PROVIDER_IDS.includes(providerName as ProviderId)) {
+    throw new Error(`AI_PROVIDER must be one of: ${PROVIDER_IDS.join(', ')}.`);
+  }
+  const modelName = process.env.AI_MODEL?.trim();
+  const applicationRoutingPolicy: ProviderRoutingPolicy = {
+    mode: 'pinned',
+    provider: providerName as ProviderId,
+    ...(modelName ? { model: modelName } : {}),
+  };
+  const selectedProviderStatus = providerRuntime.statuses.find((status) => status.id === providerName);
+  const selectedModel = modelName || selectedProviderStatus?.defaultModel;
+  const researchProviderConfigured = Boolean(
+    selectedProviderStatus?.configured &&
+    selectedModel &&
+    selectedProviderStatus.allowedModels.includes(selectedModel) &&
+    selectedProviderStatus.capabilities.includes('text') &&
+    selectedProviderStatus.capabilities.includes('json_schema'),
+  );
   const kernelConfig = {
     runtimeDir: RUNTIME_DIR,
     allowedWorkspaceRoot: process.cwd(),
@@ -187,19 +218,26 @@ const createServerContext = async () => {
     artifactStore,
     capabilityGrantStore,
     releaseLifecycle,
+    researchRoutingPolicy: applicationRoutingPolicy,
+    researchProviderConfigured,
+    researchWorkerId: WEB_INSPECT_WORKER_ID,
+    recurringResearchSchedulerEnabled: RECURRING_RESEARCH_SCHEDULER_ENABLED,
+    recurringResearchTickMs: RECURRING_RESEARCH_TICK_MS,
   };
   const kernel = createKernelService(kernelConfig);
-
-  const providerName = process.env.AI_PROVIDER?.trim() || 'openrouter';
-  if (!PROVIDER_IDS.includes(providerName as ProviderId)) {
-    throw new Error(`AI_PROVIDER must be one of: ${PROVIDER_IDS.join(', ')}.`);
-  }
-  const modelName = process.env.AI_MODEL?.trim();
-  const applicationRoutingPolicy: ProviderRoutingPolicy = {
-    mode: 'pinned',
-    provider: providerName as ProviderId,
-    ...(modelName ? { model: modelName } : {}),
-  };
+  await kernel.recoverInterruptedTasks();
+  const recurringResearchScheduler = IS_RELEASE_CHILD
+    ? undefined
+    : createRecurringResearchScheduler(kernel, {
+      enabled: RECURRING_RESEARCH_SCHEDULER_ENABLED,
+      tickIntervalMs: RECURRING_RESEARCH_TICK_MS,
+      onError: (error) => {
+        console.warn(
+          '[Scheduler] Recurring research tick failed:',
+          error instanceof Error ? error.message : error,
+        );
+      },
+    });
 
   const appGoalObjective = 'Application AI provider execution budget';
   const state = await kernel.getState();
@@ -274,6 +312,14 @@ const createServerContext = async () => {
       return { status: status.status, reason: status.reason };
     },
     accessControlStatus: () => accessControlStatus(userStore.count(), operatorToken),
+    recurringResearchSchedulerStatus: () => recurringResearchScheduler?.status() ?? {
+      enabled: false,
+      starting: false,
+      running: false,
+      tickInProgress: false,
+      tickIntervalMs: RECURRING_RESEARCH_TICK_MS,
+    },
+    recoverOnStart: false,
   }));
   app.use('/api', createApplicationAiRouter({
     routingPolicy: applicationRoutingPolicy,
@@ -292,11 +338,11 @@ const createServerContext = async () => {
     res.json((await coreModelPromise).getStatus());
   });
 
-  return { coreModelPromise, kernel, releaseLifecycle };
+  return { coreModelPromise, kernel, recurringResearchScheduler, releaseLifecycle };
 };
 
 async function start() {
-  const { releaseLifecycle } = await createServerContext();
+  const { recurringResearchScheduler, releaseLifecycle } = await createServerContext();
 
   if (IS_DEVELOPMENT) {
     const vite = await createViteServer({
@@ -311,6 +357,8 @@ async function start() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  await recurringResearchScheduler?.start();
 
   const httpServer = app.listen(PORT, '127.0.0.1', () => {
     const address = httpServer.address();
@@ -328,6 +376,7 @@ async function start() {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    await recurringResearchScheduler?.stop();
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     await releaseLifecycle.shutdown();
   };

@@ -1,9 +1,10 @@
 import express from 'express';
 import type { WorkerRegistration } from '../capabilities/types';
 import type { ProviderRouter } from '../providers/router';
-import type { ProviderPublicStatus } from '../providers/types';
+import type { ProviderPublicStatus, ProviderRoutingPolicy } from '../providers/types';
 import { buildRuntimeCapabilityReport } from './autonomy';
 import { sandboxStatus, SandboxRunner } from './sandbox/sandbox';
+import type { RecurringResearchSchedulerStatus } from './scheduler/service';
 import {
   createKernelService,
   KernelActionWorker,
@@ -26,6 +27,14 @@ export interface KernelRouterOptions {
   readonly artifactStore?: import('./artifacts/artifactStore').ArtifactStore;
   readonly capabilityGrantStore?: import('../capabilities/grantStore').CapabilityGrantStore;
   readonly releaseLifecycle?: ReturnType<typeof import('./releases/lifecycle').createReleaseLifecycle>;
+  readonly researchRoutingPolicy?: ProviderRoutingPolicy;
+  readonly researchProviderConfigured?: boolean;
+  readonly researchWorkerId?: string;
+  readonly providerTimeoutMs?: number;
+  readonly recurringResearchSchedulerEnabled?: boolean;
+  readonly recurringResearchTickMs?: number;
+  readonly recurringResearchSchedulerStatus?: () => RecurringResearchSchedulerStatus;
+  readonly recoverOnStart?: boolean;
   readonly kernelService?: ReturnType<typeof createKernelService>;
 }
 
@@ -37,6 +46,11 @@ const errorMessage = (error: unknown): string => {
 
 const isApprovalDecisionStatus = (value: unknown): value is ApprovalDecisionStatus => {
   return value === 'approved' || value === 'denied';
+};
+
+const requiredAuditReason = (value: unknown, label: string): string => {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} is required.`);
+  return value.trim();
 };
 
 export const createKernelRouter = (options: KernelRouterOptions) => {
@@ -52,14 +66,210 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     artifactStore: options.artifactStore,
     capabilityGrantStore: options.capabilityGrantStore,
     releaseLifecycle: options.releaseLifecycle,
+    researchRoutingPolicy: options.researchRoutingPolicy,
+    researchProviderConfigured: options.researchProviderConfigured,
+    researchWorkerId: options.researchWorkerId,
+    providerTimeoutMs: options.providerTimeoutMs,
+    recurringResearchSchedulerEnabled: options.recurringResearchSchedulerEnabled,
+    recurringResearchTickMs: options.recurringResearchTickMs,
   });
   const kernel = options.kernelService ?? createKernelService(config);
   const router = express.Router();
 
   // Interrupted running tasks are recovered into an inspectable blocked
   // state at startup rather than silently resuming.
-  void kernel.recoverInterruptedTasks().catch((error) => {
-    console.warn('[Kernel] Startup recovery skipped:', error instanceof Error ? error.message : error);
+  if (options.recoverOnStart !== false) {
+    void kernel.recoverInterruptedTasks().catch((error) => {
+      console.warn('[Kernel] Startup recovery skipped:', error instanceof Error ? error.message : error);
+    });
+  }
+
+  router.get('/research-missions/config', (_req, res) => {
+    res.json(kernel.getResearchMissionCapability());
+  });
+
+  router.get('/recurring-research/config', (_req, res) => {
+    res.json(kernel.getRecurringResearchCapability());
+  });
+
+  router.get('/recurring-research', async (_req, res) => {
+    try {
+      res.json({ schedules: await kernel.listRecurringResearchSchedules() });
+    } catch {
+      res.status(500).json({ error: 'Recurring research schedules are unavailable.' });
+    }
+  });
+
+  router.post('/recurring-research', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createRecurringResearchSchedule(req.body));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message.includes('unavailable') || message.includes('disabled in this deployment') ? 503 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/recurring-research/:scheduleId', async (req, res) => {
+    try {
+      res.json(await kernel.getRecurringResearchSchedule(req.params.scheduleId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Recurring research schedule not found.' ? 404 : 500).json({ error: message });
+    }
+  });
+
+  router.post('/recurring-research/:scheduleId/enabled', async (req, res) => {
+    if (typeof req.body?.enabled !== 'boolean') {
+      res.status(400).json({ error: 'Schedule enabled must be a boolean.' });
+      return;
+    }
+    try {
+      res.json(await kernel.setRecurringResearchScheduleEnabled(
+        req.params.scheduleId,
+        req.body.enabled,
+        requiredAuditReason(req.body?.reason, 'Schedule change reason'),
+      ));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message === 'Recurring research schedule not found.' ? 404
+        : message.includes('unavailable') || message.includes('disabled in this deployment') ? 503
+          : message.includes('already') || message.includes('exhausted') || message.includes('active occurrence') ||
+              message.includes('Stop All') ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.post('/recurring-research/tick', async (_req, res) => {
+    try {
+      // Wall-clock authority stays server-side. The optional kernel timestamp
+      // exists only for deterministic clocks and tests, never HTTP callers.
+      res.json(await kernel.runRecurringResearchTick());
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/recurring-research/:scheduleId/occurrences/:occurrenceId/resume', async (req, res) => {
+    try {
+      res.json(await kernel.resumeRecurringResearchOccurrence(
+        req.params.scheduleId,
+        req.params.occurrenceId,
+        requiredAuditReason(req.body?.reason, 'Occurrence resume reason'),
+      ));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message.includes('not found') ? 404
+        : message.includes('unavailable') || message.includes('disabled') ? 503
+          : message.includes('not active') || message.includes('not resumable') || message.includes('exhausted') ||
+              message.includes('Stop All') ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.post('/recurring-research/:scheduleId/occurrences/:occurrenceId/skip', async (req, res) => {
+    try {
+      res.json(await kernel.skipRecurringResearchOccurrence(
+        req.params.scheduleId,
+        req.params.occurrenceId,
+        requiredAuditReason(req.body?.reason, 'Occurrence skip reason'),
+      ));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message.includes('not found') ? 404
+        : message.includes('not active') || message.includes('must be cancelled') ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/research-missions', async (_req, res) => {
+    try {
+      res.json({ missions: await kernel.listResearchMissions() });
+    } catch {
+      res.status(500).json({ error: 'Research missions are unavailable.' });
+    }
+  });
+
+  router.post('/research-missions', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createResearchMission(req.body));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message.includes('unavailable') ? 503 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/research-missions/:missionId', async (req, res) => {
+    try {
+      const [state, events] = await Promise.all([kernel.getState(), kernel.getEvents()]);
+      const goal = state.goals.find((candidate) => (
+        candidate.research?.id === req.params.missionId ||
+        (candidate.kind === 'research_report' && candidate.id === req.params.missionId)
+      ));
+      if (!goal?.research) {
+        res.status(404).json({ error: 'Research mission not found.' });
+        return;
+      }
+      const mission = goal.research;
+      res.json({
+        mission,
+        goal,
+        tasks: state.tasks.filter((task) => task.goalId === goal.id),
+        approvals: state.approvals.filter((approval) => approval.goalId === goal.id),
+        events: events.filter((event) => (
+          event.entityId === mission.id ||
+          event.entityId === goal.id ||
+          event.payload.missionId === mission.id ||
+          event.payload.goalId === goal.id
+        )),
+        controls: state.controls,
+      });
+    } catch {
+      res.status(500).json({ error: 'Research mission state is unavailable.' });
+    }
+  });
+
+  router.post('/research-missions/:missionId/step', async (req, res) => {
+    try {
+      res.json(await kernel.stepResearchMission(req.params.missionId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Research mission not found.' ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/research-missions/:missionId/run', async (req, res) => {
+    try {
+      const maxSteps = req.body?.maxSteps === undefined ? 20 : req.body.maxSteps;
+      res.json(await kernel.runResearchMission(req.params.missionId, maxSteps));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Research mission not found.' ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/research-missions/:missionId/resume', async (req, res) => {
+    try {
+      res.json(await kernel.resumeResearchMission(req.params.missionId, String(req.body?.reason ?? '')));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message === 'Research mission not found.' ? 404
+        : message.includes('not resumable') || message.includes('requires revision') ? 409 : 400;
+      res.status(status).json({ error: message });
+    }
+  });
+
+  router.get('/research-missions/:missionId/report', async (req, res) => {
+    try {
+      res.json(await kernel.getResearchMissionReport(req.params.missionId));
+    } catch (error) {
+      const message = errorMessage(error);
+      const status = message === 'Research mission not found.' ? 404
+        : message.includes('no published report') ? 409
+          : message.startsWith('Published report') || message.includes('failed authenticated') ? 422 : 500;
+      res.status(status).json({ error: message });
+    }
   });
 
   router.post('/goals', async (req, res) => {
@@ -453,7 +663,8 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     try {
       res.json(await kernel.recoverInterruptedTasks());
     } catch (error) {
-      res.status(500).json({ error: errorMessage(error) });
+      const message = errorMessage(error);
+      res.status(message.includes('quiescent kernel') ? 409 : 500).json({ error: message });
     }
   });
 
@@ -548,6 +759,8 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
             };
         })()
         : undefined;
+      const recurringResearchCapability = kernel.getRecurringResearchCapability();
+      const recurringResearchSchedulerStatus = options.recurringResearchSchedulerStatus?.();
       res.json(buildRuntimeCapabilityReport({
         providerStatuses: options.providerStatuses ?? [],
         workerReport: kernel.getWorkers().report,
@@ -558,6 +771,17 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
         secretVault,
         accessControl,
         osSandbox,
+        recurringResearchScheduler: {
+          available: recurringResearchCapability.available,
+          enabled: recurringResearchCapability.schedulerEnabled,
+          running: recurringResearchSchedulerStatus?.running ?? false,
+          tickInProgress: recurringResearchSchedulerStatus?.tickInProgress ?? false,
+          tickIntervalMs: recurringResearchSchedulerStatus?.tickIntervalMs ?? recurringResearchCapability.tickIntervalMs,
+          reason: recurringResearchCapability.reason,
+          lastTickAt: recurringResearchSchedulerStatus?.lastTickAt,
+          lastOutcome: recurringResearchSchedulerStatus?.lastOutcome,
+          lastError: recurringResearchSchedulerStatus?.lastError,
+        },
       }));
     } catch {
       res.status(500).json({ error: 'Runtime capability report is unavailable.' });
