@@ -27,12 +27,15 @@ import { AuthPanel } from './components/AuthPanel';
 import { KernelPanel } from './components/KernelPanel';
 import { LearningPanel } from './components/LearningPanel';
 import { ProviderPanel } from './components/ProviderPanel';
+import { RecurringResearchPanel } from './components/RecurringResearchPanel';
+import { ResearchMissionPanel } from './components/ResearchMissionPanel';
 import { RuntimePanel } from './components/RuntimePanel';
+import { DesktopPanel } from './components/DesktopPanel';
 import { 
   Plus, MessageSquare, Trash2, Database, Brain, Sparkles, 
   ArrowRight, ShieldCheck, HelpCircle, HardDrive, RefreshCw, Send,
   Cpu, AlertCircle, FileText, CheckCircle, GitBranch, GitCommit, GitMerge,
-  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen
+  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen, CalendarClock, MonitorCog
 } from 'lucide-react';
 
 const memoryKindToCategory = (kind: MemoryKind): MemoryItem['category'] => {
@@ -116,7 +119,8 @@ export default function App() {
   const [targetBranchParentId, setTargetBranchParentId] = useState<string | null>(null);
 
   // Tree vs List toggle view
-  const [activePanelTab, setActivePanelTab] = useState<'chat' | 'tree' | 'mutator'>('chat');
+  const [activePanelTab, setActivePanelTab] = useState<'chat' | 'missions' | 'schedules' | 'desktop' | 'tree' | 'mutator'>('chat');
+  const [missionFocusId, setMissionFocusId] = useState<string | null>(null);
 
   // Mathematical Mutation Workspace States
   const [mutationOperator, setMutationOperator] = useState<'heuristic_leap' | 'axiomatic_friction' | 'combinatorial' | 'priority_shock'>('heuristic_leap');
@@ -754,6 +758,42 @@ export default function App() {
                 <MessageSquare size={13} />
                 Arena Chat
               </button>
+
+              <button
+                onClick={() => { setMissionFocusId(null); setActivePanelTab('missions'); setTargetBranchParentId(null); }}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  activePanelTab === 'missions'
+                    ? 'bg-teal-600 text-white font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Compass size={13} />
+                Research Missions
+              </button>
+
+              <button
+                onClick={() => { setActivePanelTab('schedules'); setTargetBranchParentId(null); }}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  activePanelTab === 'schedules'
+                    ? 'bg-violet-600 text-white font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <CalendarClock size={13} />
+                Schedules
+              </button>
+
+              <button
+                onClick={() => { setActivePanelTab('desktop'); setTargetBranchParentId(null); }}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                  activePanelTab === 'desktop'
+                    ? 'bg-sky-600 text-white font-bold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <MonitorCog size={13} />
+                Desktop
+              </button>
               
               <button
                 onClick={() => setActivePanelTab('tree')}
@@ -783,8 +823,22 @@ export default function App() {
 
           <div className="flex items-center space-x-3">
             <div className="text-right">
-              <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest block">Active Leaf Address</span>
-              <span className="text-[10px] font-mono text-teal-400">{activeSession?.activeLeafId ? activeSession.activeLeafId.substring(0, 15) + "..." : "none"}</span>
+              <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest block">
+                {activePanelTab === 'missions'
+                  ? 'Mission Authority'
+                  : activePanelTab === 'schedules'
+                    ? 'Schedule Authority'
+                    : activePanelTab === 'desktop' ? 'Desktop Authority' : 'Active Leaf Address'}
+              </span>
+              <span className="text-[10px] font-mono text-teal-400">
+                {activePanelTab === 'missions'
+                  ? 'Kernel-owned state'
+                  : activePanelTab === 'schedules'
+                    ? 'Durable kernel timer'
+                    : activePanelTab === 'desktop'
+                      ? 'Approval-gated native worker'
+                  : activeSession?.activeLeafId ? activeSession.activeLeafId.substring(0, 15) + "..." : "none"}
+              </span>
             </div>
           </div>
         </header>
@@ -1022,6 +1076,39 @@ export default function App() {
               </div>
             </div>
 
+          </div>
+        )}
+
+        {/* PANEL VIEW: RESEARCH TO VERIFIED REPORT MISSIONS */}
+        {activePanelTab === 'missions' && (
+          <div className="flex-1 overflow-y-auto p-6">
+            <div className="max-w-5xl mx-auto space-y-4">
+              <AuthPanel />
+              <ResearchMissionPanel initialMissionId={missionFocusId} />
+            </div>
+          </div>
+        )}
+
+        {/* PANEL VIEW: DURABLE RECURRING RESEARCH */}
+        {activePanelTab === 'schedules' && (
+          <div className="flex-1 overflow-y-auto p-6">
+            <div className="max-w-6xl mx-auto space-y-4">
+              <AuthPanel />
+              <RecurringResearchPanel onOpenMission={(missionId) => {
+                setMissionFocusId(missionId);
+                setActivePanelTab('missions');
+              }} />
+            </div>
+          </div>
+        )}
+
+        {/* PANEL VIEW: NATIVE WINDOWS UI AUTOMATION */}
+        {activePanelTab === 'desktop' && (
+          <div className="flex-1 overflow-y-auto p-6">
+            <div className="max-w-6xl mx-auto space-y-4">
+              <AuthPanel />
+              <DesktopPanel />
+            </div>
           </div>
         )}
 

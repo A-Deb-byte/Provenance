@@ -16,6 +16,7 @@ const statusStyles: Record<string, string> = {
 const featureLabels: Record<string, string> = {
   verificationCommands: 'Verification commands',
   providerCalls: 'Provider calls',
+  verifiedResearchReports: 'Verified research reports',
   backgroundAutomation: 'Background automation',
   coreModel: 'Core model (MiniCPM5-1B)',
   secretVault: 'OS secret vault',
@@ -24,6 +25,7 @@ const featureLabels: Record<string, string> = {
   releaseSigning: 'Release signing',
   releaseDeployment: 'Supervised core releases',
   desktopIpc: 'Desktop shell IPC',
+  desktopAutomation: 'Windows UI Automation',
 };
 
 export const RuntimePanel: React.FC = () => {

@@ -58,6 +58,16 @@ const isReadyMessage = (value: unknown): value is ReleaseReadyMessage => {
 
 const isRunning = (child: ChildProcess): boolean => child.exitCode === null && child.signalCode === null;
 
+const hasLiveProcess = (child: ChildProcess): boolean => {
+  if (!isRunning(child) || child.pid === undefined) return false;
+  try {
+    process.kill(child.pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const stopChild = async (child: ChildProcess, timeoutMs: number): Promise<void> => {
   if (!isRunning(child)) return;
   await new Promise<void>((resolve) => {
@@ -113,15 +123,33 @@ const waitForReady = async (
 };
 
 const waitForStability = async (child: ChildProcess, stabilityWindowMs: number): Promise<void> => {
-  if (!isRunning(child)) throw new Error('Release child exited before the stability window.');
+  if (!hasLiveProcess(child)) throw new Error('Release child exited before the stability window.');
   await new Promise<void>((resolve, reject) => {
-    const onExit = () => {
+    let settled = false;
+    let finalCheck: NodeJS.Immediate | undefined;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      reject(new Error('Release child exited during the stability window.'));
+      if (finalCheck) clearImmediate(finalCheck);
+      child.off('exit', onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => {
+      finish(new Error('Release child exited during the stability window.'));
     };
     const timer = setTimeout(() => {
-      child.off('exit', onExit);
-      resolve();
+      // Give a queued process-handle callback one turn before accepting the
+      // child, then confirm liveness with the operating system as well.
+      finalCheck = setImmediate(() => {
+        finalCheck = undefined;
+        if (!hasLiveProcess(child)) {
+          finish(new Error('Release child exited during the stability window.'));
+          return;
+        }
+        finish();
+      });
     }, stabilityWindowMs);
     child.once('exit', onExit);
   });

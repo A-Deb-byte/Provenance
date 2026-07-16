@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCapabilityToken } from '../capabilities';
 import { runKernelCommand } from './commandWorker';
 
@@ -142,6 +142,64 @@ describe('command worker', () => {
       expect(result.stdout).not.toContain('must-not-leak');
     } finally {
       delete process.env.KERNEL_WORKER_SECRET;
+    }
+  });
+
+  it('strips every desktop launch variable and every nonce-bearing name from worker environments', async () => {
+    const names = [
+      'DESKTOP_IPC_BASE_URL',
+      'DESKTOP_APP_ALLOWLIST',
+      'DESKTOP_READY_FILE',
+      'DESKTOP_RUNTIME_OWNER_NONCE',
+      'PROVENANCE_RUNTIME_DIR',
+      'KERNEL_RUNTIME_NONCE_VALUE',
+      'COMMAND_WORKER_VISIBLE_VALUE',
+    ] as const;
+    const original = new Map(names.map((name) => [name, process.env[name]]));
+    for (const name of names) process.env[name] = `value-for-${name}`;
+
+    try {
+      const run = vi.fn(async (spec: { env: NodeJS.ProcessEnv }) => {
+        expect(spec.env.DESKTOP_IPC_BASE_URL).toBeUndefined();
+        expect(spec.env.DESKTOP_APP_ALLOWLIST).toBeUndefined();
+        expect(spec.env.DESKTOP_READY_FILE).toBeUndefined();
+        expect(spec.env.DESKTOP_RUNTIME_OWNER_NONCE).toBeUndefined();
+        expect(spec.env.PROVENANCE_RUNTIME_DIR).toBeUndefined();
+        expect(spec.env.KERNEL_RUNTIME_NONCE_VALUE).toBeUndefined();
+        expect(spec.env.COMMAND_WORKER_VISIBLE_VALUE).toBe('value-for-COMMAND_WORKER_VISIBLE_VALUE');
+        return { stdout: 'ok', stderr: '', exitCode: 0 };
+      });
+      const token = createCapabilityToken({
+        family: 'command.run',
+        goalId: 'goal_1',
+        taskId: 'task_1',
+        workspaceRoot: tempDir,
+        command: 'npm',
+        args: ['--version'],
+        cwd: tempDir,
+        riskLevel: 'L1',
+        maxOperations: 1,
+        expiresAt: '2999-01-01T00:00:00.000Z',
+      });
+      const result = await runKernelCommand(token, {
+        command: 'npm',
+        args: ['--version'],
+        cwd: tempDir,
+        expectedEvidence: 'npm version prints',
+      }, {
+        sandbox: {
+          mode: 'host',
+          isolation: 'test',
+          run,
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      for (const [name, value] of original) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 });

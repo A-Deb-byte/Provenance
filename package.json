@@ -12,7 +12,11 @@
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify-ledger": "node scripts/verify-ledger.mjs"
+    "verify-ledger": "node scripts/verify-ledger.mjs",
+    "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
+    "desktop:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "desktop:dev": "npm run build && node -r dotenv/config ./node_modules/@tauri-apps/cli/tauri.js dev --config src-tauri/tauri.conf.json",
+    "desktop:build": "npm run build && tauri build --config src-tauri/tauri.conf.json"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -30,6 +34,7 @@
     "vite": "^6.2.3"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",

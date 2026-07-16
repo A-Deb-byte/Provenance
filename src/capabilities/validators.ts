@@ -26,7 +26,7 @@ const browserOperations = new Set<CapabilityActionType>([
   'browser.inspect', 'browser.navigate', 'browser.click', 'browser.type', 'browser.download',
 ]);
 const desktopOperations = new Set<CapabilityActionType>([
-  'desktop.inspect', 'desktop.click', 'desktop.type', 'desktop.shortcut',
+  'desktop.discover', 'desktop.inspect', 'desktop.click', 'desktop.type', 'desktop.shortcut',
 ]);
 const connectorOperations = new Set<CapabilityActionType>([
   'connector.read', 'connector.draft', 'connector.send', 'connector.delete',
@@ -76,7 +76,9 @@ const isBrowserAction = (value: Record<string, unknown>): value is BrowserAction
 
 const isDesktopAction = (value: Record<string, unknown>): value is DesktopAction => {
   if (!isText(value.type) || !desktopOperations.has(value.type as CapabilityActionType)) return false;
-  if (!isText(value.appId) || !isText(value.windowId) || !isText(value.treeRevision)) return false;
+  if (!isText(value.appId)) return false;
+  if (value.type === 'desktop.discover') return true;
+  if (!isText(value.windowId) || !isText(value.treeRevision)) return false;
   if (value.type === 'desktop.click') return isText(value.nodeId);
   if (value.type === 'desktop.type') {
     return isText(value.nodeId) && isText(value.payloadArtifactId) && isSha256(value.payloadHash);
@@ -119,8 +121,11 @@ export const isCapabilityScope = (value: unknown): value is CapabilityScope => {
       Array.isArray(value.downloadRoots) && value.downloadRoots.every(isText);
   }
   if (value.family === 'desktop') {
+    const hasWindow = value.windowId !== undefined;
+    const hasRevision = value.treeRevision !== undefined;
     return operationsMatchFamily(value.operations, 'desktop') &&
-      isText(value.appId) && isText(value.windowId) && isText(value.treeRevision);
+      isText(value.appId) && hasWindow === hasRevision &&
+      (!hasWindow || (isText(value.windowId) && isText(value.treeRevision)));
   }
   if (value.family === 'connector') {
     return operationsMatchFamily(value.operations, 'connector') &&
@@ -145,9 +150,11 @@ export const isActionWithinScope = (action: CapabilityAction, scope: CapabilityS
   }
   if (scope.family === 'desktop' && action.type.startsWith('desktop.')) {
     const desktopAction = action as DesktopAction;
-    return desktopAction.appId === scope.appId &&
-      desktopAction.windowId === scope.windowId &&
-      desktopAction.treeRevision === scope.treeRevision;
+    if (desktopAction.appId !== scope.appId) return false;
+    if (desktopAction.type === 'desktop.discover') {
+      return scope.windowId === undefined && scope.treeRevision === undefined;
+    }
+    return desktopAction.windowId === scope.windowId && desktopAction.treeRevision === scope.treeRevision;
   }
   if (scope.family === 'connector' && action.type.startsWith('connector.')) {
     const connectorAction = action as ConnectorAction;
@@ -169,7 +176,10 @@ export const isScopeWithinScope = (requested: CapabilityScope, configured: Capab
       requested.downloadRoots.every((root) => configured.downloadRoots.some((allowed) => path.resolve(root) === path.resolve(allowed)));
   }
   if (requested.family === 'desktop' && configured.family === 'desktop') {
-    return requested.appId === configured.appId && requested.windowId === configured.windowId && requested.treeRevision === configured.treeRevision;
+    if (requested.appId !== configured.appId) return false;
+    if (configured.windowId !== undefined && requested.windowId !== configured.windowId) return false;
+    if (configured.treeRevision !== undefined && requested.treeRevision !== configured.treeRevision) return false;
+    return true;
   }
   if (requested.family === 'connector' && configured.family === 'connector') {
     return requested.connectorId === configured.connectorId &&

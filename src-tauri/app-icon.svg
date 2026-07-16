@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+  <title id="title">Provenance desktop</title>
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#111827" />
+      <stop offset="1" stop-color="#312e81" />
+    </linearGradient>
+    <linearGradient id="mark" x1="304" y1="256" x2="720" y2="768" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67e8f9" />
+      <stop offset="1" stop-color="#a78bfa" />
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#background)" />
+  <path d="M512 210 746 345v270L512 750 278 615V345L512 210Z" fill="none" stroke="url(#mark)" stroke-width="52" stroke-linejoin="round" />
+  <path d="M512 350v324M372 431l280 162M652 431 372 593" fill="none" stroke="#e0f2fe" stroke-width="34" stroke-linecap="round" />
+  <circle cx="512" cy="350" r="58" fill="#67e8f9" />
+  <circle cx="372" cy="593" r="58" fill="#c4b5fd" />
+  <circle cx="652" cy="593" r="58" fill="#a78bfa" />
+  <circle cx="512" cy="512" r="70" fill="#111827" stroke="#f8fafc" stroke-width="30" />
+</svg>

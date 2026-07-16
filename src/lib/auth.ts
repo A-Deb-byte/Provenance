@@ -98,13 +98,15 @@ export const subscribeAuth = (listener: () => void): (() => void) => {
  * Single browser transport for API calls. Reads remain anonymous when no
  * credential is loaded; authenticated sessions are attached to every request.
  */
-export const authenticatedFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+export const authenticatedFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const session = getAuthSession();
   if (!session) return init === undefined ? fetch(input) : fetch(input, init);
 
   const headers = new Headers(init?.headers);
   if (!headers.has('authorization')) headers.set('authorization', `Bearer ${session.token}`);
-  return fetch(input, { ...init, headers });
+  const response = await fetch(input, { ...init, headers });
+  if (response.status === 401) clearAuthSession();
+  return response;
 };
 
 export const fetchAuthStatus = async (): Promise<AuthStatus> => {
@@ -164,6 +166,15 @@ export const useOperatorToken = async (token: string): Promise<AuthSession> => {
   const session: AuthSession = { token: normalized, kind: 'operator', role: 'operator' };
   setAuthSession(session);
   return session;
+};
+
+export const verifySessionCredential = async (session: AuthSession): Promise<void> => {
+  if (session.kind !== 'session') throw new Error('A signed user session is required.');
+  const response = await fetch('/api/auth/session/verify', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${session.token}` },
+  });
+  if (!response.ok) throw new Error(await readError(response, 'Stored session verification failed.'));
 };
 
 export const logout = async (): Promise<void> => {

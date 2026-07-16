@@ -58,13 +58,11 @@ export const defaultWorkerRegistrations = (registeredAt = new Date().toISOString
     id: 'worker.desktop.placeholder',
     family: 'desktop',
     availability: 'unavailable',
-    supportedActions: ['desktop.inspect'],
+    supportedActions: ['desktop.discover', 'desktop.inspect'],
     configuredScopes: [{
       family: 'desktop',
-      operations: ['desktop.inspect'],
+      operations: ['desktop.discover', 'desktop.inspect'],
       appId: 'app.placeholder',
-      windowId: 'window.placeholder',
-      treeRevision: 'rev.placeholder',
     }],
     registeredAt,
     unavailableReason: 'No desktop worker runtime is installed in this deployment.',
@@ -97,6 +95,41 @@ const isCanonicalHttpOrigin = (value: string): boolean => {
 
 export const WEB_INSPECT_WORKER_ID = 'worker.browser.web_inspect';
 export const BROWSER_WRITE_WORKER_ID = 'worker.browser.playwright';
+export const DESKTOP_WORKER_ID = 'worker.desktop.windows_uia';
+
+export const DESKTOP_V1_ACTIONS = [
+  'desktop.discover',
+  'desktop.inspect',
+  'desktop.click',
+  'desktop.type',
+] as const;
+
+/** Static executable allowlist; every action intent still narrows to an exact live snapshot. */
+export const buildDesktopWorkerRegistration = (
+  appIds: readonly string[],
+  options: { available: boolean; reason?: string; registeredAt?: string },
+): WorkerRegistration => {
+  const normalizedAppIds = appIds.map((appId) => appId.trim());
+  if (normalizedAppIds.length === 0 || new Set(normalizedAppIds).size !== normalizedAppIds.length ||
+    normalizedAppIds.some((appId) => !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(appId))) {
+    throw new Error('Desktop worker registration requires unique canonical application ids.');
+  }
+  return {
+    id: DESKTOP_WORKER_ID,
+    family: 'desktop',
+    availability: options.available ? 'available' : 'unavailable',
+    supportedActions: [...DESKTOP_V1_ACTIONS],
+    configuredScopes: normalizedAppIds.map((appId) => ({
+      family: 'desktop',
+      operations: [...DESKTOP_V1_ACTIONS],
+      appId,
+    })),
+    registeredAt: options.registeredAt ?? new Date().toISOString(),
+    ...(options.available ? {} : {
+      unavailableReason: options.reason?.trim() || 'The native desktop bridge is not available.',
+    }),
+  };
+};
 
 /**
  * Registration for the write-capable Playwright browser worker. Returns
@@ -117,10 +150,10 @@ export const buildBrowserWriteWorkerRegistration = (
     id: BROWSER_WRITE_WORKER_ID,
     family: 'browser',
     availability: 'available',
-    supportedActions: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
+    supportedActions: ['browser.navigate', 'browser.click', 'browser.type'],
     configuredScopes: [{
       family: 'browser',
-      operations: ['browser.inspect', 'browser.navigate', 'browser.click', 'browser.type'],
+      operations: ['browser.navigate', 'browser.click', 'browser.type'],
       origins,
       downloadRoots: [],
     }],
@@ -482,6 +515,18 @@ export interface RuntimeReportInput {
   secretVault?: { status: 'available' | 'unavailable'; reason: string };
   accessControl?: { status: 'available' | 'unavailable'; reason: string };
   osSandbox?: { status: 'available' | 'unavailable'; reason: string };
+  recurringResearchScheduler?: {
+    available: boolean;
+    enabled: boolean;
+    running: boolean;
+    tickInProgress: boolean;
+    tickIntervalMs: number;
+    reason: string;
+    lastTickAt?: string;
+    lastOutcome?: string;
+    lastError?: string;
+  };
+  desktopIpc?: RuntimeFeatureStatus;
   now?: string;
 }
 
@@ -491,6 +536,37 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
     .filter((status) => !status.configured)
     .map((status) => ({ id: status.id, reason: status.unavailableReason ?? 'Server-side credentials are not configured.' }));
   const hasAvailableWorker = input.workerReport.available.length > 0;
+  const hasResearchWorker = input.workerReport.available.includes(WEB_INSPECT_WORKER_ID);
+  const hasDesktopWorker = input.workerReport.available.includes(DESKTOP_WORKER_ID);
+  const recurringScheduler = input.recurringResearchScheduler;
+  const recurringSchedulerStatus: RuntimeFeatureStatus = !recurringScheduler
+    ? {
+      status: 'unavailable',
+      reason: 'No durable recurring research scheduler is installed in this server process.',
+    }
+    : input.stopAll
+      ? {
+        status: 'blocked',
+        reason: 'Stop All is active; recurring research dispatch and in-flight work are halted.',
+      }
+      : !recurringScheduler.enabled || !recurringScheduler.available
+        ? { status: 'unavailable', reason: recurringScheduler.reason }
+        : !recurringScheduler.running
+          ? {
+            status: 'configured',
+            reason: `The durable scheduler is configured at ${recurringScheduler.tickIntervalMs} ms but its clock is stopped.`,
+          }
+          : recurringScheduler.lastError
+            ? {
+              status: 'blocked',
+              reason: `The durable scheduler clock is running but its last tick failed: ${recurringScheduler.lastError}`,
+            }
+            : {
+              status: 'available',
+              reason: `Durable interval scheduling is running every ${recurringScheduler.tickIntervalMs} ms${
+                recurringScheduler.tickInProgress ? ' with a tick in progress' : ''
+              }${recurringScheduler.lastOutcome ? `; last outcome: ${recurringScheduler.lastOutcome}` : ''}.`,
+            };
 
   const features: Record<string, RuntimeFeatureStatus> = {
     verificationCommands: {
@@ -515,6 +591,7 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
           : 'A registered worker is available; automations still require explicit enablement.'
         : 'No capability worker runtime is available, so automations cannot execute.',
     },
+    recurringResearchScheduler: recurringSchedulerStatus,
     coreModel: input.coreModel
       ? { status: input.coreModel.status, reason: input.coreModel.reason }
       : { status: 'unavailable', reason: 'No core model runtime is configured.' },
@@ -538,13 +615,35 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
         ? 'A release signing verification key is installed; correctly signed proposals can activate.'
         : 'No release signing verification key is installed; release proposals cannot activate.',
     },
+    verifiedResearchReports: {
+      status: input.stopAll
+        ? 'blocked'
+        : configuredProviders.length > 0 && hasResearchWorker ? 'available' : 'unavailable',
+      reason: input.stopAll
+        ? 'Stop All is active; research missions cannot dispatch provider or source steps.'
+        : configuredProviders.length === 0
+          ? 'No configured provider can plan, synthesize, and critique a report.'
+          : !hasResearchWorker
+            ? 'No allowlisted read-only web inspection worker is available for source capture.'
+            : 'Explicit allowlisted sources can be captured, citation-checked, critiqued, and published as authenticated reports.',
+    },
     releaseDeployment: input.releaseDeployment ?? {
       status: 'unavailable',
       reason: 'No supervised core-release process runtime is installed.',
     },
-    desktopIpc: {
+    desktopIpc: input.desktopIpc ?? {
       status: 'unavailable',
       reason: 'No Rust/Tauri desktop shell or authenticated IPC channel is installed.',
+    },
+    desktopAutomation: {
+      status: input.stopAll
+        ? 'blocked'
+        : hasDesktopWorker ? 'available' : input.desktopIpc?.status ?? 'unavailable',
+      reason: input.stopAll
+        ? 'Stop All is active; desktop inspection and actions are halted.'
+        : hasDesktopWorker
+          ? 'Windows UI Automation is available through exact-snapshot capability grants; desktop writes require explicit L2 approval.'
+          : input.desktopIpc?.reason ?? 'No authenticated Windows UI Automation worker is available.',
     },
   };
 

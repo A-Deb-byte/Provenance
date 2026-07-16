@@ -12,6 +12,7 @@ export type BrowserAction =
   | { type: 'browser.download'; origin: string; url: string; downloadRoot: string; fileName: string };
 
 export type DesktopAction =
+  | { type: 'desktop.discover'; appId: string }
   | { type: 'desktop.inspect'; appId: string; windowId: string; treeRevision: string }
   | { type: 'desktop.click'; appId: string; windowId: string; treeRevision: string; nodeId: string }
   | { type: 'desktop.type'; appId: string; windowId: string; treeRevision: string; nodeId: string; payloadArtifactId: string; payloadHash: string }
@@ -37,8 +38,10 @@ export interface DesktopCapabilityScope {
   family: 'desktop';
   operations: DesktopAction['type'][];
   appId: string;
-  windowId: string;
-  treeRevision: string;
+  /** Omitted only on the operator-configured app allowlist and discovery intents. */
+  windowId?: string;
+  /** Exact for inspection and mutation intents; omitted only with windowId. */
+  treeRevision?: string;
 }
 
 export interface ConnectorCapabilityScope {

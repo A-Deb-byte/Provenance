@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { browserScope, browserWorker } from '../capabilities/testFixtures';
 import { createMemoryCapabilityGrantStore } from '../capabilities/grantStore';
+import type { WorkerRegistration } from '../capabilities/types';
 import { createFileArtifactStore, hashArtifactContent } from './artifacts/artifactStore';
 import { createKernelService } from './kernel';
 import { appendKernelEvent } from './ledger';
@@ -308,6 +309,298 @@ describe('automation execution', () => {
     ]));
     const state = await kernel.getState();
     expect(state.goals.find((candidate) => candidate.id === goal.id)?.usage.operations).toBe(1);
+  });
+
+  it('records desktop worker output as an untrusted screen observation', async () => {
+    const artifactStore = createFileArtifactStore(path.join(runtimeDir, 'desktop-observations'));
+    const desktopScope = {
+      family: 'desktop' as const,
+      operations: ['desktop.inspect' as const],
+      appId: 'app.editor',
+      windowId: 'window.main',
+      treeRevision: 'tree.revision.1',
+    };
+    const desktopWorker: WorkerRegistration = {
+      id: 'worker.desktop.fixture',
+      family: 'desktop',
+      availability: 'available',
+      supportedActions: ['desktop.inspect'],
+      configuredScopes: [desktopScope],
+      registeredAt: '2026-07-15T00:00:00.000Z',
+    };
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [desktopWorker],
+      actionWorkers: { [desktopWorker.id]: fakeWorker('Visible editor controls.') },
+      artifactStore,
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      name: 'Inspect editor window',
+      goalId: goal.id,
+      workerId: desktopWorker.id,
+      riskLevel: 'L0',
+      action: {
+        type: 'desktop.inspect',
+        appId: desktopScope.appId,
+        windowId: desktopScope.windowId,
+        treeRevision: desktopScope.treeRevision,
+      },
+      scope: desktopScope,
+      trigger: { type: 'manual' },
+      approvalMode: 'per_run',
+      budget: { maxRuns: 1, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 1000 },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable desktop inspection.');
+
+    const outcome = await kernel.runAutomation(automation.id);
+
+    expect(outcome.observation?.source).toBe('screen');
+    expect(outcome.observation?.artifactId).toMatch(/^artifact_/);
+    expect(await artifactStore.resolve(outcome.observation!.artifactId!)).toMatchObject({
+      content: 'Visible editor controls.',
+      contentHash: outcome.observation?.contentHash,
+    });
+    const completed = (await kernel.getEvents()).find((event) => (
+      event.type === 'automation.run_completed' && event.entityId === automation.id
+    ));
+    expect(completed?.payload.observationSource).toBe('screen');
+    expect(completed?.payload.artifactId).toBe(outcome.observation?.artifactId);
+  });
+
+  it('lets Stop All abort a pending worker and refuses its late success', async () => {
+    let signalSeen: AbortSignal | undefined;
+    let announceStarted!: () => void;
+    const started = new Promise<void>((resolve) => { announceStarted = resolve; });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async (_intent, options) => {
+            signalSeen = options.signal;
+            announceStarted();
+            return await new Promise((resolve) => {
+              const fallback = setTimeout(() => resolve({
+                status: 'succeeded' as const,
+                summary: 'Late worker result.',
+                sourceRef: 'https://example.com/account',
+                content: 'Late content must not commit.',
+              }), 1000);
+              options.signal?.addEventListener('abort', () => {
+                clearTimeout(fallback);
+                resolve({
+                  status: 'succeeded' as const,
+                  summary: 'Late worker result.',
+                  sourceRef: 'https://example.com/account',
+                  content: 'Late content must not commit.',
+                });
+              }, { once: true });
+            });
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation(automationInput(goal.id));
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable cancellation test.');
+
+    const pending = kernel.runAutomation(automation.id);
+    await started;
+    const controls = await kernel.setStopAll(true, 'Cancel the pending automation.');
+    const outcome = await pending;
+
+    expect(controls.stopAll).toBe(true);
+    expect(signalSeen?.aborted).toBe(true);
+    expect(outcome.dispatch).toMatchObject({ status: 'failed', errorCode: 'cancelled' });
+    expect(outcome.content).toBe('');
+    const terminalEvents = (await kernel.getEvents()).filter((event) => (
+      event.entityId === automation.id &&
+      (event.type === 'automation.run_completed' || event.type === 'automation.run_failed')
+    ));
+    expect(terminalEvents.map((event) => event.type)).toEqual(['automation.run_failed']);
+  });
+
+  it('records an interrupted desktop mutation as uncertain and blocks automatic retry', async () => {
+    const treeRevision = 'a'.repeat(64);
+    const nodeId = 'b'.repeat(64);
+    const scope = {
+      family: 'desktop' as const,
+      operations: ['desktop.click' as const],
+      appId: 'app.editor',
+      windowId: 'window.main',
+      treeRevision,
+    };
+    const registration: WorkerRegistration = {
+      id: 'worker.desktop.interrupted',
+      family: 'desktop',
+      availability: 'available',
+      supportedActions: ['desktop.click'],
+      configuredScopes: [scope],
+      registeredAt: '2026-07-15T00:00:00.000Z',
+    };
+    let announceStarted!: () => void;
+    const started = new Promise<void>((resolve) => { announceStarted = resolve; });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [registration],
+      actionWorkers: {
+        [registration.id]: {
+          execute: async (_intent, options) => {
+            announceStarted();
+            return await new Promise((resolve) => {
+              options.signal?.addEventListener('abort', () => resolve({
+                status: 'succeeded' as const,
+                summary: 'Native click returned after cancellation.',
+                sourceRef: 'desktop:app.editor/window.main',
+              }), { once: true });
+            });
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      name: 'Click editor control',
+      goalId: goal.id,
+      workerId: registration.id,
+      riskLevel: 'L2',
+      action: {
+        type: 'desktop.click', appId: scope.appId, windowId: scope.windowId,
+        treeRevision, nodeId,
+      },
+      scope,
+      trigger: { type: 'manual' },
+      approvalMode: 'per_run',
+      budget: { maxRuns: 3, maxConsecutiveFailures: 2, maxRuntimeMsPerRun: 5_000 },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable uncertain mutation test.');
+    const approval = await kernel.runAutomation(automation.id);
+    await kernel.decideApproval(approval.approvalId!, 'approved', 'Approve one exact click.');
+
+    const pending = kernel.runAutomation(automation.id);
+    await started;
+    await kernel.setStopAll(true, 'Interrupt the native mutation.');
+    const outcome = await pending;
+
+    expect(outcome.dispatch).toMatchObject({
+      status: 'uncertain', errorCode: 'desktop_outcome_uncertain',
+    });
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
+    await kernel.setStopAll(false, 'Review the uncertain mutation before continuing.');
+    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain desktop outcome/);
+  });
+
+  it('never dispatches two concurrent runs of the same automation', async () => {
+    let announceStarted!: () => void;
+    let finishWorker!: () => void;
+    const started = new Promise<void>((resolve) => { announceStarted = resolve; });
+    const finish = new Promise<void>((resolve) => { finishWorker = resolve; });
+    let workerCalls = 0;
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async () => {
+            workerCalls += 1;
+            announceStarted();
+            await finish;
+            return {
+              status: 'succeeded' as const,
+              summary: 'Single run completed.',
+              sourceRef: 'https://example.com/account',
+            };
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation(automationInput(goal.id));
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable concurrency test.');
+
+    const first = kernel.runAutomation(automation.id);
+    await started;
+    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/in-flight or uncertain/);
+    expect(workerCalls).toBe(1);
+    finishWorker();
+    await expect(first).resolves.toMatchObject({ dispatch: { status: 'succeeded' } });
+  });
+
+  it('bounds a non-cooperative worker with the automation runtime timeout', async () => {
+    let signalSeen: AbortSignal | undefined;
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async (_intent, options) => {
+            signalSeen = options.signal;
+            return await new Promise(() => undefined);
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      ...automationInput(goal.id),
+      budget: { maxRuns: 1, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 25 },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable timeout test.');
+
+    const outcome = await kernel.runAutomation(automation.id);
+
+    expect(signalSeen?.aborted).toBe(true);
+    expect(outcome.dispatch).toMatchObject({ status: 'failed', errorCode: 'timeout' });
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_failed');
+  });
+
+  it('fences a successful result when automation authority changes during dispatch', async () => {
+    let announceStarted!: () => void;
+    let finishWorker!: () => void;
+    const started = new Promise<void>((resolve) => { announceStarted = resolve; });
+    const workerFinished = new Promise<void>((resolve) => { finishWorker = resolve; });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async () => {
+            announceStarted();
+            await workerFinished;
+            return {
+              status: 'succeeded' as const,
+              summary: 'Worker completed after disable.',
+              sourceRef: 'https://example.com/account',
+              content: 'Stale content must not commit.',
+            };
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation(automationInput(goal.id));
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable stale-result test.');
+
+    const pending = kernel.runAutomation(automation.id);
+    await started;
+    await kernel.setAutomationEnabled(automation.id, false, 'Disable before the worker completes.');
+    finishWorker();
+    const outcome = await pending;
+
+    expect(outcome.dispatch).toMatchObject({ status: 'failed', errorCode: 'stale_dispatch' });
+    expect(outcome.content).toBe('');
+    const terminalEvents = (await kernel.getEvents()).filter((event) => (
+      event.entityId === automation.id &&
+      (event.type === 'automation.run_completed' || event.type === 'automation.run_failed')
+    ));
+    expect(terminalEvents.map((event) => event.type)).toEqual(['automation.run_failed']);
   });
 
   it('consumes an L2 approval and persisted grant before browser dispatch', async () => {

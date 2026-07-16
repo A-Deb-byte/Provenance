@@ -5,6 +5,7 @@ import { isWorkerRegistration } from '../capabilities/validators';
 import {
   buildAutomationContract,
   buildBenchmarkRun,
+  buildDesktopWorkerRegistration,
   buildReleaseAuthorizationPayload,
   buildReleaseProposal,
   buildRuntimeCapabilityReport,
@@ -14,6 +15,8 @@ import {
   isReleaseProposalInput,
   rejectReleaseProposal,
   serializeReleaseAuthorizationPayload,
+  DESKTOP_WORKER_ID,
+  WEB_INSPECT_WORKER_ID,
 } from './autonomy';
 import { BenchmarkRun, GoalContract, KernelTask } from './types';
 
@@ -229,6 +232,7 @@ describe('runtime capability report', () => {
     expect(report.providers.unavailable[0].id).toBe('openai');
     expect(report.features.providerCalls.status).toBe('available');
     expect(report.features.backgroundAutomation.status).toBe('unavailable');
+    expect(report.features.recurringResearchScheduler.status).toBe('unavailable');
     expect(report.features.secretVault.status).toBe('unavailable');
     expect(report.features.osSandbox.status).toBe('unavailable');
     expect(report.features.releaseSigning.status).toBe('unavailable');
@@ -265,5 +269,89 @@ describe('runtime capability report', () => {
     expect(report.features.verificationCommands.status).toBe('blocked');
     expect(report.features.providerCalls.status).toBe('blocked');
     expect(report.features.backgroundAutomation.status).toBe('blocked');
+    expect(report.features.desktopAutomation.status).toBe('blocked');
+  });
+
+  it('reports desktop automation only after authenticated IPC and worker registration agree', () => {
+    const available = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [DESKTOP_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      desktopIpc: { status: 'available', reason: 'Authenticated native host is healthy.' },
+    });
+    const configured = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [], configured: [], unavailable: [] },
+      stopAll: false,
+      desktopIpc: { status: 'configured', reason: 'Health check failed.' },
+    });
+    expect(available.features.desktopIpc.status).toBe('available');
+    expect(available.features.desktopAutomation.status).toBe('available');
+    expect(configured.features.desktopAutomation).toEqual({ status: 'configured', reason: 'Health check failed.' });
+  });
+
+  it('reports the durable scheduler clock separately from generic automations', () => {
+    const running = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: true,
+        tickInProgress: false,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+        lastOutcome: 'completed',
+      },
+    });
+    const stopped = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: false,
+        tickInProgress: false,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+      },
+    });
+    const halted = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [WEB_INSPECT_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: true,
+      recurringResearchScheduler: {
+        available: true,
+        enabled: true,
+        running: true,
+        tickInProgress: true,
+        tickIntervalMs: 15_000,
+        reason: 'Durable interval scheduling is available.',
+      },
+    });
+
+    expect(running.features.recurringResearchScheduler.status).toBe('available');
+    expect(running.features.recurringResearchScheduler.reason).toContain('last outcome: completed');
+    expect(stopped.features.recurringResearchScheduler.status).toBe('configured');
+    expect(halted.features.recurringResearchScheduler.status).toBe('blocked');
+  });
+
+  it('registers a native desktop worker only for static allowlisted app ids', () => {
+    const worker = buildDesktopWorkerRegistration(['notepad', 'calculator'], {
+      available: true,
+      registeredAt: '2026-07-15T00:00:00.000Z',
+    });
+    expect(isWorkerRegistration(worker)).toBe(true);
+    expect(worker.supportedActions).toEqual([
+      'desktop.discover', 'desktop.inspect', 'desktop.click', 'desktop.type',
+    ]);
+    expect(worker.configuredScopes.map((scope) => scope.family === 'desktop' ? scope.appId : '')).toEqual([
+      'notepad', 'calculator',
+    ]);
+    expect(worker.configuredScopes.every((scope) => (
+      scope.family === 'desktop' && scope.windowId === undefined && scope.treeRevision === undefined
+    ))).toBe(true);
   });
 });

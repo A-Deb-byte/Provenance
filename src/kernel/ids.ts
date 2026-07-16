@@ -14,6 +14,10 @@ export type IdPrefix =
   | 'intent'
   | 'release'
   | 'benchmark'
+  | 'mission'
+  | 'mission_step'
+  | 'research_schedule'
+  | 'schedule_lease'
   | 'obs'
   | 'artifact';
 

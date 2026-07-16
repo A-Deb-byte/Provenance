@@ -3,6 +3,8 @@ import { browserIntent, browserScope, browserWorker } from './testFixtures';
 import {
   isActionIntent,
   isActionWithinScope,
+  isCapabilityScope,
+  isScopeWithinScope,
   isUntrustedObservation,
   isWorkerRegistration,
 } from './validators';
@@ -89,6 +91,30 @@ describe('capability contract validation', () => {
     expect(isActionWithinScope(action, scope)).toBe(true);
     expect(isActionWithinScope({ ...action, treeRevision: 'tree_sha256_2' }, scope)).toBe(false);
     expect(isActionWithinScope({ ...action, windowId: 'window_8' }, scope)).toBe(false);
+  });
+
+  it('uses an app-only registration scope while keeping every non-discovery intent exact', () => {
+    const configured = {
+      family: 'desktop' as const,
+      operations: ['desktop.discover' as const, 'desktop.inspect' as const, 'desktop.click' as const],
+      appId: 'notepad',
+    };
+    const exact = {
+      family: 'desktop' as const,
+      operations: ['desktop.click' as const],
+      appId: 'notepad',
+      windowId: 'window_1',
+      treeRevision: 'rev_1',
+    };
+    expect(isCapabilityScope(configured)).toBe(true);
+    expect(isScopeWithinScope(exact, configured)).toBe(true);
+    expect(isScopeWithinScope({ ...exact, appId: 'calculator' }, configured)).toBe(false);
+    expect(isActionWithinScope({ type: 'desktop.discover', appId: 'notepad' }, {
+      family: 'desktop', operations: ['desktop.discover'], appId: 'notepad',
+    })).toBe(true);
+    expect(isActionWithinScope({
+      type: 'desktop.click', appId: 'notepad', windowId: 'window_1', treeRevision: 'rev_1', nodeId: 'node_1',
+    }, configured)).toBe(false);
   });
 
   it('matches connector resources on segment boundaries', () => {

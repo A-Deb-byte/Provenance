@@ -32,6 +32,7 @@ const riskRank: Record<CapabilityRiskLevel, number> = { L0: 0, L1: 1, L2: 2, L3:
 export const minimumRiskForAction = (action: CapabilityAction): CapabilityRiskLevel => {
   switch (action.type) {
     case 'browser.inspect':
+    case 'desktop.discover':
     case 'desktop.inspect':
       return 'L0';
     case 'browser.navigate':
@@ -42,7 +43,7 @@ export const minimumRiskForAction = (action: CapabilityAction): CapabilityRiskLe
     case 'desktop.click':
     case 'desktop.type':
     case 'desktop.shortcut':
-      return 'L1';
+      return 'L2';
     case 'connector.read':
     case 'connector.draft':
       return 'L2';

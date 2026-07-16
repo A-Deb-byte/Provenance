@@ -19,7 +19,10 @@ const isWorkerAllowlistedRequest = (request: KernelCommandRequest): boolean => {
 
 const createWorkerEnvironment = (): NodeJS.ProcessEnv => {
   return Object.fromEntries(
-    Object.entries(process.env).filter(([name]) => !sensitiveEnvironmentName.test(name)),
+    Object.entries(process.env).filter(([name]) => (
+      !sensitiveEnvironmentName.test(name) && !/^DESKTOP_/iu.test(name) &&
+      name !== 'PROVENANCE_RUNTIME_DIR' && !/nonce/iu.test(name)
+    )),
   );
 };
 
