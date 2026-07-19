@@ -606,7 +606,10 @@ fn run_native_release_runner(arguments: Vec<OsString>) -> Result<i32, ()> {
         return Err(());
     }
 
-    let node_argument = node_executable.as_os_str().encode_wide().collect::<Vec<_>>();
+    let node_argument = node_executable
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
     let entrypoint_argument = entrypoint.as_os_str().encode_wide().collect::<Vec<_>>();
     if node_argument
         .iter()
