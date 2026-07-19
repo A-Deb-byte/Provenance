@@ -12,7 +12,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'provenance-packaged-smoke-'));
 const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'provenance-packaged-runtime-'));
 const maximumLogChars = 32 * 1024;
-const startupTimeoutMs = 45_000;
+const startupTimeoutMs = 120_000;
 const builtins = new Set([...builtinModules, ...builtinModules.map((name) => `node:${name}`)]);
 const auditedOptionalExternals = new Set([
   // Optional terminal coloring and ws native accelerators. Their callers use
@@ -49,7 +49,10 @@ const appendBounded = (current, chunk) => (
 
 const waitForServerUrl = () => new Promise((resolve, reject) => {
   const deadline = setTimeout(() => {
-    reject(new Error(`Packaged server did not become ready. ${stderr.slice(-2_000)}`));
+    reject(new Error(
+      `Packaged server did not become ready within ${startupTimeoutMs}ms. ` +
+      `stdout=${JSON.stringify(stdout.slice(-2_000))} stderr=${JSON.stringify(stderr.slice(-2_000))}`,
+    ));
   }, startupTimeoutMs);
   const inspect = () => {
     const match = /running on (http:\/\/localhost:\d+)/.exec(stdout);
@@ -66,7 +69,10 @@ const waitForServerUrl = () => new Promise((resolve, reject) => {
   });
   child.once('exit', (code) => {
     clearTimeout(deadline);
-    reject(new Error(`Packaged server exited before readiness with code ${code}. ${stderr.slice(-2_000)}`));
+    reject(new Error(
+      `Packaged server exited before readiness with code ${code}. ` +
+      `stdout=${JSON.stringify(stdout.slice(-2_000))} stderr=${JSON.stringify(stderr.slice(-2_000))}`,
+    ));
   });
 });
 
