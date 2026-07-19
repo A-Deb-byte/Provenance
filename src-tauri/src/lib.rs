@@ -129,12 +129,11 @@ fn initialize_host(
 
     let allowed_apps =
         onboarding::load_or_onboard(app, packaged_release).map_err(|_| RecoveryCode::Allowlist)?;
-    ensure_host_is_not_allowlisted(
-        &allowed_apps,
-        &std::fs::canonicalize(std::env::current_exe())
-            .map_err(|_| RecoveryCode::ResourceLayout)?,
-    )
-    .map_err(|_| RecoveryCode::Allowlist)?;
+    let current_executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| RecoveryCode::ResourceLayout)?;
+    ensure_host_is_not_allowlisted(&allowed_apps, &current_executable)
+        .map_err(|_| RecoveryCode::Allowlist)?;
     let allowlist_json =
         canonical_allowlist_json(&allowed_apps).map_err(|_| RecoveryCode::Allowlist)?;
     let workspace_root = onboarding::load_or_onboard_workspace(

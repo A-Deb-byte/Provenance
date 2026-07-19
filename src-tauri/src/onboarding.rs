@@ -6,9 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
-use tauri_plugin_dialog::{
-    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
-};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -114,7 +112,6 @@ fn confirm_reconfigure(app: &tauri::App) -> Result<bool, OnboardingError> {
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::YesNo)
             .blocking_show()
-            == MessageDialogResult::Yes
     })
     .join()
     .map_err(|_| OnboardingError::Dialog)
@@ -238,7 +235,6 @@ fn confirm_workspace_reconfigure(app: &tauri::App) -> Result<bool, OnboardingErr
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::YesNo)
             .blocking_show()
-            == MessageDialogResult::Yes
     })
     .join()
     .map_err(|_| OnboardingError::Dialog)
@@ -261,7 +257,6 @@ fn confirm_workspace(app: &tauri::App, workspace: &Path) -> Result<(), Onboardin
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::YesNo)
             .blocking_show()
-            == MessageDialogResult::Yes
     })
     .join()
     .map_err(|_| OnboardingError::Dialog)?;
@@ -386,7 +381,6 @@ fn confirm_selection(
             .kind(MessageDialogKind::Warning)
             .buttons(MessageDialogButtons::YesNo)
             .blocking_show()
-            == MessageDialogResult::Yes
     })
     .join()
     .map_err(|_| OnboardingError::Dialog)?;

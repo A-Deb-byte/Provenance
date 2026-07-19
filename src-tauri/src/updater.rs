@@ -2,9 +2,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::AppHandle;
-use tauri_plugin_dialog::{
-    DialogExt, MessageDialogButtons, MessageDialogKind, MessageDialogResult,
-};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -100,7 +98,6 @@ async fn run_update_check(app: AppHandle, runtime_dir: &Path) {
             .kind(MessageDialogKind::Info)
             .buttons(MessageDialogButtons::YesNo)
             .blocking_show()
-            == MessageDialogResult::Yes
     })
     .await
     .unwrap_or(false);
