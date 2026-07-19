@@ -79,7 +79,7 @@ The canonical bundle record binds that transform and signed-native capture to th
 `.github/workflows/windows-release.yml` is manual and has three authority stages. The `build-unsigned` job has no signing secrets. It:
 
 1. Uses exact CI Node.js `22.23.1` and Rust MSVC `1.97.0`.
-2. Installs locked JavaScript dependencies and provisions `cargo-about` `0.9.1` only after matching the fixed archive and executable hashes.
+2. Installs locked JavaScript dependencies, fetches only `Cargo.lock`-resolved Rust dependencies, and provisions `cargo-about` `0.9.1` only after matching the fixed archive and executable hashes.
 3. Downloads the configured Node archive and checks its archive digest, exact x64/win32 version, vendor Authenticode signer/timestamp, executable hash, adjacent `LICENSE`, and license hash.
 4. Proves no certificate, PFX, or updater private key is present.
 5. Runs TypeScript, Rust, desktop acceptance, release, packaged-resource, and JavaScript/Rust license gates.
@@ -93,7 +93,7 @@ Publication is a separate job with `contents: write`, the protected `production`
 
 ## 4. Self-Contained Runtime Resources
 
-The server build uses esbuild to produce `dist/server.cjs` and emits a dependency metafile plus `THIRD_PARTY_NOTICES.txt`. JavaScript licenses are parsed with exact `spdx-expression-parse` `5.0.0` under the repository allowlist and generated deterministically from the installed `package-lock.json` tree. Rust notices are generated from frozen `Cargo.lock` metadata under `about.toml` with hash-pinned `cargo-about` `0.9.1`; CI pins its archive SHA-256 to `318893aff6b9efd60f70470f5827b9577ae20a805cf9732d5612862a78508581` and executable SHA-256 to `e15e1af0b7c671bac972b21916b86726d0bf183ae121c85fb645bc618e911d3f`. Both notice files and the exact adjacent Node license are payload resources whose hashes are bound into release evidence. License-policy output is compliance evidence, not legal advice.
+The server build uses esbuild to produce `dist/server.cjs` and emits a dependency metafile plus `THIRD_PARTY_NOTICES.txt`. JavaScript licenses are parsed with exact `spdx-expression-parse` `5.0.0` under the repository allowlist and generated deterministically from the installed `package-lock.json` tree. CI first acquires only `Cargo.lock`-resolved crates with `cargo fetch --locked`; Rust notices are then generated offline from frozen `Cargo.lock` metadata under `about.toml` with hash-pinned `cargo-about` `0.9.1`. CI pins its archive SHA-256 to `318893aff6b9efd60f70470f5827b9577ae20a805cf9732d5612862a78508581` and executable SHA-256 to `e15e1af0b7c671bac972b21916b86726d0bf183ae121c85fb645bc618e911d3f`. Both notice files and the exact adjacent Node license are payload resources whose hashes are bound into release evidence. License-policy output is compliance evidence, not legal advice.
 
 `scripts/packaged-server-smoke.mjs` copies only `dist` and a selected Node executable into a clean temporary resource root, clears `NODE_PATH`, audits external imports, launches the server, and probes auth status, diagnostics, and the public runtime report. Release planning independently verifies the selected Node executable version/platform/architecture, vendor signature/timestamp, and exact Node/license hashes.
 
@@ -155,6 +155,7 @@ The Rust Windows test suite separately creates a temporary real Win32 top-level 
 - `npm test`
 - `npm run desktop:release:test`
 - `npm run build`
+- `cargo fetch --manifest-path src-tauri/Cargo.toml --locked`
 - `npm run desktop:licenses`
 - `npm run desktop:resource-smoke`
 - `cargo fmt --check`

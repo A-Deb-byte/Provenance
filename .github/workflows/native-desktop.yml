@@ -92,6 +92,9 @@ jobs:
       - name: Production web and server build
         run: npm run build
 
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --manifest-path src-tauri/Cargo.toml --locked
+
       - name: Native third-party license inventory
         run: npm run desktop:licenses
 

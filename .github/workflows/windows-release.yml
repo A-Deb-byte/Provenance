@@ -191,6 +191,7 @@ jobs:
           npm run desktop:acceptance
           npm run desktop:release:plan
           npm run build
+          cargo fetch --manifest-path src-tauri/Cargo.toml --locked
           npm run desktop:licenses
           npm run desktop:resource-smoke
           npm audit --omit=dev --audit-level=high
