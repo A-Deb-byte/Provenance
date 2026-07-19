@@ -1,9 +1,22 @@
 import express from 'express';
 import type { WorkerRegistration } from '../capabilities/types';
+import {
+  createDiagnosticSnapshot,
+  createDiagnosticSupportBundle,
+  type DiagnosticHealthInput,
+  type DiagnosticLogInput,
+  type DiagnosticSnapshot,
+  type DiagnosticSnapshotInput,
+} from '../diagnostics';
 import type { ProviderRouter } from '../providers/router';
 import type { ProviderPublicStatus, ProviderRoutingPolicy } from '../providers/types';
 import { buildRuntimeCapabilityReport } from './autonomy';
 import { sandboxStatus, SandboxRunner } from './sandbox/sandbox';
+import { getSkillEvaluationLedgerMetadata } from './skills/evaluation';
+import {
+  getSkillEvaluationSuiteLedgerMetadata,
+  type SkillEvaluationSourceResolver,
+} from './skills/evaluationSuite';
 import type { RecurringResearchSchedulerStatus } from './scheduler/service';
 import {
   createKernelService,
@@ -33,9 +46,18 @@ export interface KernelRouterOptions {
   readonly providerTimeoutMs?: number;
   readonly recurringResearchSchedulerEnabled?: boolean;
   readonly recurringResearchTickMs?: number;
+  readonly skillEvaluationSourceResolver?: SkillEvaluationSourceResolver;
+  readonly skillEvaluatorAllowlist?: readonly string[];
+  readonly skillAuthorPrincipal?: (request: express.Request) => string | undefined;
   readonly recurringResearchSchedulerStatus?: () => RecurringResearchSchedulerStatus;
   readonly desktopIpcStatus?: () => import('./autonomy').RuntimeFeatureStatus;
   readonly desktopPayloadStore?: import('../desktop/payloadStore').DesktopPayloadStore;
+  readonly diagnostics?: {
+    readonly build: DiagnosticSnapshotInput['build'];
+    readonly runtime: DiagnosticSnapshotInput['runtime'];
+    readonly health?: () => readonly DiagnosticHealthInput[] | Promise<readonly DiagnosticHealthInput[]>;
+    readonly logs?: () => readonly DiagnosticLogInput[] | Promise<readonly DiagnosticLogInput[]>;
+  };
   readonly recoverOnStart?: boolean;
   readonly kernelService?: ReturnType<typeof createKernelService>;
 }
@@ -74,9 +96,55 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     providerTimeoutMs: options.providerTimeoutMs,
     recurringResearchSchedulerEnabled: options.recurringResearchSchedulerEnabled,
     recurringResearchTickMs: options.recurringResearchTickMs,
+    skillEvaluationSourceResolver: options.skillEvaluationSourceResolver,
+    skillEvaluatorAllowlist: options.skillEvaluatorAllowlist,
   });
   const kernel = options.kernelService ?? createKernelService(config);
   const router = express.Router();
+
+  const diagnosticSnapshot = async (): Promise<DiagnosticSnapshot> => {
+    if (!options.diagnostics) throw new Error('Diagnostics are unavailable.');
+    const [state, events, configuredHealth] = await Promise.all([
+      kernel.getState(),
+      kernel.getEvents(),
+      options.diagnostics.health?.() ?? [],
+    ]);
+    const workers = kernel.getWorkers().report;
+    return createDiagnosticSnapshot({
+      build: options.diagnostics.build,
+      runtime: options.diagnostics.runtime,
+      health: [
+        {
+          component: 'kernel.snapshot',
+          status: 'ok',
+          reasonCode: 'authenticated',
+          metrics: {
+            goals: state.goals.length,
+            tasks: state.tasks.length,
+            automations: state.automations.length,
+            stop_all: state.controls.stopAll,
+          },
+        },
+        {
+          component: 'kernel.ledger',
+          status: 'ok',
+          reasonCode: 'verified',
+          metrics: { events: events.length },
+        },
+        {
+          component: 'kernel.workers',
+          status: workers.available.length > 0 ? 'ok' : 'degraded',
+          reasonCode: workers.available.length > 0 ? 'available' : 'none_available',
+          metrics: {
+            available: workers.available.length,
+            configured: workers.configured.length,
+            unavailable: workers.unavailable.length,
+          },
+        },
+        ...configuredHealth,
+      ],
+    });
+  };
 
   // Interrupted running tasks are recovered into an inspectable blocked
   // state at startup rather than silently resuming.
@@ -454,15 +522,65 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
   router.get('/skill-evaluations', async (_req, res) => {
     try {
       const state = await kernel.getState();
-      res.json({ evaluations: state.skillEvaluations });
+      res.json({ evaluations: state.skillEvaluations.map(getSkillEvaluationLedgerMetadata) });
     } catch {
       res.status(500).json({ error: 'Skill evaluations are unavailable.' });
     }
   });
 
-  router.post('/skills/synthesize', async (req, res) => {
+  router.get('/skill-evaluation-suites', async (_req, res) => {
     try {
-      res.status(201).json(await kernel.synthesizeSkill(req.body));
+      const state = await kernel.getState();
+      res.json({
+        suites: (state.skillEvaluationSuites ?? []).map(getSkillEvaluationSuiteLedgerMetadata),
+      });
+    } catch {
+      res.status(500).json({ error: 'Skill evaluation suites are unavailable.' });
+    }
+  });
+
+  router.post('/skill-evaluation-suites', async (req, res) => {
+    if (
+      !req.body ||
+      typeof req.body !== 'object' ||
+      Object.keys(req.body).some((key) => key !== 'sourceId')
+    ) {
+      res.status(400).json({
+        error: 'Raw oracle expectations and authority claims are not accepted; reference one evaluator source id.',
+      });
+      return;
+    }
+    try {
+      const suite = await kernel.createSkillEvaluationSuite({ sourceId: req.body?.sourceId });
+      res.status(201).json(getSkillEvaluationSuiteLedgerMetadata(suite));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message.includes('unavailable') ? 503 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/skills/synthesize', async (req, res) => {
+    if (
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'author') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'authorPrincipalId') ||
+      Object.prototype.hasOwnProperty.call(req.body ?? {}, 'evaluatorId')
+    ) {
+      res.status(400).json({ error: 'Caller-supplied skill author or evaluator authority is not accepted.' });
+      return;
+    }
+    const principalId = options.skillAuthorPrincipal?.(req);
+    if (!principalId?.trim()) {
+      res.status(503).json({ error: 'Authenticated skill author authority is unavailable.' });
+      return;
+    }
+    try {
+      res.status(201).json(await kernel.synthesizeSkill({
+        ...req.body,
+        author: {
+          authorityType: 'authenticated-principal-v1',
+          principalId: principalId.trim(),
+        },
+      }));
     } catch (error) {
       res.status(400).json({ error: errorMessage(error) });
     }
@@ -470,7 +588,8 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
 
   router.post('/skills/:skillId/evaluate', async (req, res) => {
     try {
-      res.json(await kernel.evaluateSkill(req.params.skillId));
+      const evaluation = await kernel.evaluateSkill(req.params.skillId);
+      res.json(getSkillEvaluationLedgerMetadata(evaluation));
     } catch (error) {
       const message = errorMessage(error);
       res.status(message === 'Skill not found.' ? 404 : 409).json({ error: message });
@@ -545,6 +664,43 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     res.json(kernel.getWorkers());
   });
 
+  router.get('/diagnostics', async (_req, res) => {
+    if (!options.diagnostics) {
+      res.status(503).json({ error: 'Diagnostics are unavailable.' });
+      return;
+    }
+    try {
+      res.setHeader('cache-control', 'no-store');
+      res.json(await diagnosticSnapshot());
+    } catch {
+      res.status(500).json({ error: 'The diagnostic snapshot could not be created.' });
+    }
+  });
+
+  router.post('/diagnostics/support-bundle', async (_req, res) => {
+    if (!options.diagnostics || !options.artifactStore) {
+      res.status(503).json({ error: 'Diagnostic support-bundle export is unavailable.' });
+      return;
+    }
+    try {
+      const [snapshot, logs] = await Promise.all([
+        diagnosticSnapshot(),
+        options.diagnostics.logs?.() ?? [],
+      ]);
+      const bundle = createDiagnosticSupportBundle({ snapshot, logs, generatedAt: snapshot.generatedAt });
+      const artifact = await kernel.createArtifact(bundle.content);
+      res.status(201).set({
+        'cache-control': 'no-store',
+        'content-disposition': `attachment; filename="${bundle.fileName}"`,
+        'content-type': `${bundle.contentType}; charset=utf-8`,
+        'x-provenance-artifact-id': artifact.id,
+        'x-provenance-artifact-sha256': artifact.contentHash,
+      }).send(bundle.content);
+    } catch {
+      res.status(500).json({ error: 'The diagnostic support bundle could not be created.' });
+    }
+  });
+
   router.get('/artifacts', async (_req, res) => {
     try {
       res.json({ artifacts: await kernel.listArtifacts() });
@@ -568,7 +724,8 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
       // process-local, consume-once store until the authorized worker resolves it.
       res.status(201).json(await options.desktopPayloadStore.stage(content));
     } catch (error) {
-      res.status(400).json({ error: errorMessage(error) });
+      const message = errorMessage(error);
+      res.status(message.includes('typed-payload staging is unavailable') ? 503 : 400).json({ error: message });
     }
   });
 
@@ -764,8 +921,9 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
       const coreModel = options.coreModelStatus ? await options.coreModelStatus() : undefined;
       const secretVault = options.secretVaultStatus ? await options.secretVaultStatus() : undefined;
       const accessControl = options.accessControlStatus ? options.accessControlStatus() : undefined;
-      const osSandbox = options.sandbox
-        ? (() => { const s = sandboxStatus(options.sandbox!); return { status: s.status, reason: s.reason }; })()
+      const sandboxReport = options.sandbox ? sandboxStatus(options.sandbox) : undefined;
+      const osSandbox = sandboxReport
+        ? { status: sandboxReport.status, reason: sandboxReport.reason }
         : undefined;
       const releaseDeployment = options.releaseLifecycle
         ? (() => {
@@ -793,6 +951,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
         secretVault,
         accessControl,
         osSandbox,
+        commandExecution: sandboxReport?.commandExecution,
         recurringResearchScheduler: {
           available: recurringResearchCapability.available,
           enabled: recurringResearchCapability.schedulerEnabled,

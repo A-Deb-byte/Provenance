@@ -231,6 +231,10 @@ describe('runtime capability report', () => {
     expect(report.providers.configured).toEqual(['gemini']);
     expect(report.providers.unavailable[0].id).toBe('openai');
     expect(report.features.providerCalls.status).toBe('available');
+    expect(report.features.verificationCommands).toMatchObject({
+      status: 'available',
+      reason: expect.stringContaining('trusted-host fallback'),
+    });
     expect(report.features.backgroundAutomation.status).toBe('unavailable');
     expect(report.features.recurringResearchScheduler.status).toBe('unavailable');
     expect(report.features.secretVault.status).toBe('unavailable');
@@ -270,6 +274,25 @@ describe('runtime capability report', () => {
     expect(report.features.providerCalls.status).toBe('blocked');
     expect(report.features.backgroundAutomation.status).toBe('blocked');
     expect(report.features.desktopAutomation.status).toBe('blocked');
+  });
+
+  it('reports verification commands unavailable when native execution is disabled', () => {
+    const report = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [], configured: [], unavailable: [] },
+      stopAll: false,
+      osSandbox: { status: 'unavailable', reason: 'Docker health check failed.' },
+      commandExecution: {
+        status: 'unavailable',
+        reason: 'Native desktop mode requires healthy Docker isolation.',
+      },
+    });
+
+    expect(report.features.osSandbox.status).toBe('unavailable');
+    expect(report.features.verificationCommands).toEqual({
+      status: 'unavailable',
+      reason: 'Native desktop mode requires healthy Docker isolation.',
+    });
   });
 
   it('reports desktop automation only after authenticated IPC and worker registration agree', () => {

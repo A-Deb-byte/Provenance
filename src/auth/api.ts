@@ -1,14 +1,21 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import { resolveAccessMode } from './accessControl';
+import {
+  FIRST_ADMIN_BOOTSTRAP_HEADER,
+  type FirstAdminBootstrapAuthority,
+} from './bootstrapAuthority';
 import { issueSession, verifySession } from './session';
-import type { UserStore } from './users';
+import type { PublicUser, UserStore } from './users';
 
 export interface AuthApiOptions {
   userStore: UserStore;
   sessionSecret: string;
   operatorToken?: string;
   sessionTtlMs?: number;
+  onFirstAdminCreated?: () => void | Promise<void>;
+  onSuccessfulLogin?: () => void | Promise<void>;
+  firstAdminBootstrapAuthority?: FirstAdminBootstrapAuthority;
 }
 
 const DEFAULT_TTL_MS = 12 * 60 * 60 * 1000;
@@ -51,10 +58,25 @@ const adminClaims = (req: express.Request, options: AuthApiOptions) => {
 export const createAuthApi = (options: AuthApiOptions) => {
   const { userStore, sessionSecret } = options;
   const ttl = options.sessionTtlMs ?? DEFAULT_TTL_MS;
+  const firstAdminBootstrapAuthority = options.firstAdminBootstrapAuthority;
   const router = express.Router();
 
+  router.use((req, res, next) => {
+    if (!firstAdminBootstrapAuthority?.isPending()) return next();
+    const bootstrapStatus = req.method === 'GET' && req.path === '/status';
+    const bootstrapCreate = req.method === 'POST' && req.path === '/users';
+    if (bootstrapStatus || bootstrapCreate) return next();
+    res.status(401).json({
+      error: 'First-admin bootstrap must be completed from the native desktop launch.',
+    });
+  });
+
   router.get('/status', (_req, res) => {
-    res.json({ mode: resolveAccessMode(userStore.count(), options.operatorToken), userCount: userStore.count() });
+    const userCount = userStore.count();
+    const mode = firstAdminBootstrapAuthority?.isPending()
+      ? resolveAccessMode(userCount, undefined)
+      : resolveAccessMode(userCount, options.operatorToken);
+    res.json({ mode, userCount });
   });
 
   router.post('/operator/verify', (req, res) => {
@@ -78,7 +100,7 @@ export const createAuthApi = (options: AuthApiOptions) => {
     res.status(204).end();
   });
 
-  router.post('/login', (req, res) => {
+  router.post('/login', async (req, res) => {
     const username = req.body?.username as unknown;
     const password = req.body?.password as unknown;
     if (typeof username !== 'string' || typeof password !== 'string') {
@@ -94,6 +116,13 @@ export const createAuthApi = (options: AuthApiOptions) => {
     if (sessionVersion === undefined) {
       res.status(500).json({ error: 'User session state is unavailable.' });
       return;
+    }
+    if (options.onSuccessfulLogin) {
+      try {
+        await options.onSuccessfulLogin();
+      } catch {
+        console.warn('[Auth] Post-login authority refresh failed; protected runtimes remain unavailable.');
+      }
     }
     const token = issueSession({ userId: user.id, username: user.username, role: user.role, sessionVersion }, ttl, sessionSecret);
     res.json({ token, role: user.role, username: user.username, expiresAt: new Date(Date.now() + ttl).toISOString() });
@@ -123,7 +152,16 @@ export const createAuthApi = (options: AuthApiOptions) => {
     }
 
     const isBootstrap = userStore.count() === 0;
-    if (isBootstrap && options.operatorToken?.trim()) {
+    let nativeBootstrapAuthorized = false;
+    if (isBootstrap && firstAdminBootstrapAuthority?.isPending()) {
+      const supplied = req.header(FIRST_ADMIN_BOOTSTRAP_HEADER);
+      if (!firstAdminBootstrapAuthority.authorize(supplied)) {
+        res.status(401).json({ error: 'Native first-admin bootstrap authorization is required.' });
+        return;
+      }
+      nativeBootstrapAuthorized = true;
+    }
+    if (isBootstrap && !nativeBootstrapAuthorized && options.operatorToken?.trim()) {
       const supplied = bearerToken(req);
       if (!supplied || !timingSafeEqual(supplied, options.operatorToken.trim())) {
         res.status(401).json({ error: 'The configured operator token is required to bootstrap the first administrator.' });
@@ -137,12 +175,26 @@ export const createAuthApi = (options: AuthApiOptions) => {
     // The first account is always an admin so the deployment is manageable.
     const resolvedRole = isBootstrap ? 'admin' : (role === 'operator' || role === 'viewer' || role === 'admin' ? role : 'operator');
 
+    let user: PublicUser;
     try {
-      const user = await userStore.create({ username, password, role: resolvedRole });
-      res.status(201).json({ user, bootstrap: isBootstrap });
+      user = await userStore.create({ username, password, role: resolvedRole });
     } catch (error) {
       res.status(400).json({ error: errorMessage(error) });
+      return;
     }
+    if (isBootstrap) firstAdminBootstrapAuthority?.completeAfterPersistence();
+
+    if (isBootstrap && options.onFirstAdminCreated) {
+      try {
+        // Account persistence changes the access mode before any protected
+        // runtime is re-evaluated. A failed refresh must not misreport the
+        // already-committed administrator creation as a failed bootstrap.
+        await options.onFirstAdminCreated();
+      } catch {
+        console.warn('[Auth] First-admin authority refresh failed; protected runtimes remain unavailable.');
+      }
+    }
+    res.status(201).json({ user, bootstrap: isBootstrap });
   });
 
   router.delete('/users/:id', async (req, res) => {

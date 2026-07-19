@@ -1,5 +1,7 @@
 use crate::bridge::BridgeSecret;
 use serde::Deserialize;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -13,6 +15,54 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STABILITY_WINDOW: Duration = Duration::from_millis(750);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_READY_BYTES: u64 = 4 * 1024;
+const NATIVE_RELEASE_RUNNER_FLAG: &str = "--provenance-native-release-runner-v1";
+const NATIVE_RELEASE_RUNNER_FAILURE: i32 = 125;
+
+pub fn native_release_runner_exit_code() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    let _executable = arguments.next();
+    if arguments.next().as_deref() != Some(OsStr::new(NATIVE_RELEASE_RUNNER_FLAG)) {
+        return None;
+    }
+    let arguments = arguments.collect::<Vec<_>>();
+    Some(run_native_release_runner(arguments).unwrap_or(NATIVE_RELEASE_RUNNER_FAILURE))
+}
+
+#[cfg(not(windows))]
+fn run_native_release_runner(_arguments: Vec<OsString>) -> Result<i32, ()> {
+    Err(())
+}
+
+#[derive(Clone)]
+pub struct FirstAdminBootstrapSecret(String);
+
+impl FirstAdminBootstrapSecret {
+    pub fn generate() -> Self {
+        Self(random_launch_nonce())
+    }
+
+    pub fn expose_to_supervised_child(&self) -> &str {
+        &self.0
+    }
+
+    pub fn expose_to_initial_webview(&self) -> &str {
+        &self.0
+    }
+
+    fn is_valid(&self) -> bool {
+        self.0.len() == 43
+            && self
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }
+}
+
+impl fmt::Debug for FirstAdminBootstrapSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FirstAdminBootstrapSecret([redacted])")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NodeLaunchConfig {
@@ -22,9 +72,14 @@ pub struct NodeLaunchConfig {
     pub runtime_directory: PathBuf,
     pub bridge_url: String,
     pub bridge_secret: BridgeSecret,
+    pub first_admin_bootstrap_secret: FirstAdminBootstrapSecret,
     pub runtime_owner_nonce: String,
     pub host_instance_id: String,
     pub desktop_app_allowlist_json: String,
+    pub workspace_root: PathBuf,
+    pub packaged_release: bool,
+    pub sandbox_image: Option<String>,
+    pub build_version: String,
 }
 
 impl NodeLaunchConfig {
@@ -35,6 +90,8 @@ impl NodeLaunchConfig {
             .map_err(|error| SupervisorError::InvalidPath("working directory", error))?;
         self.runtime_directory = std::fs::canonicalize(&self.runtime_directory)
             .map_err(|error| SupervisorError::InvalidPath("runtime directory", error))?;
+        self.workspace_root = std::fs::canonicalize(&self.workspace_root)
+            .map_err(|error| SupervisorError::InvalidPath("project workspace", error))?;
 
         if !self
             .node_executable
@@ -56,11 +113,28 @@ impl NodeLaunchConfig {
         if is_within(&self.working_directory, &self.runtime_directory) {
             return Err(SupervisorError::RuntimeInsideWorkspace);
         }
+        let workspace_package = std::fs::symlink_metadata(self.workspace_root.join("package.json"));
+        if !self.workspace_root.is_dir()
+            || workspace_package
+                .as_ref()
+                .map(|metadata| !metadata.is_file() || metadata.file_type().is_symlink())
+                .unwrap_or(true)
+            || (self.packaged_release
+                && (is_within(&self.working_directory, &self.workspace_root)
+                    || is_within(&self.workspace_root, &self.working_directory)))
+            || is_within(&self.runtime_directory, &self.workspace_root)
+            || is_within(&self.workspace_root, &self.runtime_directory)
+        {
+            return Err(SupervisorError::InvalidWorkspace);
+        }
         if !self.bridge_url.starts_with("http://127.0.0.1:")
             || self.bridge_secret.expose_to_supervised_child().len() < 32
             || self.runtime_owner_nonce.len() < 32
         {
             return Err(SupervisorError::InvalidBridge);
+        }
+        if !self.first_admin_bootstrap_secret.is_valid() {
+            return Err(SupervisorError::InvalidBootstrapSecret);
         }
         if self.desktop_app_allowlist_json.len() > 64 * 1024
             || serde_json::from_str::<Vec<crate::contracts::AllowedApplication>>(
@@ -69,6 +143,17 @@ impl NodeLaunchConfig {
             .is_err()
         {
             return Err(SupervisorError::InvalidAllowlist);
+        }
+        if self
+            .sandbox_image
+            .as_deref()
+            .is_some_and(|image| !is_digest_pinned_image(image))
+            || (self.packaged_release && self.sandbox_image.is_none())
+        {
+            return Err(SupervisorError::InvalidSandboxImage);
+        }
+        if !is_public_build_version(&self.build_version) {
+            return Err(SupervisorError::InvalidBuildVersion);
         }
         Ok(self)
     }
@@ -84,10 +169,18 @@ pub enum SupervisorError {
     EntrypointEscaped,
     #[error("the native runtime directory must be outside the command workspace")]
     RuntimeInsideWorkspace,
+    #[error("the project workspace must be a real package directory disjoint from native resources and runtime state")]
+    InvalidWorkspace,
     #[error("the desktop bridge URL, token, or runtime-owner nonce is invalid")]
     InvalidBridge,
+    #[error("the per-launch first-admin bootstrap secret is invalid")]
+    InvalidBootstrapSecret,
     #[error("the desktop application allowlist is not canonical bounded JSON")]
     InvalidAllowlist,
+    #[error("packaged desktop releases require a digest-pinned command sandbox image")]
+    InvalidSandboxImage,
+    #[error("the native build version is invalid")]
+    InvalidBuildVersion,
     #[error("the per-launch readiness path could not be prepared: {0}")]
     ReadyPath(#[source] std::io::Error),
     #[error("the supervised Node log could not be opened: {0}")]
@@ -143,6 +236,8 @@ impl NodeSupervisor {
             .env("NODE_ENV", "production")
             .env("PORT", "0")
             .env("PROVENANCE_PROJECT_ROOT", &config.working_directory)
+            .env("PROVENANCE_WORKSPACE_ROOT", &config.workspace_root)
+            .env("PROVENANCE_BUILD_VERSION", &config.build_version)
             .env("PROVENANCE_RUNTIME_DIR", &config.runtime_directory)
             .env("DESKTOP_HOST_NONCE", &host_nonce)
             .env("DESKTOP_HOST_READY_FILE", &ready_path)
@@ -153,15 +248,41 @@ impl NodeSupervisor {
                 "DESKTOP_BRIDGE_TOKEN",
                 config.bridge_secret.expose_to_supervised_child(),
             )
+            .env(
+                "PROVENANCE_FIRST_ADMIN_BOOTSTRAP_SECRET",
+                config
+                    .first_admin_bootstrap_secret
+                    .expose_to_supervised_child(),
+            )
             .env("DESKTOP_HOST_INSTANCE_ID", &config.host_instance_id)
             .env("DESKTOP_APP_ALLOWLIST", &config.desktop_app_allowlist_json)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
+        if config.packaged_release {
+            command.env("DESKTOP_PACKAGED_RELEASE", "1");
+        }
+        if let Some(image) = &config.sandbox_image {
+            command.env("PROVENANCE_SANDBOX_IMAGE", image);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+            let release_runner = canonical_file(
+                &std::env::current_exe().map_err(|error| {
+                    SupervisorError::InvalidPath("native release runner", error)
+                })?,
+                "native release runner",
+            )?;
+            if !release_runner
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
+            {
+                return Err(SupervisorError::InvalidExecutable);
+            }
+            command.env("PROVENANCE_NATIVE_RELEASE_RUNNER", release_runner);
             command.creation_flags(CREATE_NO_WINDOW.0);
         }
 
@@ -360,6 +481,40 @@ fn random_launch_nonce() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+fn is_digest_pinned_image(value: &str) -> bool {
+    let Some((repository, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    repository.contains('/')
+        && !repository.starts_with('/')
+        && !repository.ends_with('/')
+        && repository.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_public_build_version(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let core = value.split_once('-').map(|(core, _)| core).unwrap_or(value);
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[cfg(windows)]
 struct ProcessJob {
     handle: windows::Win32::Foundation::HANDLE,
@@ -372,15 +527,12 @@ unsafe impl Send for ProcessJob {}
 
 #[cfg(windows)]
 impl ProcessJob {
-    fn assign(child: &Child) -> Result<Self, SupervisorError> {
+    fn create() -> Result<Self, SupervisorError> {
         use std::ffi::c_void;
         use std::mem::size_of;
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
         unsafe {
@@ -397,13 +549,30 @@ impl ProcessJob {
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
                 return Err(SupervisorError::Job(error.to_string()));
             }
-            let process_handle = HANDLE(child.as_raw_handle());
-            if let Err(error) = AssignProcessToJobObject(handle, process_handle) {
-                let _ = windows::Win32::Foundation::CloseHandle(handle);
-                return Err(SupervisorError::Job(error.to_string()));
-            }
             Ok(Self { handle })
         }
+    }
+
+    fn assign_handle(
+        &self,
+        process_handle: windows::Win32::Foundation::HANDLE,
+    ) -> Result<(), SupervisorError> {
+        unsafe {
+            windows::Win32::System::JobObjects::AssignProcessToJobObject(
+                self.handle,
+                process_handle,
+            )
+            .map_err(|error| SupervisorError::Job(error.to_string()))
+        }
+    }
+
+    fn assign(child: &Child) -> Result<Self, SupervisorError> {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+
+        let job = Self::create()?;
+        job.assign_handle(HANDLE(child.as_raw_handle()))?;
+        Ok(job)
     }
 
     fn terminate(&self) {
@@ -411,6 +580,128 @@ impl ProcessJob {
             let _ = windows::Win32::System::JobObjects::TerminateJobObject(self.handle, 1);
         }
     }
+}
+
+#[cfg(windows)]
+fn run_native_release_runner(arguments: Vec<OsString>) -> Result<i32, ()> {
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    if arguments.len() != 3 {
+        return Err(());
+    }
+    let node_executable = canonical_runner_file(&arguments[0], "exe")?;
+    let working_directory = std::fs::canonicalize(PathBuf::from(&arguments[2])).map_err(|_| ())?;
+    if !working_directory.is_dir() {
+        return Err(());
+    }
+    let entrypoint = canonical_runner_file(&arguments[1], "cjs")?;
+    if !is_within(&working_directory, &entrypoint) {
+        return Err(());
+    }
+
+    let node_argument = node_executable.as_os_str().encode_wide().collect::<Vec<_>>();
+    let entrypoint_argument = entrypoint.as_os_str().encode_wide().collect::<Vec<_>>();
+    if node_argument
+        .iter()
+        .any(|value| *value == 0 || *value == b'"' as u16)
+        || entrypoint_argument
+            .iter()
+            .any(|value| *value == 0 || *value == b'"' as u16)
+    {
+        return Err(());
+    }
+    let mut command_line = Vec::with_capacity(node_argument.len() + entrypoint_argument.len() + 6);
+    command_line.push(b'"' as u16);
+    command_line.extend_from_slice(&node_argument);
+    command_line.extend_from_slice(&[b'"' as u16, b' ' as u16, b'"' as u16]);
+    command_line.extend_from_slice(&entrypoint_argument);
+    command_line.extend_from_slice(&[b'"' as u16, 0]);
+    let node_wide = node_executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let working_wide = working_directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    let job = ProcessJob::create().map_err(|_| ())?;
+    let mut startup = STARTUPINFOW::default();
+    startup.cb = size_of::<STARTUPINFOW>() as u32;
+    let mut process = PROCESS_INFORMATION::default();
+    unsafe {
+        CreateProcessW(
+            PCWSTR(node_wide.as_ptr()),
+            Some(PWSTR(command_line.as_mut_ptr())),
+            None,
+            None,
+            false,
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            None,
+            PCWSTR(working_wide.as_ptr()),
+            &startup,
+            &mut process,
+        )
+        .map_err(|_| ())?;
+
+        if job.assign_handle(process.hProcess).is_err() {
+            let _ = TerminateProcess(process.hProcess, NATIVE_RELEASE_RUNNER_FAILURE as u32);
+            let _ = WaitForSingleObject(process.hProcess, INFINITE);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+            return Err(());
+        }
+        if ResumeThread(process.hThread) == u32::MAX {
+            job.terminate();
+            let _ = WaitForSingleObject(process.hProcess, INFINITE);
+            let _ = CloseHandle(process.hThread);
+            let _ = CloseHandle(process.hProcess);
+            return Err(());
+        }
+        let _ = CloseHandle(process.hThread);
+        if WaitForSingleObject(process.hProcess, INFINITE) != WAIT_OBJECT_0 {
+            job.terminate();
+            let _ = CloseHandle(process.hProcess);
+            return Err(());
+        }
+        let mut exit_code = NATIVE_RELEASE_RUNNER_FAILURE as u32;
+        let result = GetExitCodeProcess(process.hProcess, &mut exit_code);
+        let _ = CloseHandle(process.hProcess);
+        result.map_err(|_| ())?;
+        if exit_code > 255 {
+            return Err(());
+        }
+        Ok(exit_code as i32)
+    }
+}
+
+#[cfg(windows)]
+fn canonical_runner_file(path: &OsStr, expected_extension: &str) -> Result<PathBuf, ()> {
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        return Err(());
+    }
+    let canonical = std::fs::canonicalize(requested).map_err(|_| ())?;
+    let metadata = std::fs::symlink_metadata(&canonical).map_err(|_| ())?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || !canonical
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case(expected_extension))
+    {
+        return Err(());
+    }
+    Ok(canonical)
 }
 
 #[cfg(windows)]
@@ -470,5 +761,41 @@ mod tests {
         let right = random_launch_nonce();
         assert!(left.len() >= 32);
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn first_admin_bootstrap_secrets_are_redacted_and_url_safe() {
+        let left = FirstAdminBootstrapSecret::generate();
+        let right = FirstAdminBootstrapSecret::generate();
+        let exposed = left.expose_to_initial_webview();
+        assert!(left.is_valid());
+        assert_eq!(exposed.len(), 43);
+        assert!(exposed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+        assert_ne!(exposed, right.expose_to_initial_webview());
+        assert_eq!(format!("{left:?}"), "FirstAdminBootstrapSecret([redacted])");
+        assert!(!format!("{left:?}").contains(exposed));
+    }
+
+    #[test]
+    fn packaged_sandbox_images_are_exact_digest_references() {
+        assert!(is_digest_pinned_image(&format!(
+            "registry.example.test/provenance/sandbox@sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!is_digest_pinned_image("provenance/sandbox:latest"));
+        assert!(!is_digest_pinned_image(&format!(
+            "Provenance/sandbox@sha256:{}",
+            "a".repeat(64)
+        )));
+    }
+
+    #[test]
+    fn native_build_versions_are_public_bounded_semver() {
+        assert!(is_public_build_version("0.1.0"));
+        assert!(is_public_build_version("1.2.3-rc.1"));
+        assert!(!is_public_build_version("model-selected"));
+        assert!(!is_public_build_version("1.2.3\nSECRET=value"));
     }
 }

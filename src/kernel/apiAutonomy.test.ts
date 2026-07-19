@@ -181,6 +181,10 @@ describe('autonomy API', () => {
     expect(body.workers.available).toContain(browserWorker.id);
     expect(body.features.secretVault.status).toBe('unavailable');
     expect(body.features.osSandbox.status).toBe('unavailable');
+    expect(body.features.verificationCommands).toMatchObject({
+      status: 'available',
+      reason: expect.stringContaining('trusted-host fallback'),
+    });
     expect(body.features.releaseSigning.status).toBe('unavailable');
     expect(body.features.releaseDeployment.status).toBe('unavailable');
     expect(body.features.desktopIpc.status).toBe('unavailable');

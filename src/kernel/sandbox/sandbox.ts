@@ -20,7 +20,7 @@ export interface SandboxRunResult {
 }
 
 export interface SandboxRunner {
-  readonly mode: 'docker' | 'host';
+  readonly mode: 'docker' | 'host' | 'disabled';
   /** Human-readable description of the isolation actually provided. */
   readonly isolation: string;
   run(spec: SandboxRunSpec): Promise<SandboxRunResult>;
@@ -84,6 +84,20 @@ export const createHostSandbox = (exec: SandboxExec = execFileAsync as unknown a
   },
 });
 
+/**
+ * A deliberate fail-closed runner. Server policy selects this in native
+ * desktop mode when no approved isolation boundary is healthy.
+ */
+export const createDisabledSandbox = (reason: string): SandboxRunner => ({
+  mode: 'disabled',
+  isolation: reason,
+  run: async () => ({
+    stdout: '',
+    stderr: `Command execution is disabled: ${reason}`,
+    exitCode: 126,
+  }),
+});
+
 export interface DockerSandboxConfig {
   /** Path or name of the docker executable (e.g. 'docker' or a full path). */
   dockerPath: string;
@@ -144,6 +158,7 @@ export const buildDockerRunArgs = (spec: SandboxRunSpec, config: DockerSandboxCo
   const workdir = config.containerWorkdir;
   return [
     'run', '--rm',
+    '--pull', 'never',
     '--network', 'none',
     '--read-only',
     '--tmpfs', '/tmp:rw,exec',
@@ -161,6 +176,41 @@ export const buildDockerRunArgs = (spec: SandboxRunSpec, config: DockerSandboxCo
     spec.command,
     ...spec.args,
   ];
+};
+
+const buildDockerHealthArgs = (config: DockerSandboxConfig, workspaceRoot?: string): string[] => {
+  if (!workspaceRoot) {
+    return [
+      'run', '--rm',
+      '--pull', 'never',
+      '--network', 'none',
+      '--read-only',
+      '--tmpfs', '/tmp:rw,exec',
+      '--memory', config.memory,
+      '--memory-swap', config.memory,
+      '--pids-limit', String(config.pidsLimit),
+      '--cpus', config.cpus,
+      '--cap-drop', 'ALL',
+      '--security-opt', 'no-new-privileges',
+      config.image,
+      'node', '--version',
+    ];
+  }
+  const script = [
+    "const fs=require('fs')",
+    "const cp=require('child_process')",
+    "const marker='.provenance-sandbox-health'",
+    "try{if(!fs.statSync('package.json').isFile())process.exit(2);fs.writeFileSync(marker,'ok',{flag:'wx'});cp.execFileSync('npm',['--version'],{stdio:'ignore'})}",
+    "finally{try{fs.unlinkSync(marker)}catch{}}",
+  ].join(';');
+  return buildDockerRunArgs({
+    command: 'node',
+    args: ['-e', script],
+    cwd: workspaceRoot,
+    timeoutMs: 30_000,
+    env: {},
+    maxBuffer: 64 * 1024,
+  }, config);
 };
 
 export const createDockerSandbox = (
@@ -191,13 +241,21 @@ export const createDockerSandbox = (
 export const detectDockerSandbox = async (
   exec: SandboxExec = execFileAsync as unknown as SandboxExec,
   config: DockerSandboxConfig = DEFAULT_DOCKER_SANDBOX_CONFIG,
+  env: NodeJS.ProcessEnv = process.env,
+  workspaceRoot?: string,
 ): Promise<SandboxRunner | undefined> => {
   try {
     await exec(config.dockerPath, ['version', '--format', '{{.Server.Version}}'], {
       timeout: 15000,
       windowsHide: true,
       maxBuffer: 64 * 1024,
-      env: dockerEnv(config.dockerPath, process.env),
+      env: dockerEnv(config.dockerPath, env),
+    });
+    await exec(config.dockerPath, buildDockerHealthArgs(config, workspaceRoot), {
+      timeout: 30000,
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+      env: dockerEnv(config.dockerPath, env),
     });
     return createDockerSandbox(exec, config);
   } catch {
@@ -205,14 +263,159 @@ export const detectDockerSandbox = async (
   }
 };
 
-export interface SandboxStatus {
-  status: 'available' | 'unavailable';
-  mode: 'docker' | 'host';
-  reason: string;
+export type CommandRuntimeMode = 'native-desktop' | 'standalone';
+
+export const isPinnedDockerImage = (value: string): boolean => {
+  if (value.length > 456) return false;
+  const separator = '@sha256:';
+  const separatorIndex = value.lastIndexOf(separator);
+  if (separatorIndex <= 0 || value.indexOf(separator) !== separatorIndex) return false;
+  const repository = value.slice(0, separatorIndex);
+  const digest = value.slice(separatorIndex + separator.length);
+  return repository.includes('/')
+    && !repository.startsWith('/')
+    && !repository.endsWith('/')
+    && /^[a-z0-9._:/-]+$/.test(repository)
+    && /^[a-f0-9]{64}$/.test(digest);
+};
+
+const NATIVE_DESKTOP_MARKERS = [
+  'DESKTOP_PACKAGED_RELEASE',
+  'DESKTOP_RUNTIME_OWNER_NONCE',
+  'DESKTOP_RUNTIME_OWNER_PID',
+  'DESKTOP_HOST_NONCE',
+  'DESKTOP_HOST_READY_FILE',
+] as const;
+
+export const detectCommandRuntimeMode = (env: NodeJS.ProcessEnv): CommandRuntimeMode => (
+  NATIVE_DESKTOP_MARKERS.some((name) => Boolean(env[name]?.trim())) ? 'native-desktop' : 'standalone'
+);
+
+const defaultDockerPathCandidates = (
+  env: NodeJS.ProcessEnv,
+  configuredPath: string,
+): string[] => {
+  if (configuredPath !== DEFAULT_DOCKER_SANDBOX_CONFIG.dockerPath) return [configuredPath];
+  if (process.platform !== 'win32') return [configuredPath];
+
+  const windowsRoot = path.parse(env.WINDIR?.trim() || 'C:\\Windows').root || 'C:\\';
+  const programFiles = env.ProgramW6432?.trim() || env.ProgramFiles?.trim() || path.join(windowsRoot, 'Program Files');
+  return [...new Set([
+    configuredPath,
+    path.join(programFiles, 'Docker', 'Docker', 'resources', 'bin', 'docker.exe'),
+  ])];
+};
+
+export interface CommandSandboxSelection {
+  runner: SandboxRunner;
+  runtimeMode: CommandRuntimeMode;
+  dockerHealthy: boolean;
+  trustedHostFallback: boolean;
 }
 
-export const sandboxStatus = (runner: SandboxRunner): SandboxStatus => (
-  runner.mode === 'docker'
-    ? { status: 'available', mode: 'docker', reason: runner.isolation }
-    : { status: 'unavailable', mode: 'host', reason: `No container runtime detected; ${runner.isolation}.` }
-);
+export interface ResolveCommandSandboxOptions {
+  env?: NodeJS.ProcessEnv;
+  exec?: SandboxExec;
+  config?: DockerSandboxConfig;
+  workspaceRoot?: string;
+}
+
+/**
+ * Selects command authority once at startup. Native desktop launches never
+ * fall back to the host; standalone launches retain the explicitly reported
+ * trusted-host fallback used by development and source checkouts.
+ */
+export const resolveCommandSandbox = async (
+  options: ResolveCommandSandboxOptions = {},
+): Promise<CommandSandboxSelection> => {
+  const env = options.env ?? process.env;
+  const exec = options.exec ?? execFileAsync as unknown as SandboxExec;
+  const runtimeMode = detectCommandRuntimeMode(env);
+  const baseConfig = options.config ?? DEFAULT_DOCKER_SANDBOX_CONFIG;
+  const configuredPath = env.DOCKER_PATH?.trim() || baseConfig.dockerPath;
+  const packagedRelease = env.DESKTOP_PACKAGED_RELEASE?.trim() === '1';
+  const configuredImage = env.PROVENANCE_SANDBOX_IMAGE?.trim();
+
+  if (packagedRelease && (!configuredImage || !isPinnedDockerImage(configuredImage))) {
+    return {
+      runner: createDisabledSandbox(
+        'packaged desktop mode requires a build-pinned Docker image reference with a sha256 digest',
+      ),
+      runtimeMode,
+      dockerHealthy: false,
+      trustedHostFallback: false,
+    };
+  }
+  const config = configuredImage ? { ...baseConfig, image: configuredImage } : baseConfig;
+
+  for (const dockerPath of defaultDockerPathCandidates(env, configuredPath)) {
+    const runner = await detectDockerSandbox(
+      exec,
+      { ...config, dockerPath },
+      env,
+      options.workspaceRoot,
+    );
+    if (runner) {
+      return { runner, runtimeMode, dockerHealthy: true, trustedHostFallback: false };
+    }
+  }
+
+  if (runtimeMode === 'native-desktop') {
+    return {
+      runner: createDisabledSandbox(
+        'native desktop mode requires a healthy Docker runtime and the configured image to be present',
+      ),
+      runtimeMode,
+      dockerHealthy: false,
+      trustedHostFallback: false,
+    };
+  }
+
+  return {
+    runner: createHostSandbox(exec),
+    runtimeMode,
+    dockerHealthy: false,
+    trustedHostFallback: true,
+  };
+};
+
+export interface SandboxStatus {
+  status: 'available' | 'unavailable';
+  mode: 'docker' | 'host' | 'disabled';
+  reason: string;
+  commandExecution: { status: 'available' | 'unavailable'; reason: string };
+}
+
+export const sandboxStatus = (runner: SandboxRunner): SandboxStatus => {
+  if (runner.mode === 'docker') {
+    return {
+      status: 'available',
+      mode: 'docker',
+      reason: runner.isolation,
+      commandExecution: {
+        status: 'available',
+        reason: 'Allowlisted verification commands execute inside the healthy Docker isolation boundary.',
+      },
+    };
+  }
+  if (runner.mode === 'host') {
+    return {
+      status: 'unavailable',
+      mode: 'host',
+      reason: `No container runtime detected; ${runner.isolation}.`,
+      commandExecution: {
+        status: 'available',
+        reason: 'Standalone trusted-host fallback is enabled; commands are allowlisted but have no OS isolation.',
+      },
+    };
+  }
+  return {
+    status: 'unavailable',
+    mode: 'disabled',
+    reason: runner.isolation,
+    commandExecution: {
+      status: 'unavailable',
+      reason: `Command execution is disabled because ${runner.isolation}.`,
+    },
+  };
+};

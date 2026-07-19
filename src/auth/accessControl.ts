@@ -5,10 +5,23 @@ import type { UserStore } from './users';
 
 export type AccessMode = 'open' | 'operator_token' | 'multi_user';
 
+export interface AccessPrincipal {
+  principalId: string;
+  mode: AccessMode;
+  role: 'admin' | 'operator' | 'viewer';
+}
+
+const requestPrincipals = new WeakMap<express.Request, AccessPrincipal>();
+
+export const getRequestAccessPrincipal = (req: express.Request): AccessPrincipal | undefined => (
+  requestPrincipals.get(req)
+);
+
 export interface AccessControlDeps {
   userStore: UserStore;
   operatorToken?: string;
   sessionSecret: string;
+  firstAdminBootstrapPending?: () => boolean;
 }
 
 const timingSafeEqual = (a: string, b: string): boolean => {
@@ -31,6 +44,8 @@ export const resolveAccessMode = (userCount: number, operatorToken: string | und
 
 /**
  * Unified guard for mutations and authoritative kernel reads. Precedence:
+ * - native first-admin bootstrap pending: every guarded API request is denied;
+ *   the auth router separately exposes only status and account bootstrap.
  * - multi_user (any users exist): a valid, unexpired session token whose role
  *   is admin or operator is required; viewers are read-only.
  * - operator_token (no users, token configured): the shared bearer token.
@@ -42,6 +57,12 @@ export const resolveAccessMode = (userCount: number, operatorToken: string | und
  * control is configured. Viewers may read them.
  */
 export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandler => (req, res, next) => {
+  if (deps.firstAdminBootstrapPending?.()) {
+    res.status(401).json({
+      error: 'First-admin bootstrap must be completed from the native desktop launch.',
+    });
+    return;
+  }
   const readOnly = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
   const originalPath = req.originalUrl.split('?', 1)[0];
   const kernelRead = readOnly && (
@@ -57,7 +78,14 @@ export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandl
   if (readOnly && (!kernelRead || publicRuntimeRead)) return next();
 
   const mode = resolveAccessMode(deps.userStore.count(), deps.operatorToken);
-  if (mode === 'open') return next();
+  if (mode === 'open') {
+    requestPrincipals.set(req, {
+      principalId: 'access:loopback-open',
+      mode,
+      role: 'operator',
+    });
+    return next();
+  }
 
   const token = bearer(req);
   if (!token) {
@@ -70,6 +98,11 @@ export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandl
       res.status(401).json({ error: 'A valid operator bearer token is required.' });
       return;
     }
+    requestPrincipals.set(req, {
+      principalId: 'access:shared-operator-token',
+      mode,
+      role: 'operator',
+    });
     return next();
   }
 
@@ -94,6 +127,11 @@ export const createAccessGuard = (deps: AccessControlDeps): express.RequestHandl
     res.status(403).json({ error: 'Your role is read-only and cannot perform this action.' });
     return;
   }
+  requestPrincipals.set(req, {
+    principalId: `user:${claims.userId}`,
+    mode,
+    role: claims.role,
+  });
   (req as express.Request & { user?: unknown }).user = claims;
   return next();
 };

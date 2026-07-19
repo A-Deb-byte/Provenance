@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { browserWorker } from './testFixtures';
+import { browserScope, browserWorker } from './testFixtures';
 import { createWorkerRegistry } from './registry';
 
 describe('worker registry', () => {
@@ -29,5 +29,43 @@ describe('worker registry', () => {
       ...browserWorker,
       supportedActions: ['connector.send'],
     }])).toThrow('Invalid worker');
+  });
+
+  it('allows only a one-way availability activation with unchanged authority', () => {
+    const configured = {
+      ...browserWorker,
+      availability: 'configured' as const,
+      unavailableReason: 'Runtime health has not passed.',
+    };
+    const registry = createWorkerRegistry([configured]);
+    const available = {
+      ...configured,
+      availability: 'available' as const,
+      registeredAt: '2026-07-17T00:00:00.000Z',
+    };
+
+    registry.activate(available);
+
+    expect(registry.report().available).toEqual([browserWorker.id]);
+    expect(() => registry.activate(available)).toThrow(/already available/);
+  });
+
+  it('rejects authority expansion during late runtime activation', () => {
+    const configured = {
+      ...browserWorker,
+      availability: 'configured' as const,
+      unavailableReason: 'Runtime health has not passed.',
+    };
+    const registry = createWorkerRegistry([configured]);
+
+    expect(() => registry.activate({
+      ...configured,
+      availability: 'available',
+      configuredScopes: [{
+        ...browserScope,
+        origins: ['https://example.com', 'https://expanded.example'],
+      }],
+    })).toThrow(/cannot change configured authority/);
+    expect(registry.report().configured).toEqual([browserWorker.id]);
   });
 });

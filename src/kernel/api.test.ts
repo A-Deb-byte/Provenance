@@ -7,6 +7,7 @@ import express from 'express';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createApprovalRecord } from './approvals';
 import { createKernelRouter } from './api';
+import { createSkillEvaluationSource } from './skills/evaluationSuite';
 import { createEmptyKernelState, writeKernelState } from './store';
 import {
   ApprovalRecord,
@@ -26,6 +27,13 @@ let workspaceRoot = '';
 let outsideWorkspaceRoot = '';
 let server: Server | undefined;
 let baseUrl = '';
+
+const apiEvaluatorSource = createSkillEvaluationSource({
+  evaluatorId: 'evaluator:api-quality',
+  sourceId: 'evaluation-source:api-v1',
+  cases: [{ id: 'oracle_1', input: ' B ', expectedOutput: 'B', sourceRef: 'fixture:api_oracle_1' }],
+  observedAt: '2026-07-12T00:00:00.000Z',
+});
 
 const goalInput = (root = workspaceRoot) => ({
   objective: 'Verify the API fixture',
@@ -77,7 +85,15 @@ beforeEach(async () => {
   }), 'utf8');
 
   const app = express();
-  const routerOptions = { runtimeDir, allowedWorkspaceRoot: workspaceRoot };
+  const routerOptions = {
+    runtimeDir,
+    allowedWorkspaceRoot: workspaceRoot,
+    skillEvaluatorAllowlist: [apiEvaluatorSource.evaluatorId],
+    skillEvaluationSourceResolver: async (sourceId: string) => (
+      sourceId === apiEvaluatorSource.sourceId ? apiEvaluatorSource : undefined
+    ),
+    skillAuthorPrincipal: () => 'user:api-skill-author',
+  };
   const router = createKernelRouter(routerOptions);
   routerOptions.allowedWorkspaceRoot = outsideWorkspaceRoot;
   app.use(express.json());
@@ -301,14 +317,63 @@ describe('kernel API', () => {
         observedAt: '2026-07-12T00:00:00.000Z',
       },
     };
+    const rejectedCallerOracle = await postJson<{ error: string }>('/skill-evaluation-suites', {
+      sourceId: apiEvaluatorSource.sourceId,
+      cases: apiEvaluatorSource.cases,
+    });
+    expect(rejectedCallerOracle.response.status).toBe(400);
+    expect(rejectedCallerOracle.body.error).toMatch(/raw oracle expectations/i);
+
+    const suite = await postJson<{
+      suiteId: string;
+      suiteHash: string;
+      caseCount: number;
+    }>('/skill-evaluation-suites', {
+      sourceId: apiEvaluatorSource.sourceId,
+    });
+    expect(suite.response.status).toBe(201);
+    expect(suite.body.caseCount).toBe(1);
+
+    const rejectedSelfClaim = await postJson<{ error: string }>('/skills/synthesize', {
+      manifest,
+      trainingCases: [{ id: 'train_1', input: ' A ', expectedOutput: 'A', kind: 'train' }],
+      evaluationSuiteId: suite.body.suiteId,
+      evaluationSuiteHash: suite.body.suiteHash,
+      author: { authorityType: 'provider', principalId: 'attacker' },
+    });
+    expect(rejectedSelfClaim.response.status).toBe(400);
+    expect(rejectedSelfClaim.body.error).toMatch(/caller-supplied skill author/i);
+
+    const rejectedOverlap = await postJson<{ error: string }>('/skills/synthesize', {
+      manifest,
+      trainingCases: [{ id: 'different_id', input: ' B ', expectedOutput: 'attacker', kind: 'train' }],
+      evaluationSuiteId: suite.body.suiteId,
+      evaluationSuiteHash: suite.body.suiteHash,
+    });
+    expect(rejectedOverlap.response.status).toBe(400);
+    expect(rejectedOverlap.body.error).toMatch(/overlap the held-out evaluator suite/i);
+
+    const rejectedRawOracle = await postJson<{ error: string }>('/skills/synthesize', {
+      manifest,
+      trainingCases: [{ id: 'train_1', input: ' A ', expectedOutput: 'A', kind: 'train' }],
+      evaluationSuiteId: suite.body.suiteId,
+      evaluationSuiteHash: suite.body.suiteHash,
+      replayCases: [{ id: 'replay_1', input: ' B ', expectedOutput: 'B', kind: 'replay' }],
+    });
+    expect(rejectedRawOracle.response.status).toBe(400);
+    expect(rejectedRawOracle.body.error).toMatch(/raw replay expectations/i);
+
     const created = await postJson<SkillPackage>('/skills/synthesize', {
       manifest,
       trainingCases: [{ id: 'train_1', input: ' A ', expectedOutput: 'A', kind: 'train' }],
-      replayCases: [{ id: 'replay_1', input: ' B ', expectedOutput: 'B', kind: 'replay' }],
+      evaluationSuiteId: suite.body.suiteId,
+      evaluationSuiteHash: suite.body.suiteHash,
     });
     expect(created.response.status).toBe(201);
     const evaluated = await postJson<SkillEvaluation>(`/skills/${created.body.id}/evaluate`, {});
     expect(evaluated.body.eligibleForCanary).toBe(true);
+    expect(evaluated.body).not.toHaveProperty('caseResults');
+    expect(JSON.stringify(evaluated.body)).not.toContain('actualOutput');
     const activated = await postJson<SkillActivation>(`/skills/${created.body.id}/canary`, { maxRuns: 1 });
     expect(activated.body.status).toBe('canary');
     const rejectedOracle = await postJson<{ error: string }>(`/skills/${created.body.id}/canary-runs`, {
@@ -320,7 +385,7 @@ describe('kernel API', () => {
     const run = await postJson<{ caseId: string; passed: boolean }>(`/skills/${created.body.id}/canary-runs`, {});
     expect(run.response.status).toBe(200);
     expect(run.body.passed).toBe(true);
-    expect(run.body.caseId).toBe('kernel_canary_v1_0');
+    expect(run.body.caseId).toBe('oracle_1');
     const promoted = await postJson<SkillPackage>(`/skills/${created.body.id}/promote`, {});
     expect(promoted.body.status).toBe('promoted');
     const invoked = await postJson<{ output: string }>(`/skills/${created.body.id}/invoke`, { input: ' D ' });
@@ -328,7 +393,15 @@ describe('kernel API', () => {
 
     const skills = await requestJson<{ skills: SkillPackage[] }>('/skills');
     const evaluations = await requestJson<{ evaluations: SkillEvaluation[] }>('/skill-evaluations');
+    const suites = await requestJson<{ suites: Array<{ suiteId: string; suiteHash: string }> }>(
+      '/skill-evaluation-suites',
+    );
     expect(skills.body.skills).toHaveLength(1);
     expect(evaluations.body.evaluations).toHaveLength(1);
+    expect(JSON.stringify(evaluations.body.evaluations)).not.toContain('actualOutput');
+    expect(suites.body.suites).toEqual([
+      expect.objectContaining({ suiteId: suite.body.suiteId, suiteHash: suite.body.suiteHash }),
+    ]);
+    expect(JSON.stringify(suites.body.suites)).not.toContain('expectedOutput');
   });
 });

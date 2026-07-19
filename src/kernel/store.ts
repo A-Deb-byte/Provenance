@@ -19,6 +19,7 @@ export const createEmptyKernelState = (): KernelState => ({
   tasks: [],
   approvals: [],
   memories: [],
+  skillEvaluationSuites: [],
   skillPackages: [],
   skillEvaluations: [],
   skillActivations: [],
@@ -36,6 +37,9 @@ const normalizeKernelState = (parsed: Partial<KernelState>): KernelState => ({
   tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
   approvals: Array.isArray(parsed.approvals) ? parsed.approvals : [],
   memories: Array.isArray(parsed.memories) ? parsed.memories : [],
+  ...(Array.isArray(parsed.skillEvaluationSuites)
+    ? { skillEvaluationSuites: parsed.skillEvaluationSuites }
+    : {}),
   skillPackages: Array.isArray(parsed.skillPackages) ? parsed.skillPackages : [],
   skillEvaluations: Array.isArray(parsed.skillEvaluations) ? parsed.skillEvaluations : [],
   skillActivations: Array.isArray(parsed.skillActivations) ? parsed.skillActivations : [],

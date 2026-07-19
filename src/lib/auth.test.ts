@@ -4,6 +4,7 @@ import {
   bootstrapAdmin,
   clearAuthSession,
   getAuthSession,
+  initializeFirstAdminBootstrapSecret,
   login,
   logout,
   setAuthSession,
@@ -14,6 +15,7 @@ import {
 afterEach(() => {
   clearAuthSession();
   sessionStorage.clear();
+  window.history.replaceState({}, '', '/');
   vi.unstubAllGlobals();
 });
 
@@ -67,7 +69,41 @@ describe('authenticated browser transport', () => {
     await bootstrapAdmin('first-admin', 'password-value');
     expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/auth/users', expect.objectContaining({ method: 'POST' }));
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/auth/login', expect.objectContaining({ method: 'POST' }));
+    expect((fetchMock.mock.calls[0][1]?.headers as Headers)
+      .has('x-provenance-first-admin-bootstrap')).toBe(false);
     expect(getAuthSession()?.username).toBe('first-admin');
+  });
+
+  it('consumes the native launch fragment and sends it only on first-admin creation', async () => {
+    const bootstrapSecret = 'C'.repeat(43);
+    window.history.replaceState(
+      { fixture: true },
+      '',
+      `/?view=cockpit#provenance-first-admin=${bootstrapSecret}&preserved=value`,
+    );
+    initializeFirstAdminBootstrapSecret();
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({ bootstrap: true }) } as Response)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          token: 'new-session', username: 'first-admin', role: 'admin', expiresAt: '2099-01-01T00:00:00.000Z',
+        }),
+      } as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect(window.location.hash).toBe('#preserved=value');
+    expect(window.location.href).not.toContain(bootstrapSecret);
+    expect(JSON.stringify(window.history.state)).not.toContain(bootstrapSecret);
+    expect(JSON.stringify(sessionStorage)).not.toContain(bootstrapSecret);
+
+    await bootstrapAdmin('first-admin', 'password-value');
+
+    const bootstrapHeaders = fetchMock.mock.calls[0][1]?.headers as Headers;
+    const loginHeaders = new Headers(fetchMock.mock.calls[1][1]?.headers);
+    expect(bootstrapHeaders.get('x-provenance-first-admin-bootstrap')).toBe(bootstrapSecret);
+    expect(loginHeaders.has('x-provenance-first-admin-bootstrap')).toBe(false);
   });
 
   it('attaches the loaded operator token when bootstrapping a protected deployment', async () => {

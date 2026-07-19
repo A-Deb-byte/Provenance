@@ -202,4 +202,41 @@ describe('command worker', () => {
       }
     }
   });
+
+  it('fails closed before consuming a capability when command execution is disabled', async () => {
+    const run = vi.fn(async () => ({ stdout: 'should not run', stderr: '', exitCode: 0 }));
+    const token = createCapabilityToken({
+      family: 'command.run',
+      goalId: 'goal_1',
+      taskId: 'task_1',
+      workspaceRoot: tempDir,
+      command: 'npm',
+      args: ['--version'],
+      cwd: tempDir,
+      riskLevel: 'L1',
+      maxOperations: 1,
+      expiresAt: '2999-01-01T00:00:00.000Z',
+    });
+
+    const result = await runKernelCommand(token, {
+      command: 'npm',
+      args: ['--version'],
+      cwd: tempDir,
+      expectedEvidence: 'npm version prints',
+    }, {
+      sandbox: {
+        mode: 'disabled',
+        isolation: 'native desktop mode requires healthy Docker isolation',
+        run,
+      },
+    });
+
+    expect(result).toMatchObject({
+      summary: 'Command execution is unavailable.',
+      exitCode: 126,
+      stderr: expect.stringContaining('requires healthy Docker isolation'),
+    });
+    expect(run).not.toHaveBeenCalled();
+    expect(token.usedOperations).toBe(0);
+  });
 });

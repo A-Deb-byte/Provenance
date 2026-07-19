@@ -328,6 +328,7 @@ export const createReleaseLifecycle = (options: ReleaseLifecycleOptions) => {
     let switched = false;
     let preparedProcess: PreparedReleaseProcess | undefined;
     let activationFailure = false;
+    let commitAttempted = false;
 
     try {
       await mkdir(stagingDir, { recursive: true });
@@ -365,6 +366,7 @@ export const createReleaseLifecycle = (options: ReleaseLifecycleOptions) => {
 
       await atomicWrite(activeManifestPath, JSON.stringify(manifest, null, 2));
       switched = true;
+      commitAttempted = true;
       await options.supervisor.commit(preparedProcess);
       preparedProcess = undefined;
 
@@ -374,28 +376,64 @@ export const createReleaseLifecycle = (options: ReleaseLifecycleOptions) => {
       };
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'Release installation failed.';
-      if (preparedProcess) await options.supervisor.abort(preparedProcess).catch(() => undefined);
+      let cleanupIssue: string | undefined;
+      if (preparedProcess) {
+        try {
+          await options.supervisor.abort(preparedProcess);
+        } catch (abortError) {
+          cleanupIssue = `candidate abort failed: ${abortError instanceof Error ? abortError.message : 'unknown abort error'}`;
+        }
+      }
+      if (commitAttempted) {
+        cleanupIssue ??= 'release commit failed after manifest switch; prior process-tree ownership is uncertain';
+      }
+      try {
+        const processStatus = options.supervisor.getStatus();
+        if (processStatus.pendingReleaseIds.length > 0) {
+          cleanupIssue ??= `supervisor still tracks pending releases: ${processStatus.pendingReleaseIds.join(', ')}`;
+        }
+      } catch (statusError) {
+        cleanupIssue ??= `supervisor status could not be inspected: ${statusError instanceof Error ? statusError.message : 'unknown status error'}`;
+      }
+      const cleanupCleared = cleanupIssue ? await clearSupervisor() : true;
+      let manifestRollbackError: unknown;
       if (switched) {
         try {
           if (previous.raw !== undefined) await atomicWrite(activeManifestPath, previous.raw);
           else await rm(activeManifestPath, { force: true });
         } catch (rollbackError) {
-          return {
-            status: 'rollback_failed',
-            reasonCode: 'rollback_failed',
-            reason: `Release failed (${reason}) and the active manifest could not be restored: ${rollbackError instanceof Error ? rollbackError.message : 'unknown rollback error'}`,
-            manifest,
-            previousManifest: previous.manifest,
-          };
-        } finally {
-          if (installed) await rm(finalDir, { recursive: true, force: true }).catch(() => undefined);
+          manifestRollbackError = rollbackError;
         }
+      }
+      if (installed && cleanupCleared) {
+        await rm(finalDir, { recursive: true, force: true }).catch(() => undefined);
+      }
+      if (manifestRollbackError) {
+        const cleanupSuffix = cleanupIssue
+          ? ` Process cleanup also failed (${cleanupIssue}); supervisor-wide cleanup ${cleanupCleared ? 'completed' : 'could not be confirmed'}.`
+          : '';
+        return {
+          status: 'rollback_failed',
+          reasonCode: 'rollback_failed',
+          reason: `Release failed (${reason}) and the active manifest could not be restored: ${manifestRollbackError instanceof Error ? manifestRollbackError.message : 'unknown rollback error'}.${cleanupSuffix}`,
+          manifest, previousManifest: previous.manifest,
+        };
+      }
+      if (cleanupIssue) {
+        return {
+          status: 'rollback_failed',
+          reasonCode: 'rollback_failed',
+          reason: `Release failed (${reason}) and process-tree cleanup was not completed by the candidate operation (${cleanupIssue}); supervisor-wide cleanup ${cleanupCleared ? 'completed but stopped the prior active process' : 'could not be confirmed'}.`,
+          manifest,
+          previousManifest: previous.manifest,
+        };
+      }
+      if (switched) {
         return {
           status: 'rolled_back', reasonCode: 'health_check_failed', reason,
           manifest, previousManifest: previous.manifest,
         };
       }
-      if (installed) await rm(finalDir, { recursive: true, force: true }).catch(() => undefined);
       await rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
       if (activationFailure) {
         return {
@@ -528,9 +566,19 @@ export const createReleaseLifecycle = (options: ReleaseLifecycleOptions) => {
       await options.supervisor.commit(preparedProcess);
       preparedProcess = undefined;
     } catch (error) {
-      if (preparedProcess) await options.supervisor.abort(preparedProcess).catch(() => undefined);
+      let abortFailure: string | undefined;
+      if (preparedProcess) {
+        try {
+          await options.supervisor.abort(preparedProcess);
+        } catch (abortError) {
+          abortFailure = abortError instanceof Error ? abortError.message : 'unknown abort error';
+        }
+      }
       const cleared = await clearSupervisor();
-      const reason = error instanceof Error ? error.message : 'unknown supervised process error';
+      const failureReason = error instanceof Error ? error.message : 'unknown supervised process error';
+      const reason = abortFailure
+        ? `${failureReason}; candidate abort also failed: ${abortFailure}`
+        : failureReason;
       return blocked(
         'process_restore_failed',
         cleared

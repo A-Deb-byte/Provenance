@@ -230,6 +230,44 @@ describe('staged release lifecycle', () => {
     expect(installedEntries).toEqual([]);
   });
 
+  it('reports rollback failure when candidate abort and supervisor-wide cleanup cannot confirm termination', async () => {
+    const artifact = packageArtifact();
+    const signed = signedProposal(artifact);
+    const prepared = Object.freeze({
+      id: 'process_release_1',
+      releaseId: 'release_1',
+    }) satisfies PreparedReleaseProcess;
+    const supervisor: ReleaseProcessSupervisor = {
+      prepare: vi.fn(async () => prepared),
+      commit: vi.fn(async () => {
+        throw new Error('Previous process tree could not be terminated.');
+      }),
+      abort: vi.fn(async () => {
+        throw new Error('Candidate process tree could not be terminated.');
+      }),
+      getStatus: () => ({ pendingReleaseIds: ['release_1'] }),
+      shutdown: vi.fn(async () => {
+        throw new Error('Process-tree cleanup remains uncertain.');
+      }),
+    };
+    const lifecycle = createReleaseLifecycle({
+      releasesDir: path.join(dir, 'releases'),
+      publicKey: signed.publicKeyBase64,
+      resolveArtifact: async () => artifact,
+      verifyEvaluationReference: async () => true,
+      healthCheck: async () => ({ ok: true, reason: 'ok' }),
+      supervisor,
+    });
+
+    const result = await lifecycle.activate(signed.proposal, 'artifact_release_1');
+
+    expect(result).toMatchObject({ status: 'rollback_failed', reasonCode: 'rollback_failed' });
+    expect(result.reason).toMatch(/candidate abort failed/i);
+    expect(result.reason).toMatch(/could not be confirmed/i);
+    expect(supervisor.abort).toHaveBeenCalledWith(prepared);
+    expect(supervisor.shutdown).toHaveBeenCalledTimes(2);
+  });
+
   it('reauthenticates installed bytes and restores the active process without rewriting the manifest', async () => {
     const artifact = packageArtifact();
     const signed = signedProposal(artifact);

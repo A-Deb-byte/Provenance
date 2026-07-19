@@ -1,12 +1,12 @@
 {
   "name": "provenance",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A local-first, self-hosted AI agent with a trusted kernel — models propose, the kernel decides, and every action leaves verifiable evidence.",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --sourcemap --metafile=dist/server.meta.json --outfile=dist/server.cjs && node scripts/generate-third-party-notices.mjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
@@ -15,8 +15,19 @@
     "verify-ledger": "node scripts/verify-ledger.mjs",
     "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "desktop:test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "desktop:acceptance": "tsx scripts/desktop-acceptance.mts",
     "desktop:dev": "npm run build && node -r dotenv/config ./node_modules/@tauri-apps/cli/tauri.js dev --config src-tauri/tauri.conf.json",
-    "desktop:build": "npm run build && tauri build --config src-tauri/tauri.conf.json"
+    "desktop:build": "npm run build && tauri build --config src-tauri/tauri.conf.json",
+    "desktop:release:plan": "node scripts/desktop-release.mjs plan",
+    "desktop:release:build": "node scripts/desktop-release.mjs build-unsigned",
+    "desktop:release:build-unsigned": "node scripts/desktop-release.mjs build-unsigned",
+    "desktop:release:verify-unsigned": "node scripts/desktop-release.mjs verify-unsigned",
+    "desktop:release:bundle-signed-native": "node scripts/desktop-release.mjs bundle-signed-native",
+    "desktop:release:manifest": "node scripts/desktop-release.mjs manifest",
+    "desktop:release:verify": "node scripts/desktop-release.mjs verify",
+    "desktop:release:test": "vitest run scripts/desktop-release.test.ts scripts/updater-signature.test.ts scripts/generate-rust-third-party-notices.test.ts scripts/license-policy.test.ts",
+    "desktop:licenses": "node scripts/generate-rust-third-party-notices.mjs",
+    "desktop:resource-smoke": "node scripts/packaged-server-smoke.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -34,7 +45,7 @@
     "vite": "^6.2.3"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/cli": "2.11.4",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
@@ -43,6 +54,7 @@
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "jsdom": "^29.1.1",
+    "spdx-expression-parse": "5.0.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",

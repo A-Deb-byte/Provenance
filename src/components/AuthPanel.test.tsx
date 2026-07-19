@@ -1,17 +1,63 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { clearAuthSession } from '../lib/auth';
+import { clearAuthSession, initializeFirstAdminBootstrapSecret } from '../lib/auth';
 import { AuthPanel } from './AuthPanel';
 
 afterEach(() => {
   cleanup();
   clearAuthSession();
   sessionStorage.clear();
+  window.history.replaceState({}, '', '/');
   vi.unstubAllGlobals();
 });
 
 describe('AuthPanel', () => {
+  it('uses the transient native bootstrap fragment without retaining it in the URL or storage', async () => {
+    const bootstrapSecret = 'D'.repeat(43);
+    window.history.replaceState({}, '', `/#provenance-first-admin=${bootstrapSecret}`);
+    initializeFirstAdminBootstrapSecret();
+    let bootstrapped = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === '/api/auth/status') {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ mode: bootstrapped ? 'multi_user' : 'open', userCount: bootstrapped ? 1 : 0 }),
+        } as Response;
+      }
+      if (url === '/api/auth/users') {
+        expect(new Headers(init?.headers).get('x-provenance-first-admin-bootstrap')).toBe(bootstrapSecret);
+        bootstrapped = true;
+        return { ok: true, status: 201, json: async () => ({ bootstrap: true }) } as Response;
+      }
+      if (url === '/api/auth/login') {
+        expect(new Headers(init?.headers).has('x-provenance-first-admin-bootstrap')).toBe(false);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            token: 'native-session', username: 'admin1', role: 'admin', expiresAt: '2099-01-01T00:00:00.000Z',
+          }),
+        } as Response;
+      }
+      return { ok: true, status: 204 } as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+
+    expect(window.location.hash).toBe('');
+    expect(window.location.href).not.toContain(bootstrapSecret);
+    render(<AuthPanel />);
+    await user.type(await screen.findByLabelText('Username'), 'admin1');
+    await user.type(screen.getByLabelText('Password'), 'adminpassword');
+    await user.click(screen.getByRole('button', { name: 'Create admin' }));
+
+    expect(await screen.findByText('Signed in as admin1')).toBeInTheDocument();
+    expect(JSON.stringify(sessionStorage)).not.toContain(bootstrapSecret);
+  });
+
   it('bootstraps the first admin and exposes a working logout control', async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);

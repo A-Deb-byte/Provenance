@@ -283,6 +283,40 @@ describe('automation execution', () => {
     }),
   });
 
+  it('activates a fixed-authority runtime without restarting the kernel', async () => {
+    const configured: WorkerRegistration = {
+      ...browserWorker,
+      availability: 'configured',
+      unavailableReason: 'Authenticated runtime health is pending.',
+    };
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [configured],
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation(automationInput(goal.id));
+    await expect(kernel.setAutomationEnabled(automation.id, true, 'Premature enable.'))
+      .rejects.toThrow(/not available/);
+
+    expect(() => kernel.activateWorkerRuntime({
+      ...browserWorker,
+      configuredScopes: [{
+        ...browserScope,
+        origins: ['https://example.com', 'https://expanded.example'],
+      }],
+    }, fakeWorker('Expanded authority must not execute.'))).toThrow(/cannot change configured authority/);
+    expect(kernel.getWorkers().report.configured).toEqual([browserWorker.id]);
+
+    kernel.activateWorkerRuntime(browserWorker, fakeWorker('Runtime activated safely.'));
+    await kernel.setAutomationEnabled(automation.id, true, 'Authority is now active.');
+    const outcome = await kernel.runAutomation(automation.id);
+
+    expect(kernel.getWorkers().report.available).toEqual([browserWorker.id]);
+    expect(outcome.dispatch?.status).toBe('succeeded');
+    expect(outcome.content).toBe('Runtime activated safely.');
+  });
+
   it('runs an enabled automation through grant, dispatch, and observation evidence', async () => {
     const kernel = createKernelService({
       runtimeDir,
@@ -491,7 +525,7 @@ describe('automation execution', () => {
     });
     expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
     await kernel.setStopAll(false, 'Review the uncertain mutation before continuing.');
-    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain desktop outcome/);
+    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain mutation outcome/);
   });
 
   it('never dispatches two concurrent runs of the same automation', async () => {
@@ -531,7 +565,7 @@ describe('automation execution', () => {
     await expect(first).resolves.toMatchObject({ dispatch: { status: 'succeeded' } });
   });
 
-  it('bounds a non-cooperative worker with the automation runtime timeout', async () => {
+  it('fences a timed-out browser mutation as uncertain and blocks automatic retry', async () => {
     let signalSeen: AbortSignal | undefined;
     const kernel = createKernelService({
       runtimeDir,
@@ -549,15 +583,70 @@ describe('automation execution', () => {
     const goal = await kernel.createGoal(goalInput());
     const automation = await kernel.createAutomation({
       ...automationInput(goal.id),
-      budget: { maxRuns: 1, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 25 },
+      name: 'Navigate with a bounded runtime',
+      riskLevel: 'L2',
+      action: {
+        type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/account',
+      },
+      budget: { maxRuns: 2, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 25 },
     });
     await kernel.setAutomationEnabled(automation.id, true, 'Enable timeout test.');
+    const approval = await kernel.runAutomation(automation.id);
+    await kernel.decideApproval(approval.approvalId!, 'approved', 'Approve one exact browser navigation.');
 
     const outcome = await kernel.runAutomation(automation.id);
 
     expect(signalSeen?.aborted).toBe(true);
-    expect(outcome.dispatch).toMatchObject({ status: 'failed', errorCode: 'timeout' });
-    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_failed');
+    expect(outcome.dispatch).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
+    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain mutation outcome/);
+  });
+
+  it('fences a browser mutation interrupted by Stop All as uncertain', async () => {
+    let announceStarted!: () => void;
+    const started = new Promise<void>((resolve) => { announceStarted = resolve; });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: {
+        [browserWorker.id]: {
+          execute: async (_intent, options) => {
+            announceStarted();
+            return await new Promise((resolve) => {
+              options.signal?.addEventListener('abort', () => resolve({
+                status: 'succeeded' as const,
+                summary: 'Browser navigation returned after cancellation.',
+                sourceRef: 'https://example.com/account',
+              }), { once: true });
+            });
+          },
+        },
+      },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      ...automationInput(goal.id),
+      name: 'Navigate under Stop All fencing',
+      riskLevel: 'L2',
+      action: {
+        type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/account',
+      },
+      budget: { maxRuns: 2, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 5_000 },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable browser interruption test.');
+    const approval = await kernel.runAutomation(automation.id);
+    await kernel.decideApproval(approval.approvalId!, 'approved', 'Approve one exact browser navigation.');
+
+    const pending = kernel.runAutomation(automation.id);
+    await started;
+    await kernel.setStopAll(true, 'Interrupt the browser mutation.');
+    const outcome = await pending;
+
+    expect(outcome.dispatch).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
+    await kernel.setStopAll(false, 'Review the uncertain browser mutation.');
+    await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain mutation outcome/);
   });
 
   it('fences a successful result when automation authority changes during dispatch', async () => {

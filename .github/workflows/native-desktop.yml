@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_ABOUT_VERSION: 0.9.1
+  CARGO_ABOUT_ARCHIVE_URL: https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.1/cargo-about-0.9.1-x86_64-pc-windows-msvc.tar.gz
+  CARGO_ABOUT_ARCHIVE_SHA256: 318893aff6b9efd60f70470f5827b9577ae20a805cf9732d5612862a78508581
+  CARGO_ABOUT_EXE_SHA256: e15e1af0b7c671bac972b21916b86726d0bf183ae121c85fb645bc618e911d3f
+
 concurrency:
   group: native-desktop-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,24 +26,56 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 22.23.1
           cache: npm
 
-      - name: Set up stable Rust MSVC
+      - name: Set up pinned Rust MSVC
         shell: pwsh
         run: |
-          rustup toolchain install stable --profile minimal --no-self-update
-          rustup default stable
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          rustup default 1.97.0
           rustup target add x86_64-pc-windows-msvc
           rustc --version
 
       - name: Install JavaScript dependencies
         run: npm ci
+
+      - name: Provision hash-pinned cargo-about
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'cargo-about-0.9.1.tar.gz'
+          $destination = Join-Path $env:RUNNER_TEMP 'cargo-about-0.9.1'
+          Invoke-WebRequest -Uri $env:CARGO_ABOUT_ARCHIVE_URL -OutFile $archive
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne
+              $env:CARGO_ABOUT_ARCHIVE_SHA256) {
+            throw 'The cargo-about archive digest does not match the pinned release asset.'
+          }
+          New-Item -ItemType Directory -Path $destination | Out-Null
+          & tar.exe -xzf $archive -C $destination
+          if ($LASTEXITCODE -ne 0) { throw 'The pinned cargo-about archive could not be extracted.' }
+          $reparsePoints = @(Get-ChildItem -LiteralPath $destination -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          if ($reparsePoints.Count -ne 0) { throw 'The cargo-about archive contains a reparse point.' }
+          $executables = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter cargo-about.exe)
+          if ($executables.Count -ne 1) { throw 'The cargo-about archive must contain exactly one executable.' }
+          $cargoAbout = $executables[0]
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cargoAbout.FullName).Hash.ToLowerInvariant()
+          if ($exeHash -cne $env:CARGO_ABOUT_EXE_SHA256 -or
+              ((& $cargoAbout.FullName --version | Out-String).Trim()) -cne
+                "cargo-about $env:CARGO_ABOUT_VERSION") {
+            throw 'The pinned cargo-about executable has an unexpected identity.'
+          }
+          "PROVENANCE_CARGO_ABOUT=$($cargoAbout.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_SHA256=$exeHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_VERSION=$env:CARGO_ABOUT_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_TEST_CARGO_ABOUT=$($cargoAbout.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: TypeScript lint
         run: npm run lint
@@ -45,8 +83,23 @@ jobs:
       - name: TypeScript tests
         run: npm test
 
+      - name: Desktop release policy tests
+        run: npm run desktop:release:test
+
+      - name: Deterministic desktop acceptance
+        run: npm run desktop:acceptance
+
       - name: Production web and server build
         run: npm run build
+
+      - name: Native third-party license inventory
+        run: npm run desktop:licenses
+
+      - name: Clean packaged server readiness smoke
+        run: npm run desktop:resource-smoke
+
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check

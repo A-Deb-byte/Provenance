@@ -11,6 +11,7 @@ export interface WorkerRegistry {
   get(workerId: string): WorkerRegistration | undefined;
   list(): WorkerRegistration[];
   report(): WorkerAvailabilityReport;
+  activate(registration: WorkerRegistration): void;
 }
 
 const cloneRegistration = (worker: WorkerRegistration): WorkerRegistration => ({
@@ -38,6 +39,12 @@ export const createWorkerRegistry = (registrations: WorkerRegistration[]): Worke
   const sorted = (): WorkerRegistration[] => [...workers.values()]
     .sort((left, right) => left.id.localeCompare(right.id))
     .map(cloneRegistration);
+  const authorityShape = (worker: WorkerRegistration): string => JSON.stringify({
+    id: worker.id,
+    family: worker.family,
+    supportedActions: worker.supportedActions,
+    configuredScopes: worker.configuredScopes,
+  });
 
   return {
     get: (workerId) => {
@@ -45,6 +52,20 @@ export const createWorkerRegistry = (registrations: WorkerRegistration[]): Worke
       return worker ? cloneRegistration(worker) : undefined;
     },
     list: sorted,
+    activate: (registration) => {
+      if (!isWorkerRegistration(registration as unknown) || registration.availability !== 'available') {
+        throw new Error(`Invalid available worker activation: ${registration.id || 'unknown'}.`);
+      }
+      const current = workers.get(registration.id);
+      if (!current) throw new Error(`Worker activation requires an existing registration: ${registration.id}.`);
+      if (current.availability === 'available') {
+        throw new Error(`Worker is already available and its runtime cannot be replaced: ${registration.id}.`);
+      }
+      if (authorityShape(current) !== authorityShape(registration)) {
+        throw new Error(`Worker activation cannot change configured authority: ${registration.id}.`);
+      }
+      workers.set(registration.id, cloneRegistration(registration));
+    },
     report: () => {
       const report: WorkerAvailabilityReport = { available: [], configured: [], unavailable: [] };
       for (const worker of sorted()) {

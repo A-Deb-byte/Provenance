@@ -1,0 +1,868 @@
+name: Verified Windows desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish verified artifacts for an existing v* tag
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_ABOUT_VERSION: 0.9.1
+  CARGO_ABOUT_ARCHIVE_URL: https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.1/cargo-about-0.9.1-x86_64-pc-windows-msvc.tar.gz
+  CARGO_ABOUT_ARCHIVE_SHA256: 318893aff6b9efd60f70470f5827b9577ae20a805cf9732d5612862a78508581
+  CARGO_ABOUT_EXE_SHA256: e15e1af0b7c671bac972b21916b86726d0bf183ae121c85fb645bc618e911d3f
+
+jobs:
+  build-unsigned:
+    name: Test and stage immutable unsigned Windows payload
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      PROVENANCE_UPDATER_PUBLIC_KEY: ${{ vars.PROVENANCE_UPDATER_PUBLIC_KEY }}
+      PROVENANCE_UPDATER_ENDPOINT: ${{ vars.PROVENANCE_UPDATER_ENDPOINT }}
+      PROVENANCE_SANDBOX_IMAGE: ${{ vars.PROVENANCE_SANDBOX_IMAGE }}
+    outputs:
+      manifest_sha256: ${{ steps.payload.outputs.manifest_sha256 }}
+      native_sha256: ${{ steps.payload.outputs.native_sha256 }}
+      sign_command_sha256: ${{ steps.payload.outputs.sign_command_sha256 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up exact Node.js toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.23.1
+          cache: npm
+
+      - name: Set up exact Rust MSVC toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          rustup default 1.97.0
+          rustup target add --toolchain 1.97.0 x86_64-pc-windows-msvc
+          rustup component add --toolchain 1.97.0 rustfmt clippy
+          if ((rustc --version) -notmatch '^rustc 1\.97\.0 ') {
+            throw 'The exact Rust toolchain was not activated.'
+          }
+
+      - name: Install locked JavaScript dependencies
+        run: npm ci
+
+      - name: Provision hash-pinned cargo-about
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'cargo-about-0.9.1.tar.gz'
+          $destination = Join-Path $env:RUNNER_TEMP 'cargo-about-0.9.1'
+          if (Test-Path -LiteralPath $destination) {
+            throw 'The cargo-about destination unexpectedly already exists.'
+          }
+          Invoke-WebRequest -Uri $env:CARGO_ABOUT_ARCHIVE_URL -OutFile $archive
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($archiveHash -cne $env:CARGO_ABOUT_ARCHIVE_SHA256) {
+            throw 'The cargo-about archive digest does not match the pinned release asset.'
+          }
+          New-Item -ItemType Directory -Path $destination | Out-Null
+          & tar.exe -xzf $archive -C $destination
+          if ($LASTEXITCODE -ne 0) { throw 'The pinned cargo-about archive could not be extracted.' }
+          $reparsePoints = @(Get-ChildItem -LiteralPath $destination -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          if ($reparsePoints.Count -ne 0) { throw 'The cargo-about archive contains a reparse point.' }
+          $executables = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter cargo-about.exe)
+          if ($executables.Count -ne 1) {
+            throw "The cargo-about archive contained $($executables.Count) executables; expected one."
+          }
+          $cargoAbout = $executables[0]
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cargoAbout.FullName).Hash.ToLowerInvariant()
+          if ($exeHash -cne $env:CARGO_ABOUT_EXE_SHA256) {
+            throw 'The extracted cargo-about executable digest is invalid.'
+          }
+          $version = (& $cargoAbout.FullName --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $version -cne "cargo-about $env:CARGO_ABOUT_VERSION") {
+            throw 'The pinned cargo-about executable has an unexpected identity.'
+          }
+          "PROVENANCE_CARGO_ABOUT=$($cargoAbout.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_SHA256=$exeHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_VERSION=$env:CARGO_ABOUT_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Provision pinned Windows Node runtime
+        shell: pwsh
+        env:
+          NODE_ARCHIVE_URL: ${{ vars.PROVENANCE_BUNDLED_NODE_URL }}
+          NODE_ARCHIVE_SHA256: ${{ vars.PROVENANCE_BUNDLED_NODE_ARCHIVE_SHA256 }}
+          NODE_RUNTIME_VERSION: ${{ vars.PROVENANCE_BUNDLED_NODE_VERSION }}
+          NODE_SIGNER_THUMBPRINT: ${{ vars.PROVENANCE_BUNDLED_NODE_SIGNER_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archiveUri = $null
+          if (-not [Uri]::TryCreate($env:NODE_ARCHIVE_URL, [UriKind]::Absolute, [ref]$archiveUri) -or
+              $archiveUri.Scheme -cne 'https' -or $archiveUri.UserInfo -or
+              $archiveUri.Query -or $archiveUri.Fragment) {
+            throw 'PROVENANCE_BUNDLED_NODE_URL must be a query-free, credential-free HTTPS URL.'
+          }
+          if ($env:NODE_ARCHIVE_SHA256 -notmatch '^[a-f0-9]{64}$') {
+            throw 'PROVENANCE_BUNDLED_NODE_ARCHIVE_SHA256 must be lowercase SHA-256.'
+          }
+          if ($env:NODE_RUNTIME_VERSION -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw 'PROVENANCE_BUNDLED_NODE_VERSION must be an exact Node version.'
+          }
+          $expectedNodeSigner = $env:NODE_SIGNER_THUMBPRINT.Replace(' ', '').ToUpperInvariant()
+          if ($expectedNodeSigner -notmatch '^[A-F0-9]{40}$') {
+            throw 'PROVENANCE_BUNDLED_NODE_SIGNER_THUMBPRINT must be an exact SHA-1 thumbprint.'
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP 'provenance-node.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'provenance-node'
+          Invoke-WebRequest -Uri $archiveUri -OutFile $archive
+          $actualArchiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actualArchiveHash -cne $env:NODE_ARCHIVE_SHA256) {
+            throw 'The pinned Node archive digest is invalid.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $reparsePoints = @(Get-ChildItem -LiteralPath $destination -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          if ($reparsePoints.Count -ne 0) { throw 'The Node archive contains a reparse point.' }
+          $nodes = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter node.exe)
+          if ($nodes.Count -ne 1) { throw "The Node archive contained $($nodes.Count) node.exe files; expected one." }
+          $node = $nodes[0]
+          $licenses = @(Get-ChildItem -LiteralPath $node.Directory.FullName -File | Where-Object Name -CEQ 'LICENSE')
+          if ($licenses.Count -ne 1) { throw 'The Node archive must contain one adjacent LICENSE file.' }
+          $license = $licenses[0]
+          $nodeHashBeforeExecution = (Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant()
+          $nodeSignature = Get-AuthenticodeSignature -LiteralPath $node.FullName
+          if ($nodeSignature.Status -ne 'Valid' -or $null -eq $nodeSignature.SignerCertificate -or
+              $nodeSignature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $expectedNodeSigner -or
+              $null -eq $nodeSignature.TimeStamperCertificate) {
+            throw 'The bundled Node runtime must have a valid vendor signature and timestamp.'
+          }
+          $runtime = (& $node.FullName -p 'JSON.stringify({version:process.version,arch:process.arch,platform:process.platform})' | Out-String).Trim() | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $runtime.version -cne $env:NODE_RUNTIME_VERSION -or
+              $runtime.arch -cne 'x64' -or $runtime.platform -cne 'win32') {
+            throw 'The bundled Node runtime identity is invalid.'
+          }
+          $nodeSignatureAfterExecution = Get-AuthenticodeSignature -LiteralPath $node.FullName
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant() -cne $nodeHashBeforeExecution -or
+              $nodeSignatureAfterExecution.Status -ne 'Valid' -or
+              $nodeSignatureAfterExecution.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $expectedNodeSigner -or
+              $null -eq $nodeSignatureAfterExecution.TimeStamperCertificate) {
+            throw 'The bundled Node runtime changed during its identity probe.'
+          }
+          "PROVENANCE_BUNDLED_NODE=$($node.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_VERSION=$env:NODE_RUNTIME_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_SIGNER_THUMBPRINT=$expectedNodeSigner" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_LICENSE=$($license.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_LICENSE_SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $license.FullName).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prove unsigned job has no signing authority
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $probe = (& node scripts/desktop-release.mjs probe-build-env | Out-String).Trim() | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $probe.privateKey -or $probe.privateKeyPassword -or
+              $probe.pfx -or $probe.certificate) {
+            throw 'The unsigned job unexpectedly has signing authority.'
+          }
+
+      - name: Run application, release, license, and native gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm run lint
+          npm test
+          npm run desktop:release:test
+          npm run desktop:acceptance
+          npm run desktop:release:plan
+          npm run build
+          npm run desktop:licenses
+          npm run desktop:resource-smoke
+          npm audit --omit=dev --audit-level=high
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml --all-targets
+          cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build exact unsigned native payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = Join-Path $env:RUNNER_TEMP 'provenance-unsigned-target'
+          if (Test-Path -LiteralPath $target) { throw 'The unsigned release target is not fresh.' }
+          "PROVENANCE_RELEASE_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $env:PROVENANCE_RELEASE_TARGET_DIR = $target
+          npm run desktop:release:build-unsigned
+          if ($LASTEXITCODE -ne 0) { throw 'Unsigned payload construction failed.' }
+
+      - name: Verify and attest exact unsigned payload
+        id: payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $payload = Join-Path $env:PROVENANCE_RELEASE_TARGET_DIR 'unsigned-payload'
+          $verification = (& node scripts/desktop-release.mjs verify-unsigned $payload | Out-String).Trim() | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $verification.status -cne 'verified') {
+            throw 'The unsigned payload did not pass independent manifest verification.'
+          }
+          $manifest = Join-Path $payload 'manifest.json'
+          $manifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash.ToLowerInvariant()
+          $nativeHash = [string]$verification.nativeSha256
+          if ($manifestHash -cne [string]$verification.manifestSha256 -or
+              $nativeHash -notmatch '^[a-f0-9]{64}$') {
+            throw 'The unsigned payload verification output is inconsistent.'
+          }
+          $native = Join-Path $payload 'native\provenance-desktop.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $native
+          if ($signature.Status -ne 'NotSigned' -or $null -ne $signature.SignerCertificate) {
+            throw 'The unsigned payload unexpectedly contains a signed native executable.'
+          }
+          $signCommandHash = (Get-FileHash -Algorithm SHA256 -LiteralPath scripts\windows-sign-command.ps1).Hash.ToLowerInvariant()
+          "PROVENANCE_UNSIGNED_PAYLOAD=$payload" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "manifest_sha256=$manifestHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "native_sha256=$nativeHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "sign_command_sha256=$signCommandHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload untouched unsigned payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-unsigned-payload-${{ github.sha }}
+          path: ${{ env.PROVENANCE_UNSIGNED_PAYLOAD }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+          compression-level: 0
+
+  sign-and-verify:
+    name: Protected native signing, NSIS bundling, and acceptance
+    needs: build-unsigned
+    if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: production
+
+    steps:
+      - name: Check out exact build revision
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up exact Node.js toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22.23.1
+          cache: npm
+
+      - name: Set up exact Rust MSVC metadata toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.97.0 --profile minimal --no-self-update
+          rustup default 1.97.0
+          rustup target add --toolchain 1.97.0 x86_64-pc-windows-msvc
+          if ((rustc --version) -notmatch '^rustc 1\.97\.0 ') {
+            throw 'The exact Rust toolchain was not activated.'
+          }
+
+      - name: Install locked bundler dependencies before secrets
+        run: npm ci --ignore-scripts
+
+      - name: Re-provision hash-pinned cargo-about
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'production-cargo-about-0.9.1.tar.gz'
+          $destination = Join-Path $env:RUNNER_TEMP 'production-cargo-about-0.9.1'
+          Invoke-WebRequest -Uri $env:CARGO_ABOUT_ARCHIVE_URL -OutFile $archive
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne
+              $env:CARGO_ABOUT_ARCHIVE_SHA256) {
+            throw 'The protected job cargo-about archive digest is invalid.'
+          }
+          New-Item -ItemType Directory -Path $destination | Out-Null
+          & tar.exe -xzf $archive -C $destination
+          if ($LASTEXITCODE -ne 0) { throw 'The protected cargo-about archive could not be extracted.' }
+          $reparsePoints = @(Get-ChildItem -LiteralPath $destination -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          $executables = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter cargo-about.exe)
+          if ($reparsePoints.Count -ne 0 -or $executables.Count -ne 1) {
+            throw 'The protected cargo-about extraction has an invalid shape.'
+          }
+          $cargoAbout = $executables[0]
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $cargoAbout.FullName).Hash.ToLowerInvariant()
+          $version = (& $cargoAbout.FullName --version | Out-String).Trim()
+          if ($exeHash -cne $env:CARGO_ABOUT_EXE_SHA256 -or
+              $version -cne "cargo-about $env:CARGO_ABOUT_VERSION") {
+            throw 'The protected cargo-about executable identity is invalid.'
+          }
+          "PROVENANCE_CARGO_ABOUT=$($cargoAbout.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_SHA256=$exeHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_CARGO_ABOUT_VERSION=$env:CARGO_ABOUT_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Re-download protected production Node runtime
+        shell: pwsh
+        env:
+          PROVENANCE_PRODUCTION_BUNDLED_NODE_URL: ${{ vars.PROVENANCE_PRODUCTION_BUNDLED_NODE_URL }}
+          PROVENANCE_PRODUCTION_BUNDLED_NODE_ARCHIVE_SHA256: ${{ vars.PROVENANCE_PRODUCTION_BUNDLED_NODE_ARCHIVE_SHA256 }}
+          PROVENANCE_PRODUCTION_BUNDLED_NODE_VERSION: ${{ vars.PROVENANCE_PRODUCTION_BUNDLED_NODE_VERSION }}
+          PROVENANCE_PRODUCTION_BUNDLED_NODE_SIGNER_THUMBPRINT: ${{ vars.PROVENANCE_PRODUCTION_BUNDLED_NODE_SIGNER_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $uri = $null
+          if (-not [Uri]::TryCreate($env:PROVENANCE_PRODUCTION_BUNDLED_NODE_URL, [UriKind]::Absolute, [ref]$uri) -or
+              $uri.Scheme -cne 'https' -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) {
+            throw 'The protected Node URL must be query-free, credential-free HTTPS.'
+          }
+          if ($env:PROVENANCE_PRODUCTION_BUNDLED_NODE_ARCHIVE_SHA256 -notmatch '^[a-f0-9]{64}$' -or
+              $env:PROVENANCE_PRODUCTION_BUNDLED_NODE_VERSION -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw 'The protected Node archive digest or version is not canonical.'
+          }
+          $expectedNodeSigner = $env:PROVENANCE_PRODUCTION_BUNDLED_NODE_SIGNER_THUMBPRINT.Replace(' ', '').ToUpperInvariant()
+          if ($expectedNodeSigner -notmatch '^[A-F0-9]{40}$') {
+            throw 'The protected Node signer thumbprint is invalid.'
+          }
+          $archive = Join-Path $env:RUNNER_TEMP 'production-node.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'production-node'
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -cne
+              $env:PROVENANCE_PRODUCTION_BUNDLED_NODE_ARCHIVE_SHA256) {
+            throw 'The protected Node archive digest is invalid.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $reparsePoints = @(Get-ChildItem -LiteralPath $destination -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+          })
+          $nodes = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter node.exe)
+          if ($reparsePoints.Count -ne 0 -or $nodes.Count -ne 1) {
+            throw 'The protected Node extraction has an invalid shape.'
+          }
+          $node = $nodes[0]
+          $licenses = @(Get-ChildItem -LiteralPath $node.Directory.FullName -File | Where-Object Name -CEQ 'LICENSE')
+          if ($licenses.Count -ne 1) { throw 'The protected Node archive lacks one adjacent LICENSE.' }
+          $license = $licenses[0]
+          $nodeHashBeforeExecution = (Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant()
+          $nodeSignature = Get-AuthenticodeSignature -LiteralPath $node.FullName
+          if ($nodeSignature.Status -ne 'Valid' -or $null -eq $nodeSignature.SignerCertificate -or
+              $nodeSignature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $expectedNodeSigner -or
+              $null -eq $nodeSignature.TimeStamperCertificate) {
+            throw 'The protected Node runtime must have a valid vendor signature and timestamp.'
+          }
+          $runtime = (& $node.FullName -p 'JSON.stringify({version:process.version,arch:process.arch,platform:process.platform})' | Out-String).Trim() | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or
+              $runtime.version -cne $env:PROVENANCE_PRODUCTION_BUNDLED_NODE_VERSION -or
+              $runtime.arch -cne 'x64' -or $runtime.platform -cne 'win32') {
+            throw 'The protected Node executable identity is invalid.'
+          }
+          $nodeSignatureAfterExecution = Get-AuthenticodeSignature -LiteralPath $node.FullName
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant() -cne $nodeHashBeforeExecution -or
+              $nodeSignatureAfterExecution.Status -ne 'Valid' -or
+              $nodeSignatureAfterExecution.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $expectedNodeSigner -or
+              $null -eq $nodeSignatureAfterExecution.TimeStamperCertificate) {
+            throw 'The protected Node runtime changed during its identity probe.'
+          }
+          "PROVENANCE_BUNDLED_NODE=$($node.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $node.FullName).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_VERSION=$env:PROVENANCE_PRODUCTION_BUNDLED_NODE_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_SIGNER_THUMBPRINT=$expectedNodeSigner" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_LICENSE=$($license.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_NODE_LICENSE_SHA256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $license.FullName).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download untouched unsigned payload
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: windows-unsigned-payload-${{ github.sha }}
+          path: unsigned-input
+
+      - name: Revalidate production authority and unsigned payload before secrets
+        shell: pwsh
+        env:
+          PROVENANCE_PRODUCTION_UPDATER_PUBLIC_KEY: ${{ vars.PROVENANCE_PRODUCTION_UPDATER_PUBLIC_KEY }}
+          PROVENANCE_PRODUCTION_UPDATER_ENDPOINT: ${{ vars.PROVENANCE_PRODUCTION_UPDATER_ENDPOINT }}
+          PROVENANCE_PRODUCTION_SANDBOX_IMAGE: ${{ vars.PROVENANCE_PRODUCTION_SANDBOX_IMAGE }}
+          PROVENANCE_PRODUCTION_WINDOWS_CERTIFICATE_THUMBPRINT: ${{ vars.PROVENANCE_PRODUCTION_WINDOWS_CERTIFICATE_THUMBPRINT }}
+          PROVENANCE_PRODUCTION_WINDOWS_TIMESTAMP_URL: ${{ vars.PROVENANCE_PRODUCTION_WINDOWS_TIMESTAMP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'PROVENANCE_PRODUCTION_UPDATER_PUBLIC_KEY',
+            'PROVENANCE_PRODUCTION_UPDATER_ENDPOINT',
+            'PROVENANCE_PRODUCTION_SANDBOX_IMAGE',
+            'PROVENANCE_PRODUCTION_WINDOWS_CERTIFICATE_THUMBPRINT',
+            'PROVENANCE_PRODUCTION_WINDOWS_TIMESTAMP_URL'
+          )) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value) -or $value -cne $value.Trim()) {
+              throw "$name must be a canonical protected-environment value."
+            }
+          }
+          $thumbprint = $env:PROVENANCE_PRODUCTION_WINDOWS_CERTIFICATE_THUMBPRINT.Replace(' ', '').ToUpperInvariant()
+          if ($thumbprint -notmatch '^[A-F0-9]{40}$') {
+            throw 'The protected signing certificate thumbprint is invalid.'
+          }
+          $timestampUri = $null
+          if (-not [Uri]::TryCreate($env:PROVENANCE_PRODUCTION_WINDOWS_TIMESTAMP_URL, [UriKind]::Absolute, [ref]$timestampUri) -or
+              $timestampUri.Scheme -cne 'https' -or $timestampUri.UserInfo -or
+              $timestampUri.Query -or $timestampUri.Fragment) {
+            throw 'The protected timestamp URL must be query-free, credential-free HTTPS.'
+          }
+
+          $env:PROVENANCE_UPDATER_PUBLIC_KEY = $env:PROVENANCE_PRODUCTION_UPDATER_PUBLIC_KEY
+          $env:PROVENANCE_UPDATER_ENDPOINT = $env:PROVENANCE_PRODUCTION_UPDATER_ENDPOINT
+          $env:PROVENANCE_SANDBOX_IMAGE = $env:PROVENANCE_PRODUCTION_SANDBOX_IMAGE
+          $payload = (Resolve-Path -LiteralPath unsigned-input).Path
+          $verification = (& node scripts/desktop-release.mjs verify-unsigned $payload | Out-String).Trim() | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $verification.status -cne 'verified') {
+            throw 'The protected production plan rejected the unsigned payload.'
+          }
+          $manifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $payload 'manifest.json')).Hash.ToLowerInvariant()
+          if ($manifestHash -cne '${{ needs.build-unsigned.outputs.manifest_sha256 }}' -or
+              [string]$verification.nativeSha256 -cne '${{ needs.build-unsigned.outputs.native_sha256 }}') {
+            throw 'The downloaded payload does not match the unsigned job hash attestation.'
+          }
+          $signCommandHash = (Get-FileHash -Algorithm SHA256 -LiteralPath scripts\windows-sign-command.ps1).Hash.ToLowerInvariant()
+          if ($signCommandHash -cne '${{ needs.build-unsigned.outputs.sign_command_sha256 }}') {
+            throw 'The protected checkout signing command differs from the unsigned-job revision.'
+          }
+
+          $signtools = @(Get-ChildItem -LiteralPath (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin') -Recurse -File -Filter signtool.exe |
+            Where-Object { $_.FullName -match '[\\/]x64[\\/]signtool\.exe$' } |
+            Sort-Object FullName -Descending)
+          if ($signtools.Count -lt 1) { throw 'No x64 Windows SDK signtool.exe was found.' }
+          $signtool = $signtools[0]
+          $signtoolSignature = Get-AuthenticodeSignature -LiteralPath $signtool.FullName
+          if ($signtoolSignature.Status -ne 'Valid' -or $null -eq $signtoolSignature.SignerCertificate -or
+              $signtoolSignature.SignerCertificate.Subject -notmatch '(?:^|,\s*)O=Microsoft Corporation(?:,|$)') {
+            throw 'The selected signtool.exe is not validly signed by Microsoft.'
+          }
+
+          $config = Get-Content -Raw -LiteralPath src-tauri\tauri.conf.json | ConvertFrom-Json
+          if ($config.productName -cne 'Provenance' -or
+              $config.version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
+            throw 'The release identity cannot produce the constrained NSIS installer name.'
+          }
+          $target = Join-Path $env:RUNNER_TEMP 'provenance-signed-target'
+          if (Test-Path -LiteralPath $target) { throw 'The protected release target is not fresh.' }
+
+          "PROVENANCE_UPDATER_PUBLIC_KEY=$env:PROVENANCE_UPDATER_PUBLIC_KEY" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_UPDATER_ENDPOINT=$env:PROVENANCE_UPDATER_ENDPOINT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_SANDBOX_IMAGE=$env:PROVENANCE_SANDBOX_IMAGE" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT=$thumbprint" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_TIMESTAMP_URL=$($timestampUri.AbsoluteUri)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_SIGN_COMMAND_SHA256=$signCommandHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_SIGNTOOL=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_SIGN_PAYLOAD_ROOT=$payload" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_WINDOWS_SIGN_EXPECTED_INSTALLER_NAME=Provenance_$($config.version)_x64-setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_UNSIGNED_PAYLOAD_MANIFEST_SHA256=$manifestHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_UNSIGNED_NATIVE_SHA256=$($verification.nativeSha256)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_RELEASE_TARGET_DIR=$target" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Import certificate, sign native bundle, and erase signing authority
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64: ${{ secrets.PROVENANCE_WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD: ${{ secrets.PROVENANCE_WINDOWS_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxBase64 = $env:WINDOWS_PFX_BASE64
+          $pfxPassword = $env:WINDOWS_PFX_PASSWORD
+          Remove-Item Env:\WINDOWS_PFX_BASE64 -ErrorAction SilentlyContinue
+          Remove-Item Env:\WINDOWS_PFX_PASSWORD -ErrorAction SilentlyContinue
+          if ([string]::IsNullOrWhiteSpace($pfxBase64) -or [string]::IsNullOrEmpty($pfxPassword)) {
+            throw 'The protected PFX material is unavailable.'
+          }
+
+          $thumbprint = $env:PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT
+          $existing = @(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+            $_.Thumbprint.ToUpperInvariant() -ceq $thumbprint
+          })
+          if ($existing.Count -ne 0) {
+            throw 'The expected signing certificate already existed before protected import.'
+          }
+          $beforeThumbprints = @(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | ForEach-Object {
+            $_.Thumbprint.ToUpperInvariant()
+          })
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'provenance-signing.pfx'
+          $newCertificates = @()
+          try {
+            $pfxBytes = [Convert]::FromBase64String($pfxBase64)
+            try {
+              [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+            } finally {
+              [Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+            }
+            $securePassword = ConvertTo-SecureString $pfxPassword -AsPlainText -Force
+            Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword | Out-Null
+            Remove-Item -LiteralPath $pfxPath -Force
+            $pfxBase64 = $null
+            $pfxPassword = $null
+            $securePassword = $null
+
+            $newCertificates = @(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+              $beforeThumbprints -notcontains $_.Thumbprint.ToUpperInvariant()
+            })
+            $matching = @($newCertificates | Where-Object {
+              $_.Thumbprint.ToUpperInvariant() -ceq $thumbprint
+            })
+            if ($matching.Count -ne 1 -or -not $matching[0].HasPrivateKey) {
+              throw 'The PFX did not import exactly one expected private signing certificate.'
+            }
+            $codeSigning = @($matching[0].EnhancedKeyUsageList | Where-Object {
+              $_.ObjectId.Value -ceq '1.3.6.1.5.5.7.3.3'
+            })
+            if ($codeSigning.Count -ne 1) { throw 'The imported certificate lacks code-signing authority.' }
+
+            $bundleLines = @(& node scripts/desktop-release.mjs bundle-signed-native unsigned-input)
+            $bundleExitCode = $LASTEXITCODE
+            foreach ($line in $bundleLines) { Write-Host $line }
+            if ($bundleExitCode -ne 0 -or $bundleLines.Count -lt 1) {
+              throw 'Protected native signing and NSIS bundling failed.'
+            }
+            try {
+              $bundleResult = $bundleLines[-1] | ConvertFrom-Json
+            } catch {
+              throw 'Protected bundling did not end with its canonical JSON evidence record.'
+            }
+          } finally {
+            Remove-Item Env:\WINDOWS_PFX_BASE64 -ErrorAction SilentlyContinue
+            Remove-Item Env:\WINDOWS_PFX_PASSWORD -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+            $pfxBase64 = $null
+            $pfxPassword = $null
+            $securePassword = $null
+            $newCertificates = @(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+              $beforeThumbprints -notcontains $_.Thumbprint.ToUpperInvariant()
+            })
+            foreach ($certificate in $newCertificates) {
+              $certificatePath = "Cert:\CurrentUser\My\$($certificate.Thumbprint)"
+              if ($certificate.HasPrivateKey) {
+                Remove-Item -LiteralPath $certificatePath -DeleteKey -Force
+              } else {
+                Remove-Item -LiteralPath $certificatePath -Force
+              }
+            }
+          }
+
+          $remainingImportedCertificates = @(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+            $beforeThumbprints -notcontains $_.Thumbprint.ToUpperInvariant()
+          })
+          if (Test-Path -LiteralPath $pfxPath -or $remainingImportedCertificates.Count -ne 0) {
+            throw 'The protected signing certificate or PFX remained after bundling.'
+          }
+          if ($bundleResult.schemaVersion -ne 1) { throw 'The signed bundle evidence schema is invalid.' }
+          $bundleRoot = Join-Path $env:PROVENANCE_RELEASE_TARGET_DIR 'release\bundle'
+          $recordPath = (Resolve-Path -LiteralPath ([string]$bundleResult.record)).Path
+          $installer = Get-Item -LiteralPath ([string]$bundleResult.installer) -Force
+          $signedNativeCapture = Get-Item -LiteralPath ([string]$bundleResult.signedNativeCapture) -Force
+          $expectedRecord = Join-Path $bundleRoot 'bundled-release.json'
+          $expectedCapture = Join-Path $env:PROVENANCE_RELEASE_TARGET_DIR 'release\attestation\provenance-desktop-signed.exe'
+          if (-not [IO.Path]::GetFullPath($recordPath).Equals([IO.Path]::GetFullPath($expectedRecord), [StringComparison]::OrdinalIgnoreCase) -or
+              -not [IO.Path]::GetFullPath($signedNativeCapture.FullName).Equals([IO.Path]::GetFullPath($expectedCapture), [StringComparison]::OrdinalIgnoreCase) -or
+              $installer.PSIsContainer -or $signedNativeCapture.PSIsContainer -or
+              ($installer.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+              ($signedNativeCapture.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The signed bundle JSON points outside the exact protected release output.'
+          }
+          $record = Get-Content -Raw -LiteralPath $recordPath | ConvertFrom-Json
+          if ($record.installer.file -cne $installer.Name -or
+              $record.installer.sha256 -cne (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant() -or
+              $record.sourcePayload.signedNativeSha256 -cne
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $signedNativeCapture.FullName).Hash.ToLowerInvariant() -or
+              $record.sourcePayload.signedNativeSha256 -cne [string]$bundleResult.signedNativeSha256 -or
+              (Get-FileHash -Algorithm SHA256 -LiteralPath $recordPath).Hash.ToLowerInvariant() -cne [string]$bundleResult.recordSha256) {
+            throw 'The bundled release record does not bind the exact NSIS installer.'
+          }
+          $restoredNative = Join-Path $env:PROVENANCE_RELEASE_TARGET_DIR 'release\provenance-desktop.exe'
+          $restoredSignature = Get-AuthenticodeSignature -LiteralPath $restoredNative
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $restoredNative).Hash.ToLowerInvariant() -cne
+                $env:PROVENANCE_UNSIGNED_NATIVE_SHA256 -or
+              $restoredSignature.Status -ne 'NotSigned' -or
+              $null -ne $restoredSignature.SignerCertificate) {
+            throw 'Tauri did not restore the exact manifest-bound unsigned target executable.'
+          }
+          $captureSignature = Get-AuthenticodeSignature -LiteralPath $signedNativeCapture.FullName
+          if ($captureSignature.Status -ne 'Valid' -or $null -eq $captureSignature.SignerCertificate -or
+              $captureSignature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $thumbprint -or
+              $null -eq $captureSignature.TimeStamperCertificate) {
+            throw 'The captured signed native executable failed public signature verification.'
+          }
+          "PROVENANCE_SIGNED_INSTALLER=$($installer.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_BUNDLED_RECORD=$recordPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROVENANCE_SIGNED_NATIVE_CAPTURE=$($signedNativeCapture.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Silent-install and verify installed native and uninstaller
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-ExpectedSignature([string]$Path, [string]$Label) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or
+                $signature.SignerCertificate.Thumbprint.ToUpperInvariant() -cne $env:PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT -or
+                $null -eq $signature.TimeStamperCertificate) {
+              throw "$Label has an invalid signer or RFC3161 timestamp."
+            }
+          }
+
+          if (@(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+            $_.Thumbprint.ToUpperInvariant() -ceq $env:PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT
+          }).Count -ne 0) {
+            throw 'The private signing certificate is still installed during public acceptance.'
+          }
+          $record = Get-Content -Raw -LiteralPath $env:PROVENANCE_BUNDLED_RECORD | ConvertFrom-Json
+          Assert-ExpectedSignature $env:PROVENANCE_SIGNED_INSTALLER 'NSIS installer'
+          Assert-ExpectedSignature $env:PROVENANCE_SIGNED_NATIVE_CAPTURE 'Captured Provenance executable'
+          $capturedNativeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PROVENANCE_SIGNED_NATIVE_CAPTURE).Hash.ToLowerInvariant()
+          if ($capturedNativeHash -cne [string]$record.sourcePayload.signedNativeSha256) {
+            throw 'The preserved signed-native capture does not match the bundled release record.'
+          }
+          $installRoot = Join-Path $env:RUNNER_TEMP "provenance-install-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ($installRoot -match '\s' -or (Test-Path -LiteralPath $installRoot)) {
+            throw 'The silent-install acceptance root is not fresh and canonical.'
+          }
+          try {
+            $install = Start-Process -FilePath $env:PROVENANCE_SIGNED_INSTALLER `
+              -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "NSIS silent install failed with exit code $($install.ExitCode)." }
+            $native = Join-Path $installRoot 'provenance-desktop.exe'
+            $uninstaller = Join-Path $installRoot 'uninstall.exe'
+            foreach ($file in @($native, $uninstaller)) {
+              $item = Get-Item -LiteralPath $file -Force
+              if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  $item.Length -le 0 -or $item.Length -gt 1GB) {
+                throw 'The installed acceptance executable has an invalid filesystem shape.'
+              }
+            }
+            Assert-ExpectedSignature $native 'Installed Provenance executable'
+            Assert-ExpectedSignature $uninstaller 'Installed NSIS uninstaller'
+            $installedNativeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $native).Hash.ToLowerInvariant()
+            if ($installedNativeHash -cne [string]$record.sourcePayload.signedNativeSha256 -or
+                $installedNativeHash -cne $capturedNativeHash) {
+              throw 'The installed native executable is not byte-identical to the captured signed-native evidence.'
+            }
+
+            $payloadManifest = Get-Content -Raw -LiteralPath (Join-Path $env:PROVENANCE_WINDOWS_SIGN_PAYLOAD_ROOT 'manifest.json') | ConvertFrom-Json
+            $expectedFiles = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            $expectedDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            if (-not $expectedFiles.Add('provenance-desktop.exe') -or
+                -not $expectedFiles.Add('uninstall.exe')) {
+              throw 'The installed-file inventory could not be initialized.'
+            }
+            foreach ($resource in $payloadManifest.resources) {
+              $relative = ([string]$resource.destination).Replace('/', '\')
+              if ($relative -match '(^|\\)(?:\.|\.\.)(?:\\|$)' -or
+                  [IO.Path]::IsPathRooted($relative) -or
+                  -not $expectedFiles.Add($relative)) {
+                throw 'The payload manifest contains an invalid installed resource destination.'
+              }
+              $segments = $relative.Split('\')
+              for ($index = 1; $index -lt $segments.Count; $index++) {
+                [void]$expectedDirectories.Add(($segments[0..($index - 1)] -join '\'))
+              }
+              $installedResource = Join-Path $installRoot $relative
+              $resourceItem = Get-Item -LiteralPath $installedResource -Force
+              if ($resourceItem.PSIsContainer -or
+                  ($resourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  $resourceItem.Length -ne [long]$resource.size -or
+                  (Get-FileHash -Algorithm SHA256 -LiteralPath $resourceItem.FullName).Hash.ToLowerInvariant() -cne [string]$resource.sha256) {
+                throw "Installed resource $($resource.destination) does not match the unsigned payload manifest."
+              }
+            }
+
+            $installedEntries = @(Get-ChildItem -LiteralPath $installRoot -Recurse -Force)
+            if (@($installedEntries | Where-Object {
+              ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            }).Count -ne 0) {
+              throw 'The isolated installation contains a reparse point.'
+            }
+            $actualFiles = @($installedEntries | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
+              [IO.Path]::GetRelativePath($installRoot, $_.FullName)
+            })
+            $actualDirectories = @($installedEntries | Where-Object { $_.PSIsContainer } | ForEach-Object {
+              [IO.Path]::GetRelativePath($installRoot, $_.FullName)
+            })
+            $fileDifference = @(Compare-Object -ReferenceObject @($expectedFiles) -DifferenceObject $actualFiles -CaseSensitive)
+            $directoryDifference = @(Compare-Object -ReferenceObject @($expectedDirectories) -DifferenceObject $actualDirectories -CaseSensitive)
+            if ($fileDifference.Count -ne 0 -or $directoryDifference.Count -ne 0) {
+              throw 'The isolated installation contains missing or extra files or directories.'
+            }
+
+            $uninstall = Start-Process -FilePath $uninstaller `
+              -ArgumentList @('/S', "_?=$installRoot") -Wait -PassThru
+            if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed with exit code $($uninstall.ExitCode)." }
+            for ($attempt = 0; $attempt -lt 30 -and (Test-Path -LiteralPath $installRoot); $attempt++) {
+              Start-Sleep -Seconds 1
+            }
+            if (Test-Path -LiteralPath $installRoot) {
+              throw 'The signed NSIS uninstaller did not remove the isolated acceptance installation.'
+            }
+          } finally {
+            if (Test-Path -LiteralPath $installRoot) {
+              $rootItem = Get-Item -LiteralPath $installRoot -Force
+              $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+              if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                  -not [IO.Path]::GetFullPath($rootItem.FullName).StartsWith($runnerTemp, [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Refusing to clean an unsafe acceptance installation path.'
+              }
+              Remove-Item -LiteralPath $rootItem.FullName -Recurse -Force
+            }
+          }
+
+      - name: Apply Tauri updater signature after certificate removal
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.PROVENANCE_TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.PROVENANCE_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (@(Get-ChildItem -LiteralPath Cert:\CurrentUser\My | Where-Object {
+            $_.Thumbprint.ToUpperInvariant() -ceq $env:PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT
+          }).Count -ne 0 -or (Test-Path -LiteralPath (Join-Path $env:RUNNER_TEMP 'provenance-signing.pfx'))) {
+            throw 'Authenticode private material remained before updater-key exposure.'
+          }
+          if ((Test-Path -LiteralPath "$env:PROVENANCE_SIGNED_INSTALLER.sig") -or
+              (Test-Path -LiteralPath "$env:PROVENANCE_BUNDLED_RECORD.sig")) {
+            throw 'An updater evidence signature output unexpectedly already exists.'
+          }
+          try {
+            node node_modules/@tauri-apps/cli/tauri.js signer sign $env:PROVENANCE_SIGNED_INSTALLER
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri updater installer signing failed.' }
+            node node_modules/@tauri-apps/cli/tauri.js signer sign $env:PROVENANCE_BUNDLED_RECORD
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri bundled-record signing failed.' }
+          } finally {
+            Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+            Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+          }
+          foreach ($signaturePath in @(
+            "$env:PROVENANCE_SIGNED_INSTALLER.sig",
+            "$env:PROVENANCE_BUNDLED_RECORD.sig"
+          )) {
+            $signature = Get-Item -LiteralPath $signaturePath -Force
+            if ($signature.PSIsContainer -or
+                ($signature.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $signature.Length -le 0 -or $signature.Length -gt 16384) {
+              throw 'Tauri signing did not produce both bounded regular evidence signatures.'
+            }
+          }
+
+      - name: Generate and publicly verify exact release set
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $PWD 'signed-output'
+          if (Test-Path -LiteralPath $output) { throw 'The public release output is not fresh.' }
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $manifest = Join-Path $output 'latest.json'
+          node scripts/desktop-release.mjs manifest `
+            $env:PROVENANCE_SIGNED_INSTALLER `
+            $manifest `
+            $env:PROVENANCE_BUNDLED_RECORD `
+            $env:PROVENANCE_WINDOWS_SIGN_PAYLOAD_ROOT `
+            $env:PROVENANCE_SIGNED_NATIVE_CAPTURE
+          if ($LASTEXITCODE -ne 0) { throw 'Public updater and Authenticode verification failed.' }
+          node scripts/desktop-release.mjs verify $env:PROVENANCE_SIGNED_INSTALLER
+          if ($LASTEXITCODE -ne 0) { throw 'Independent signed-installer verification failed.' }
+          Copy-Item -LiteralPath $env:PROVENANCE_SIGNED_INSTALLER -Destination $output
+          Copy-Item -LiteralPath "$env:PROVENANCE_SIGNED_INSTALLER.sig" -Destination $output
+
+          $files = @(Get-ChildItem -LiteralPath $output -File)
+          $installers = @($files | Where-Object Name -CEQ ([IO.Path]::GetFileName($env:PROVENANCE_SIGNED_INSTALLER)))
+          $signatures = @($files | Where-Object Name -CEQ "$([IO.Path]::GetFileName($env:PROVENANCE_SIGNED_INSTALLER)).sig")
+          if ($files.Count -ne 4 -or $installers.Count -ne 1 -or $signatures.Count -ne 1 -or
+              -not (Test-Path -LiteralPath (Join-Path $output 'latest.json') -PathType Leaf) -or
+              -not (Test-Path -LiteralPath (Join-Path $output 'release-attestation.json') -PathType Leaf)) {
+            throw 'The public release directory must contain exactly four expected files.'
+          }
+          $latest = Get-Content -Raw -LiteralPath $manifest | ConvertFrom-Json
+          $attestation = Get-Content -Raw -LiteralPath (Join-Path $output 'release-attestation.json') | ConvertFrom-Json
+          $record = Get-Content -Raw -LiteralPath $env:PROVENANCE_BUNDLED_RECORD | ConvertFrom-Json
+          $recordHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:PROVENANCE_BUNDLED_RECORD).Hash.ToLowerInvariant()
+          $recordSignature = (Get-Content -Raw -LiteralPath "$env:PROVENANCE_BUNDLED_RECORD.sig").Trim()
+          if ($null -eq $latest.platforms.'windows-x86_64-nsis' -or
+              $latest.provenance.bundle.recordSha256 -cne $recordHash -or
+              $latest.provenance.bundle.signedNativeSha256 -cne [string]$record.sourcePayload.signedNativeSha256 -or
+              [string]$latest.provenance.bundle.signedRecord.signature -cne $recordSignature -or
+              [Convert]::ToBase64String([IO.File]::ReadAllBytes($env:PROVENANCE_BUNDLED_RECORD)) -cne
+                [string]$latest.provenance.bundle.signedRecord.canonicalBase64 -or
+              [string]$attestation.bundle.signedRecord.signature -cne $recordSignature -or
+              [string]$attestation.bundle.signedRecord.canonicalBase64 -cne
+                [string]$latest.provenance.bundle.signedRecord.canonicalBase64) {
+            throw 'The public updater manifest does not bind the exact signed native bundle.'
+          }
+          "PROVENANCE_PUBLIC_RELEASE_OUTPUT=$output" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload exact four-file verified release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-signed-${{ github.sha }}
+          path: ${{ env.PROVENANCE_PUBLIC_RELEASE_OUTPUT }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish protected GitHub release
+    needs: sign-and-verify
+    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified public release set
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: windows-signed-${{ github.sha }}
+          path: release-output
+
+      - name: Validate tag and exact four-file release set
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(jq -er '.version' release-output/latest.json)"
+          test "${GITHUB_REF_NAME}" = "v${version}"
+          test "$(find release-output -maxdepth 1 -type f | wc -l)" -eq 4
+          test "$(find release-output -maxdepth 1 -type f -name '*-setup.exe' | wc -l)" -eq 1
+          test "$(find release-output -maxdepth 1 -type f -name '*.exe.sig' | wc -l)" -eq 1
+          test -f release-output/latest.json
+          test -f release-output/release-attestation.json
+          jq -e '.platforms["windows-x86_64-nsis"] and .provenance.bundle.recordSha256 and .provenance.bundle.signedRecord.signature and .provenance.bundle.signedRecord.canonicalBase64' release-output/latest.json >/dev/null
+          jq -e '.bundle.signedRecord.signature and .bundle.signedRecord.canonicalBase64' release-output/release-attestation.json >/dev/null
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer="$(find release-output -maxdepth 1 -type f -name '*-setup.exe' -print -quit)"
+          signature="${installer}.sig"
+          gh release create "${GITHUB_REF_NAME}" \
+            "${installer}" \
+            "${signature}" \
+            release-output/latest.json \
+            release-output/release-attestation.json \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --verify-tag \
+            --title "Provenance ${{ steps.release.outputs.version }}" \
+            --generate-notes

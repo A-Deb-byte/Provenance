@@ -4,9 +4,15 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { accessControlStatus, createAccessGuard, resolveAccessMode } from './accessControl';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  accessControlStatus,
+  createAccessGuard,
+  getRequestAccessPrincipal,
+  resolveAccessMode,
+} from './accessControl';
 import { createAuthApi } from './api';
+import { createFirstAdminBootstrapAuthority } from './bootstrapAuthority';
 import { createUserStore, UserStore } from './users';
 
 let dir = '';
@@ -15,12 +21,35 @@ let server: Server | undefined;
 let baseUrl = '';
 const sessionSecret = 'test-session-secret';
 
-const startApp = async (operatorToken?: string): Promise<void> => {
+const startApp = async (
+  operatorToken?: string,
+  onFirstAdminCreated?: () => void | Promise<void>,
+  onSuccessfulLogin?: () => void | Promise<void>,
+  firstAdminBootstrapSecret?: string,
+): Promise<void> => {
   const app = express();
+  const firstAdminBootstrapAuthority = createFirstAdminBootstrapAuthority(firstAdminBootstrapSecret);
   app.use(express.json());
-  app.use('/api/auth', createAuthApi({ userStore: store, sessionSecret, operatorToken }));
-  app.use('/api/kernel', createAccessGuard({ userStore: store, operatorToken, sessionSecret }));
-  app.post('/api/kernel/thing', (_req, res) => res.json({ mutated: true }));
+  app.use('/api/auth', createAuthApi({
+    userStore: store,
+    sessionSecret,
+    operatorToken,
+    onFirstAdminCreated,
+    onSuccessfulLogin,
+    firstAdminBootstrapAuthority,
+  }));
+  app.use('/api', createAccessGuard({
+    userStore: store,
+    operatorToken,
+    sessionSecret,
+    firstAdminBootstrapPending: () => Boolean(firstAdminBootstrapAuthority?.isPending()),
+  }));
+  app.post('/api/kernel/thing', (req, res) => res.json({
+    mutated: true,
+    principal: getRequestAccessPrincipal(req),
+  }));
+  app.post('/api/providers/configure', (_req, res) => res.json({ configured: true }));
+  app.post('/api/vault/secrets', (_req, res) => res.json({ stored: true }));
   app.get('/api/kernel/thing', (_req, res) => res.json({ read: true }));
   app.get('/api/kernel/runtime-report', (_req, res) => res.json({ safe: true }));
   app.get('/api/kernel/research-missions', (_req, res) => res.json({ missions: [] }));
@@ -33,9 +62,18 @@ const startApp = async (operatorToken?: string): Promise<void> => {
   baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 };
 
-const post = (p: string, body: unknown, token?: string) => fetch(`${baseUrl}${p}`, {
+const post = (
+  p: string,
+  body: unknown,
+  token?: string,
+  extraHeaders: Record<string, string> = {},
+) => fetch(`${baseUrl}${p}`, {
   method: 'POST',
-  headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+  headers: {
+    'content-type': 'application/json',
+    ...(token ? { authorization: `Bearer ${token}` } : {}),
+    ...extraHeaders,
+  },
   body: JSON.stringify(body),
 });
 
@@ -50,6 +88,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   if (server) {
     const active = server;
     server = undefined;
@@ -71,7 +110,12 @@ describe('access mode resolution', () => {
 describe('guard: open and operator-token modes', () => {
   it('allows mutations when no users and no token', async () => {
     await startApp(undefined);
-    expect((await post('/api/kernel/thing', {})).status).toBe(200);
+    const response = await post('/api/kernel/thing', {});
+    expect(response.status).toBe(200);
+    expect((await response.json()).principal).toMatchObject({
+      principalId: 'access:loopback-open',
+      mode: 'open',
+    });
   });
 
   it('requires the operator token when configured and no users exist', async () => {
@@ -80,7 +124,12 @@ describe('guard: open and operator-token modes', () => {
     expect((await post('/api/auth/operator/verify', {}, 'wrong-token')).status).toBe(401);
     expect((await post('/api/auth/operator/verify', {}, 'secret-token')).status).toBe(204);
     expect((await post('/api/kernel/thing', {})).status).toBe(401);
-    expect((await post('/api/kernel/thing', {}, 'secret-token')).status).toBe(200);
+    const authorized = await post('/api/kernel/thing', {}, 'secret-token');
+    expect(authorized.status).toBe(200);
+    expect((await authorized.json()).principal).toMatchObject({
+      principalId: 'access:shared-operator-token',
+      mode: 'operator_token',
+    });
     expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(401);
     expect((await fetch(`${baseUrl}/api/kernel/thing`, {
       headers: { authorization: 'Bearer secret-token' },
@@ -98,12 +147,163 @@ describe('guard: open and operator-token modes', () => {
 });
 
 describe('multi-user flow', () => {
+  it('rejects malformed or missing required native bootstrap secrets', () => {
+    expect(() => createFirstAdminBootstrapAuthority(
+      'not-a-256-bit-base64url-secret',
+    )).toThrow(/bootstrap secret is invalid/);
+    expect(() => createFirstAdminBootstrapAuthority(undefined, { required: true }))
+      .toThrow(/Native desktop launches require/);
+    expect(createFirstAdminBootstrapAuthority(undefined)).toBeUndefined();
+  });
+
+  it('keeps bootstrap authority pending until persistence is explicitly completed', () => {
+    const secret = 'P'.repeat(43);
+    const authority = createFirstAdminBootstrapAuthority(secret)!;
+    expect(authority.isPending()).toBe(true);
+    expect(authority.authorize(secret)).toBe(true);
+    expect(authority.isPending()).toBe(true);
+    authority.completeAfterPersistence();
+    expect(authority.isPending()).toBe(false);
+    expect(authority.authorize(secret)).toBe(false);
+  });
+
+  it('requires and consumes the native per-launch first-admin bootstrap secret', async () => {
+    const bootstrapSecret = 'A'.repeat(43);
+    let refreshes = 0;
+    await startApp(undefined, () => { refreshes += 1; }, undefined, bootstrapSecret);
+
+    expect((await fetch(`${baseUrl}/api/auth/status`)).status).toBe(200);
+    expect((await fetch(`${baseUrl}/api/auth/users`)).status).toBe(401);
+    expect((await post('/api/auth/login', {
+      username: 'admin1', password: 'adminpassword',
+    })).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(401);
+    expect((await fetch(`${baseUrl}/api/kernel/runtime-report`)).status).toBe(401);
+    expect((await post('/api/kernel/thing', {}, undefined, {
+      'x-provenance-first-admin-bootstrap': bootstrapSecret,
+    })).status).toBe(401);
+    expect((await post('/api/providers/configure', {}, undefined, {
+      'x-provenance-first-admin-bootstrap': bootstrapSecret,
+    })).status).toBe(401);
+    expect((await post('/api/vault/secrets', {}, undefined, {
+      'x-provenance-first-admin-bootstrap': bootstrapSecret,
+    })).status).toBe(401);
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    })).status).toBe(401);
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    }, undefined, { 'x-provenance-first-admin-bootstrap': 'B'.repeat(43) })).status).toBe(401);
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'short',
+    }, undefined, { 'x-provenance-first-admin-bootstrap': bootstrapSecret })).status).toBe(400);
+    expect((await fetch(`${baseUrl}/api/kernel/thing`)).status).toBe(401);
+    expect(store.count()).toBe(0);
+    expect(refreshes).toBe(0);
+
+    const bootstrap = await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    }, undefined, { 'x-provenance-first-admin-bootstrap': bootstrapSecret });
+    expect(bootstrap.status).toBe(201);
+    expect(store.count()).toBe(1);
+    expect(refreshes).toBe(1);
+
+    expect((await post('/api/kernel/thing', {})).status).toBe(401);
+    const login = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
+    expect(login.status).toBe(200);
+    const adminToken = (await login.json()).token as string;
+    expect((await post('/api/kernel/thing', {}, adminToken)).status).toBe(200);
+    expect((await post('/api/providers/configure', {}, adminToken)).status).toBe(200);
+    expect((await post('/api/vault/secrets', {}, adminToken)).status).toBe(200);
+
+    expect((await post('/api/auth/users', {
+      username: 'second-admin', password: 'adminpassword',
+    }, undefined, { 'x-provenance-first-admin-bootstrap': bootstrapSecret })).status).toBe(403);
+    expect(store.count()).toBe(1);
+  });
+
+  it('refreshes protected runtime authority only after the first admin is persisted', async () => {
+    const observedUserCounts: number[] = [];
+    await startApp(undefined, async () => {
+      observedUserCounts.push(store.count());
+    });
+
+    const bootstrap = await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    });
+    expect(bootstrap.status).toBe(201);
+    expect(observedUserCounts).toEqual([1]);
+
+    const login = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
+    const adminToken = (await login.json()).token as string;
+    expect((await post('/api/auth/users', {
+      username: 'operator1', password: 'operatorpassword', role: 'operator',
+    }, adminToken)).status).toBe(201);
+    expect(observedUserCounts).toEqual([1]);
+  });
+
+  it('keeps a persisted bootstrap successful when runtime authority refresh fails closed', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await startApp(undefined, async () => {
+      throw new Error('fixture runtime unavailable');
+    });
+
+    const bootstrap = await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    });
+
+    expect(bootstrap.status).toBe(201);
+    expect(store.count()).toBe(1);
+    expect(warning).toHaveBeenCalledWith(
+      '[Auth] First-admin authority refresh failed; protected runtimes remain unavailable.',
+    );
+    warning.mockRestore();
+  });
+
+  it('retries a failed bootstrap authority refresh after valid login without a restart', async () => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    let attempts = 0;
+    const refresh = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('fixture bridge was not ready');
+    };
+    await startApp(undefined, refresh, refresh);
+
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    })).status).toBe(201);
+    expect(attempts).toBe(1);
+
+    const login = await post('/api/auth/login', { username: 'admin1', password: 'adminpassword' });
+    expect(login.status).toBe(200);
+    expect(attempts).toBe(2);
+    expect((await post('/api/auth/login', { username: 'admin1', password: 'wrong-password' })).status).toBe(401);
+    expect(attempts).toBe(2);
+    expect(warning).toHaveBeenCalledWith(
+      '[Auth] First-admin authority refresh failed; protected runtimes remain unavailable.',
+    );
+    warning.mockRestore();
+  });
+
   it('requires the configured operator token for first-admin bootstrap', async () => {
     await startApp('bootstrap-secret');
     expect((await post('/api/auth/users', { username: 'admin1', password: 'adminpassword' })).status).toBe(401);
     expect((await post('/api/auth/users', {
       username: 'admin1', password: 'adminpassword',
     }, 'bootstrap-secret')).status).toBe(201);
+  });
+
+  it('uses native launch authority without deadlocking on a restored operator token', async () => {
+    const bootstrapSecret = 'N'.repeat(43);
+    await startApp('restored-operator-token', undefined, undefined, bootstrapSecret);
+
+    const status = await fetch(`${baseUrl}/api/auth/status`);
+    expect((await status.json()).mode).toBe('open');
+    expect((await post('/api/auth/operator/verify', {}, 'restored-operator-token')).status).toBe(401);
+    expect((await post('/api/auth/users', {
+      username: 'admin1', password: 'adminpassword',
+    }, undefined, { 'x-provenance-first-admin-bootstrap': bootstrapSecret })).status).toBe(201);
+    expect(store.count()).toBe(1);
   });
 
   it('bootstraps the first admin, logs in, and enforces role-scoped mutations', async () => {

@@ -276,6 +276,7 @@ fn bounded_text(value: String) -> String {
 mod windows_worker {
     use super::*;
     use crate::contracts::{MAX_TREE_DEPTH, MAX_TREE_NODES};
+    use hmac::{Hmac, Mac};
     use rand::rngs::OsRng;
     use rand::RngCore;
     use sha2::{Digest, Sha256};
@@ -294,8 +295,8 @@ mod windows_worker {
     };
     use windows::Win32::UI::Accessibility::{
         CUIAutomation8, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-        IUIAutomationTreeWalker, IUIAutomationValuePattern, UIA_InvokePatternId,
-        UIA_ValuePatternId,
+        IUIAutomationTogglePattern, IUIAutomationTreeWalker, IUIAutomationValuePattern,
+        UIA_InvokePatternId, UIA_TogglePatternId, UIA_ValuePatternId,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindow,
@@ -528,9 +529,16 @@ mod windows_worker {
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let (target, element, path) =
                 self.resolve_authoritative_node(app_id, window_id, tree_revision, node_id)?;
-            let pattern: IUIAutomationInvokePattern =
-                unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }
-                    .map_err(|_| DesktopExecutionError::UnsupportedPattern)?;
+            let toggle_pattern: Option<IUIAutomationTogglePattern> =
+                unsafe { element.GetCurrentPatternAs(UIA_TogglePatternId) }.ok();
+            let invoke_pattern: Option<IUIAutomationInvokePattern> = if toggle_pattern.is_none() {
+                unsafe { element.GetCurrentPatternAs(UIA_InvokePatternId) }.ok()
+            } else {
+                None
+            };
+            if invoke_pattern.is_none() && toggle_pattern.is_none() {
+                return Err(DesktopExecutionError::UnsupportedPattern);
+            }
             if !unsafe { element.CurrentIsEnabled() }
                 .map(|value| value.as_bool())
                 .unwrap_or(false)
@@ -538,8 +546,29 @@ mod windows_worker {
                 return Err(DesktopExecutionError::NodeStale);
             }
             self.revalidate_node_identity(&element, &path, node_id)?;
-            unsafe { pattern.Invoke() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-            self.verify_mutation_after_side_effect(target, tree_revision, "desktop.click")
+            self.revalidate_target_identity(&target)?;
+            let independently_verified = if let Some(pattern) = toggle_pattern {
+                let before = unsafe { pattern.CurrentToggleState() }
+                    .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                unsafe { pattern.Toggle() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                let after = unsafe { pattern.CurrentToggleState() }
+                    .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                if after == before {
+                    return Err(DesktopExecutionError::OutcomeUncertain);
+                }
+                true
+            } else if let Some(pattern) = invoke_pattern {
+                unsafe { pattern.Invoke() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                false
+            } else {
+                return Err(DesktopExecutionError::UnsupportedPattern);
+            };
+            self.verify_mutation_after_side_effect(
+                target,
+                tree_revision,
+                "desktop.click",
+                independently_verified,
+            )
         }
 
         fn type_value(
@@ -552,35 +581,63 @@ mod windows_worker {
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let (target, element, path) =
                 self.resolve_authoritative_node(app_id, window_id, tree_revision, node_id)?;
-            let pattern: IUIAutomationValuePattern =
-                unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
-                    .map_err(|_| DesktopExecutionError::UnsupportedPattern)?;
-            if unsafe { pattern.CurrentIsReadOnly() }
-                .map(|value| value.as_bool())
-                .unwrap_or(true)
             {
-                return Err(DesktopExecutionError::ReadOnly);
+                let pattern: IUIAutomationValuePattern =
+                    unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
+                        .map_err(|_| DesktopExecutionError::UnsupportedPattern)?;
+                if unsafe { pattern.CurrentIsReadOnly() }
+                    .map(|value| value.as_bool())
+                    .unwrap_or(true)
+                {
+                    return Err(DesktopExecutionError::ReadOnly);
+                }
             }
             self.revalidate_node_identity(&element, &path, node_id)?;
+            self.revalidate_target_identity(&target)?;
             unsafe { element.SetFocus() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+            let element = self
+                .reacquire_node_at_path(&target, &path, node_id)
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             if !unsafe { element.CurrentIsEnabled() }
                 .map(|value| value.as_bool())
                 .unwrap_or(false)
             {
                 return Err(DesktopExecutionError::OutcomeUncertain);
             }
+            self.revalidate_node_identity(&element, &path, node_id)
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+            self.revalidate_target_identity(&target)
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+            let pattern: IUIAutomationValuePattern =
+                unsafe { element.GetCurrentPatternAs(UIA_ValuePatternId) }
+                    .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             if unsafe { pattern.CurrentIsReadOnly() }
                 .map(|value| value.as_bool())
                 .unwrap_or(true)
             {
                 return Err(DesktopExecutionError::OutcomeUncertain);
             }
-            self.revalidate_node_identity(&element, &path, node_id)
-                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             let value = BSTR::from(payload);
             unsafe { pattern.SetValue(&value) }
                 .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-            self.verify_mutation_after_side_effect(target, tree_revision, "desktop.type")
+            let actual = unsafe { pattern.CurrentValue() }
+                .map(|value| value.to_string())
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+            if !self.value_matches(payload, &actual) {
+                return Err(DesktopExecutionError::OutcomeUncertain);
+            }
+            self.verify_mutation_after_side_effect(target, tree_revision, "desktop.type", true)
+        }
+
+        fn value_matches(&self, expected: &str, actual: &str) -> bool {
+            let mut expected_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.node_salt)
+                .expect("HMAC accepts a 32-byte key");
+            expected_mac.update(expected.as_bytes());
+            let expected_tag = expected_mac.finalize().into_bytes();
+            let mut actual_mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.node_salt)
+                .expect("HMAC accepts a 32-byte key");
+            actual_mac.update(actual.as_bytes());
+            actual_mac.verify_slice(&expected_tag).is_ok()
         }
 
         fn verify_mutation_after_side_effect(
@@ -588,9 +645,11 @@ mod windows_worker {
             target: WindowTarget,
             previous_revision: &str,
             action: &'static str,
+            independently_verified: bool,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let window_id = target.window_id.clone();
-            match self.verify_after_write(target, previous_revision, action) {
+            match self.verify_after_write(target, previous_revision, action, independently_verified)
+            {
                 Ok(output) => Ok(output),
                 Err(_) => {
                     self.trees.remove(&window_id);
@@ -604,8 +663,12 @@ mod windows_worker {
             target: WindowTarget,
             previous_revision: &str,
             action: &'static str,
+            independently_verified: bool,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let current = self.build_tree(&target)?;
+            if !independently_verified && current.revision == previous_revision {
+                return Err(DesktopExecutionError::OutcomeUncertain);
+            }
             let content = MutationContent {
                 schema_version: 1,
                 kind: "desktop.action",
@@ -628,7 +691,7 @@ mod windows_worker {
         }
 
         fn authoritative_target(
-            &self,
+            &mut self,
             app_id: &str,
             window_id: &str,
         ) -> Result<WindowTarget, DesktopExecutionError> {
@@ -641,15 +704,32 @@ mod windows_worker {
                 .filter(|target| target.app_id == app_id)
                 .cloned()
                 .ok_or(DesktopExecutionError::WindowStale)?;
-            if !unsafe { IsWindow(Some(target.hwnd())) }.as_bool()
-                || window_pid(target.hwnd()) != Some(target.pid)
-                || process_path(target.pid)
-                    .map(|path| !paths_equal(&path, &target.executable_path))
-                    .unwrap_or(true)
-            {
-                return Err(DesktopExecutionError::WindowStale);
-            }
+            self.revalidate_target_identity(&target)?;
             Ok(target)
+        }
+
+        fn target_identity_matches(&self, target: &WindowTarget) -> bool {
+            self.allowed
+                .get(&target.app_id)
+                .map(|allowed| paths_equal(&allowed.executable_path, &target.executable_path))
+                .unwrap_or(false)
+                && unsafe { IsWindow(Some(target.hwnd())) }.as_bool()
+                && window_pid(target.hwnd()) == Some(target.pid)
+                && process_path(target.pid)
+                    .map(|path| paths_equal(&path, &target.executable_path))
+                    .unwrap_or(false)
+        }
+
+        fn revalidate_target_identity(
+            &mut self,
+            target: &WindowTarget,
+        ) -> Result<(), DesktopExecutionError> {
+            if self.target_identity_matches(target) {
+                return Ok(());
+            }
+            self.windows.remove(&target.window_id);
+            self.trees.remove(&target.window_id);
+            Err(DesktopExecutionError::WindowStale)
         }
 
         fn resolve_authoritative_node(
@@ -681,6 +761,27 @@ mod windows_worker {
                 .cloned()
                 .ok_or(DesktopExecutionError::NodeStale)?;
             Ok((target, element, expected_path))
+        }
+
+        fn reacquire_node_at_path(
+            &mut self,
+            target: &WindowTarget,
+            expected_path: &[usize],
+            expected_node_id: &str,
+        ) -> Result<IUIAutomationElement, DesktopExecutionError> {
+            self.revalidate_target_identity(target)?;
+            let current = self.build_tree(target)?;
+            if current.paths.get(expected_node_id).map(Vec::as_slice) != Some(expected_path) {
+                return Err(DesktopExecutionError::NodeStale);
+            }
+            let element = current
+                .elements
+                .get(expected_node_id)
+                .cloned()
+                .ok_or(DesktopExecutionError::NodeStale)?;
+            self.revalidate_node_identity(&element, expected_path, expected_node_id)?;
+            self.revalidate_target_identity(target)?;
+            Ok(element)
         }
 
         fn revalidate_node_identity(
@@ -723,7 +824,11 @@ mod windows_worker {
             ]))
         }
 
-        fn build_tree(&self, target: &WindowTarget) -> Result<BuiltTree, DesktopExecutionError> {
+        fn build_tree(
+            &mut self,
+            target: &WindowTarget,
+        ) -> Result<BuiltTree, DesktopExecutionError> {
+            self.revalidate_target_identity(target)?;
             let root = unsafe { self.automation.ElementFromHandle(target.hwnd()) }
                 .map_err(|_| DesktopExecutionError::WindowStale)?;
             let mut nodes = Vec::new();
@@ -737,6 +842,7 @@ mod windows_worker {
                 &mut paths,
                 &mut elements,
             )?;
+            self.revalidate_target_identity(target)?;
             let serialized_nodes =
                 serde_json::to_vec(&nodes).map_err(|_| DesktopExecutionError::FailedClosed)?;
             let revision = hash_values(&[target.window_id.as_bytes(), &serialized_nodes]);
@@ -1019,6 +1125,264 @@ mod tests {
         ] {
             assert!(!error.public_summary().contains("secret"));
             assert!(!error.code().is_empty());
+        }
+    }
+
+    #[cfg(windows)]
+    mod live_windows_acceptance {
+        use super::*;
+        use serde_json::Value;
+        use sha2::{Digest, Sha256};
+        use std::ffi::c_void;
+        use std::path::PathBuf;
+        use std::thread::JoinHandle;
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DispatchMessageW, GetMessageW, GetWindowTextLengthW, GetWindowTextW,
+            PostThreadMessageW, SendMessageW, ShowWindow, TranslateMessage, BM_GETCHECK,
+            BS_AUTOCHECKBOX, ES_AUTOHSCROLL, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_QUIT,
+            WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+        };
+
+        const APP_ID: &str = "provenance.acceptance.fixture";
+        const TOGGLE_NAME: &str = "Acceptance toggle";
+        const EDIT_NAME: &str = "Acceptance input";
+
+        struct AcceptanceWindow {
+            title: String,
+            edit: isize,
+            toggle: isize,
+            thread_id: u32,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl AcceptanceWindow {
+            fn start() -> Self {
+                let title = format!(
+                    "Provenance UIA acceptance {}",
+                    uuid::Uuid::new_v4().simple()
+                );
+                let thread_title = title.clone();
+                let (ready, receiver) = mpsc::sync_channel(1);
+                let thread = std::thread::spawn(move || unsafe {
+                    let title_wide = wide(&thread_title);
+                    let edit_text = wide(EDIT_NAME);
+                    let toggle_text = wide(TOGGLE_NAME);
+                    let result = (|| -> Result<(isize, isize, u32), String> {
+                        let window = CreateWindowExW(
+                            WINDOW_EX_STYLE::default(),
+                            w!("STATIC"),
+                            PCWSTR(title_wide.as_ptr()),
+                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                            120,
+                            120,
+                            520,
+                            240,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .map_err(|error| format!("fixture window creation failed: {error}"))?;
+                        let edit = CreateWindowExW(
+                            WINDOW_EX_STYLE::default(),
+                            w!("EDIT"),
+                            PCWSTR(edit_text.as_ptr()),
+                            WS_CHILD
+                                | WS_VISIBLE
+                                | WS_TABSTOP
+                                | WS_BORDER
+                                | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                            32,
+                            40,
+                            420,
+                            36,
+                            Some(window),
+                            None,
+                            None,
+                            None,
+                        )
+                        .map_err(|error| format!("fixture edit creation failed: {error}"))?;
+                        let toggle = CreateWindowExW(
+                            WINDOW_EX_STYLE::default(),
+                            w!("BUTTON"),
+                            PCWSTR(toggle_text.as_ptr()),
+                            WS_CHILD
+                                | WS_VISIBLE
+                                | WS_TABSTOP
+                                | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                            32,
+                            104,
+                            240,
+                            36,
+                            Some(window),
+                            None,
+                            None,
+                            None,
+                        )
+                        .map_err(|error| format!("fixture toggle creation failed: {error}"))?;
+                        let _ = ShowWindow(window, SW_SHOW);
+                        Ok((edit.0 as isize, toggle.0 as isize, GetCurrentThreadId()))
+                    })();
+                    if ready.send(result).is_err() {
+                        return;
+                    }
+                    let mut message = MSG::default();
+                    while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                });
+                let (edit, toggle, thread_id) = receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("fixture window did not start")
+                    .expect("fixture window could not be created");
+                Self {
+                    title,
+                    edit,
+                    toggle,
+                    thread_id,
+                    thread: Some(thread),
+                }
+            }
+
+            fn edit_text(&self) -> String {
+                unsafe {
+                    let hwnd = HWND(self.edit as *mut c_void);
+                    let length = GetWindowTextLengthW(hwnd).max(0) as usize;
+                    let mut buffer = vec![0_u16; length + 1];
+                    let written = GetWindowTextW(hwnd, &mut buffer).max(0) as usize;
+                    String::from_utf16_lossy(&buffer[..written])
+                }
+            }
+
+            fn toggle_checked(&self) -> bool {
+                unsafe {
+                    SendMessageW(HWND(self.toggle as *mut c_void), BM_GETCHECK, None, None).0 == 1
+                }
+            }
+        }
+
+        impl Drop for AcceptanceWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                }
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        fn wide(value: &str) -> Vec<u16> {
+            value.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        fn content(output: DesktopActionOutput) -> Value {
+            serde_json::from_str(output.content.as_deref().expect("action content missing"))
+                .expect("action content was not JSON")
+        }
+
+        fn text_hash(value: &str) -> String {
+            hex::encode(Sha256::digest(value.as_bytes()))
+        }
+
+        #[test]
+        fn discovers_inspects_clicks_and_types_against_a_real_win32_window() {
+            let fixture = AcceptanceWindow::start();
+            let executable_path = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+            let broker = UiaBroker::start(vec![AllowedApplication {
+                app_id: APP_ID.into(),
+                executable_path: PathBuf::from(executable_path),
+            }])
+            .expect("UI Automation broker did not start");
+
+            let discovered = content(
+                broker
+                    .execute(ActionEnvelope {
+                        schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                        action: DesktopAction::Discover {
+                            app_id: APP_ID.into(),
+                        },
+                        payload_text: None,
+                    })
+                    .expect("fixture discovery failed"),
+            );
+            let window = discovered["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|window| window["title"].as_str() == Some(&fixture.title))
+                .expect("fixture window was not discovered");
+            let window_id = window["windowId"].as_str().unwrap().to_string();
+            let discovery_revision = window["treeRevision"].as_str().unwrap().to_string();
+
+            let inspected = content(
+                broker
+                    .execute(ActionEnvelope {
+                        schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                        action: DesktopAction::Inspect {
+                            app_id: APP_ID.into(),
+                            window_id: window_id.clone(),
+                            tree_revision: discovery_revision,
+                        },
+                        payload_text: None,
+                    })
+                    .expect("fixture inspection failed"),
+            );
+            let tree_revision = inspected["treeRevision"].as_str().unwrap().to_string();
+            let nodes = inspected["nodes"].as_array().unwrap();
+            let toggle_node = nodes
+                .iter()
+                .find(|node| node["name"].as_str() == Some(TOGGLE_NAME))
+                .expect("fixture toggle was not present in the UIA tree");
+            let edit_node = nodes
+                .iter()
+                .find(|node| node["name"].as_str() == Some(EDIT_NAME))
+                .expect("fixture edit was not present in the UIA tree");
+            let toggle_node_id = toggle_node["nodeId"].as_str().unwrap().to_string();
+            let edit_node_id = edit_node["nodeId"].as_str().unwrap().to_string();
+
+            let clicked = content(
+                broker
+                    .execute(ActionEnvelope {
+                        schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                        action: DesktopAction::Click {
+                            app_id: APP_ID.into(),
+                            window_id: window_id.clone(),
+                            tree_revision,
+                            node_id: toggle_node_id,
+                        },
+                        payload_text: None,
+                    })
+                    .expect("fixture click failed"),
+            );
+            assert!(
+                fixture.toggle_checked(),
+                "UIA invoke did not toggle the real control"
+            );
+
+            let payload = "typed by Provenance acceptance";
+            let after_click_revision = clicked["currentTreeRevision"].as_str().unwrap().to_string();
+            let typed = content(
+                broker
+                    .execute(ActionEnvelope {
+                        schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                        action: DesktopAction::Type {
+                            app_id: APP_ID.into(),
+                            window_id,
+                            tree_revision: after_click_revision,
+                            node_id: edit_node_id,
+                            payload_hash: text_hash(payload),
+                        },
+                        payload_text: Some(payload.into()),
+                    })
+                    .expect("fixture typing failed"),
+            );
+            assert_eq!(typed["action"], "desktop.type");
+            assert_eq!(fixture.edit_text(), payload);
         }
     }
 }

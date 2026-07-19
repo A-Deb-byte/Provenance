@@ -15,10 +15,12 @@ Provenance now provides:
 - Normalized provider routing for Google Gemini, OpenAI, OpenRouter, DeepSeek, and GLM, plus an explicit unavailable boundary for AWS Bedrock when its runtime is absent.
 - Evidence-backed memory and a bounded `pure-transform-v1` skill foundry that never executes model-generated source code.
 - Read-only web inspection and a Playwright browser worker for navigation, clicking, and hash-addressed text entry.
-- A Docker command sandbox when Docker is available, with an explicitly reported trusted-host fallback when it is not.
+- A Docker command sandbox with exact workspace health checks. Standalone source runs retain an explicitly reported trusted-host fallback; native desktop launches fail closed and disable command execution unless Docker and the configured image are healthy.
 - Windows DPAPI, macOS Keychain, and Linux Secret Service vault adapters, selected and reported by platform.
 - Dashboard authentication for operator-token, bootstrap, login, role-scoped sessions, logout, and session revocation.
-- A Windows Native Desktop Runtime v1 source slice: a Tauri/Rust host owns and supervises the local Node control plane, an authenticated loopback bridge exposes bounded UI Automation, and the dashboard routes desktop work through kernel policy, approval, capability, and ledger boundaries.
+- A Windows Production Desktop Release v1 implementation: a Tauri/Rust host owns and supervises the local Node control plane, first-run native dialogs establish the application allowlist and command workspace, and a one-time native launch secret authorizes first-admin creation. The desktop worker can then activate without a restart, but only with its pre-registered fixed application and action authority.
+- A two-stage release-only NSIS pipeline for a self-contained server bundle, exact Node/Rust/Tauri/license-tool contracts, an exactly pinned Windows x64 Node runtime and license, Authenticode signing, Tauri updater signatures, and a digest-pinned Docker image. Producing or publishing an installer still requires protected production variables, external keys and certificates, hosted artifacts, and an explicit protected release run.
+- Authenticated coded diagnostics and a redacted, hash-integrity support bundle. Diagnostic exports omit credentials, authoritative payload text, absolute paths, and updater authority.
 - Controlled staged releases with canonical authorization signatures, evaluation gates, verified installation, supervised process readiness, restart restoration, and rollback on activation failure.
 
 This is a substantial local control plane, not an unrestricted self-modifying agent. Remaining deployment boundaries are listed below.
@@ -65,23 +67,31 @@ In `multi_user` and `operator_token` modes, authoritative kernel reads also requ
 
 Memory records follow `candidate -> promoted -> superseded/revoked`. Promotion requires an explicit reason and at least one independent, source-backed ledger event; a candidate's own creation event is not acceptable evidence. Provider extraction creates candidates only and cannot silently promote or delete durable memory.
 
-The skill foundry synthesizes an allowlisted text-transform DSL, compares it with a baseline, evaluates submitted replay cases, and then canaries kernel-generated fixtures against a separate reference interpreter. The canary-run endpoint accepts no caller input or expected output. Promotion requires every independent canary run to pass and remains reversible.
+The skill foundry synthesizes only the allowlisted `pure-transform-v1` DSL. A caller may reference an evaluator source id, but cannot submit oracle cases, expected outputs, author identity, or evaluator authority. A configured, allowlisted evaluator resolver supplies hash-sealed held-out cases; the kernel attests that source before sealing the suite, binds the authenticated candidate author, rejects same-author evaluation and training overlap, and keeps oracle values out of the API. Evaluation, canary, promotion, and invocation recheck the source -> suite -> candidate ledger order and hashes. Production fails closed until an independent evaluator integration is configured.
 
 ### Browser actions, approvals, and grants
 
-`browser.inspect` is read-only L0. Browser navigation, clicking, typing, and downloads have a minimum L2 risk and require explicit approval. The browser driver checks the allowlisted origin before an action, after navigation, and after click/script-driven navigation; redirects cannot silently widen scope.
+`browser.inspect` is read-only L0. Browser navigation, clicking, typing, and any future download operation have a minimum L2 risk and require explicit approval. The browser driver blocks off-origin top-level document requests before dispatch, rechecks the origin after navigation and click/script-driven navigation, closes unexpected pages, and rejects any download triggered by a write action. The current write worker does not implement `browser.download`.
 
 For approval-gated automations, the first run creates a persisted approval. A later run may consume the matching approved record and execute within that exact intent. Capability grants are persisted and consumed before worker I/O; the worker must claim the resulting opaque one-use dispatch authorization immediately before acting.
 
-### Native desktop runtime v1
+### Production desktop release v1
 
-The Windows desktop source slice places a Tauri/Rust host above the existing TypeScript control plane. The host acquires exclusive ownership of the `.agent-kernel` runtime before Node opens it, supervises the fixed `dist/server.cjs` entrypoint under a kill-on-close Windows job, and accepts readiness only from a per-launch nonce-bound file. A standalone Node launch uses the same owner record and refuses to open a runtime already held by a live owner. This is single-owner fencing, not multi-process shared-state coordination.
+The Windows desktop host places Tauri/Rust above the existing TypeScript control plane. It acquires exclusive ownership of the `.agent-kernel` runtime before Node opens it, supervises the fixed `dist/server.cjs` entrypoint under a kill-on-close Windows job, and accepts readiness only from a per-launch nonce-bound file. A standalone Node launch uses the same owner record and refuses to open a runtime already held by a live owner. This is single-owner fencing, not multi-process shared-state coordination.
 
-The native bridge binds to an ephemeral `127.0.0.1` port. Requests and responses are HMAC-SHA256 authenticated with a per-launch secret; request ids, bounded timestamps, body hashes, response status, and nonce replay protection are part of the protocol. The Node process registers the Windows worker only after authenticated health reports the exact expected capabilities and application allowlist. Bridge credentials and runtime-owner nonces are generated for one supervised launch and are neither dashboard configuration nor persisted authority.
+On the first packaged launch, native dialogs require the operator to choose and confirm both a 1-32 executable application allowlist and a project workspace containing a real `package.json`. The workspace must be disjoint from bundled resources, native configuration, and runtime state. Packaged releases ignore environment-provided application authority; invalid persisted selections are quarantined and require explicit reconfiguration. Development launches may still use the documented environment overrides. Rust generates a URL-safe one-launch first-admin secret, passes it to Node through the minimal child environment, and opens the webview with it in the URL fragment. The dashboard immediately removes the fragment from the visible URL/history, keeps it only in memory, and sends it only in the dedicated first-admin header. Node deletes the inherited environment value and consumes the authority only after the administrator record is durably created.
 
-Desktop use requires `operator_token` or `multi_user` access control; it is blocked in loopback `open` mode. `desktop.discover` and `desktop.inspect` are L0 read-only operations. `desktop.click` and `desktop.type` are minimum L2 and execute only after the matching approval is consumed and a one-use capability dispatch is claimed. Every request remains scoped to an allowlisted executable identity; mutations additionally bind the discovered window, UI tree revision, and node id. Text is resolved from a hash-addressed artifact rather than accepted from an observation. UI Automation output is untrusted evidence and cannot grant authority.
+The native bridge binds to an ephemeral `127.0.0.1` port. Requests and responses are HMAC-SHA256 authenticated with a per-launch secret; request ids, bounded timestamps, body hashes, response status, and nonce replay protection are part of the protocol. While native first-admin bootstrap is pending, the shared API guard denies everything except the narrowly self-authorizing auth status/create routes. After bootstrap and automatic login, Node changes to `multi_user`, rechecks authenticated bridge health, and activates the already registered desktop runtime without a process restart. Registry activation is one-way availability only: it cannot change the configured worker id, operations, risk levels, or application allowlist. A failed activation stays unavailable and a later valid login may retry it. Bridge credentials, bootstrap authority, and runtime-owner nonces are generated for one supervised launch and are neither dashboard configuration nor persisted authority.
 
-The v1 worker does not expose shortcuts, elevation, arbitrary shell execution, plugins, downloads, an installer, or an updater. Native availability is health-gated and remains unavailable when the host, access mode, allowlist, or authenticated bridge is not ready.
+Desktop use requires `operator_token` or `multi_user` access control; it is blocked in loopback `open` mode. `desktop.discover` and `desktop.inspect` are L0 read-only operations. `desktop.click` and `desktop.type` are minimum L2 and execute only after the matching approval is consumed and a one-use capability dispatch is claimed. Every mutation revalidates the allowlisted executable, process, window, tree revision, path, and node identity immediately before acting. Typing discards the pre-focus value pattern, rebuilds and revalidates the tree after focus, then obtains a fresh value pattern immediately before `SetValue`. Text is resolved from a bounded consume-once payload store and checked against its intent hash. UI Automation output is untrusted evidence and cannot grant authority.
+
+Packaged command execution is a separate authority boundary. The release build embeds a digest-pinned Docker image reference and the Node server verifies Docker by running the configured image against the exact selected workspace. If the pinned image is absent, the daemon is unhealthy, or the workspace probe fails, command execution is reported unavailable and dispatch returns before consuming a capability. Native launches never fall back to host command execution. The trusted-host fallback remains limited to standalone source/development runs and is reported as degraded.
+
+The release-only pipeline packages the self-contained `dist/server.cjs` and web assets with both JavaScript and Rust third-party notices, an exactly versioned and SHA-256-pinned Windows x64 `node.exe`, and its independently hashed adjacent `LICENSE`. The selected Node executable must also retain its expected vendor Authenticode signer and timestamp. Installer v1 deliberately does not bundle optional Playwright browser engines or a `node-llama-cpp` native runtime/model, so browser-write and local-model features report unavailable unless a future audited package adds those resources. This boundary does not affect provider-backed chat or read-only web inspection.
+
+The trusted Rust updater checks one configured public HTTPS `latest.json`, verifies Tauri signatures, asks the user before installation, and shuts down the supervised child before updater exit. The dashboard receives no updater or dialog invoke capability. A failed check or install is recorded as coded diagnostic state and leaves the current process fail-closed; the implementation does not automatically roll back the installed trusted Tauri parent after a bad update. The separate signed Node-child release supervisor below retains its own pre-commit candidate rollback behavior.
+
+`GET /api/kernel/diagnostics` is a coded health snapshot available to authenticated viewers/operators in protected modes. `POST /api/kernel/diagnostics/support-bundle` requires operator/admin mutation authority in protected modes and persists a bounded JSON attachment with SHA-256 integrity. Loopback `open` mode follows the same documented no-bearer trust model as the rest of the kernel. The safe schema and correlation redaction remove tokens, keys, cookies, nonces, content/prompt/input/output text, unsupported values, and raw filesystem paths. The checksum detects accidental bundle modification; it is not a digital signature or proof of authenticity.
 
 ### Snapshots and recovery
 
@@ -91,9 +101,9 @@ This authenticates a snapshot against the ledger. It is not a claim that every h
 
 ### Controlled releases
 
-A release signature covers the target version, package hash, sorted evaluation references, and rollback instructions. The matching staged package must declare a controlled `.cjs` entrypoint and pass path, size, and file-hash validation. Activation installs only beneath the controlled releases directory, performs the installed-file health check, launches the candidate with a fixed Node invocation and minimal environment, and requires a nonce/version/hash IPC readiness proof plus a stability window before committing the active manifest and stopping the previous child.
+A release signature covers the target version, package hash, sorted evaluation references, and rollback instructions. The matching staged package must declare a controlled `.cjs` entrypoint and pass path, size, and file-hash validation. Activation installs only beneath the controlled releases directory and performs the installed-file health check. On Windows, the trusted Tauri executable launches the exact Node/candidate pair suspended, assigns it to a nested kill-on-close Job Object before its first instruction, resumes it, and holds the job until exit; activation fails closed when that native authority is absent. POSIX uses a detached process group. A nonce/version/hash readiness proof plus a stability window must pass before the active manifest changes.
 
-Candidate failure terminates and removes the candidate while leaving the previous process and manifest active. Startup revalidates the persisted proposal, signature, evaluations, artifact, installed files, and health before restoring the supervised child. This is a bounded operator-signed core service, not permission for a model to rewrite source or replace the trusted parent Express control plane.
+Candidate failure terminates the owned process group/job and removes the candidate while leaving the previous process and manifest active. Cleanup failure remains tracked and makes the lifecycle report `rollback_failed`; it is never converted into successful activation. Startup revalidates the persisted proposal, signature, evaluations, artifact, installed files, and health before restoring the supervised child. This is a bounded operator-signed core service, not permission for a model to rewrite source or replace the trusted parent Express control plane.
 
 Generate the operator release key outside the repository, then sign a proposal JSON document containing `targetVersion`, `contentHash`, `evaluationEventIds`, and `rollbackInstructions`:
 
@@ -148,14 +158,17 @@ RECURRING_RESEARCH_TICK_MS=15000
 
 The clock interval is clamped to 1-60 seconds; durable mission intervals remain independently bounded to 15 minutes through 365 days.
 
-On Windows, Native Desktop Runtime v1 additionally requires Rust stable MSVC 1.85 or newer, the Visual Studio 2022 Desktop development with C++ workload, a Windows 10/11 SDK, WebView2 Evergreen, and a canonical `node.exe`. Configure an operator token or bootstrap a multi-user account, then add a narrow executable allowlist to `.env`:
+Native desktop development on Windows requires Rust stable MSVC 1.85 or newer, the Visual Studio 2022 Desktop development with C++ workload, a Windows 10/11 SDK, WebView2 Evergreen, and a canonical `node.exe`. Configure an operator token or bootstrap a multi-user account. Development launches may provide a narrow executable allowlist and workspace in `.env`:
 
 ```dotenv
 KERNEL_API_TOKEN=choose-a-long-random-value
 DESKTOP_APP_ALLOWLIST='[{"appId":"windows.notepad","executablePath":"C:\\Windows\\System32\\notepad.exe"}]'
+PROVENANCE_WORKSPACE_ROOT="C:\\path\\to\\a\\project"
 ```
 
-The JSON must contain 1-32 unique objects with only `appId` and `executablePath`. Application ids use lowercase letters, digits, `.`, `_`, or `-`; each path must already be an absolute normalized `.exe` path. `npm run desktop:dev` preloads `.env` before it starts Tauri; a directly launched host binary must receive `DESKTOP_APP_ALLOWLIST` in its process environment. `PROVENANCE_PROJECT_ROOT` and `PROVENANCE_NODE_EXECUTABLE` may override the canonical repository and Node paths for native development. Native runtime state is placed under Tauri's per-user local application-data directory, outside the repository command workspace; standalone Node retains the repository-local `.agent-kernel` default. The native host generates the bridge secret, a private runtime-owner proof, its expected host PID, runtime path, and readiness values for the supervised child. Only the owner's SHA-256 proof hash is written to disk. Do not place any per-launch value in `.env`.
+The JSON must contain 1-32 unique objects with only `appId` and `executablePath`. Application ids use lowercase letters, digits, `.`, `_`, or `-`; each path must already be an absolute normalized `.exe` path. `npm run desktop:dev` preloads `.env` before it starts Tauri. `PROVENANCE_PROJECT_ROOT` and `PROVENANCE_NODE_EXECUTABLE` may override the canonical resource and Node paths for development.
+
+A packaged host ignores `DESKTOP_APP_ALLOWLIST` and `PROVENANCE_WORKSPACE_ROOT`. Its first-run native dialogs create per-user persisted selections only after confirmation. On a fresh per-user runtime, bootstrap the first administrator from that native launch. The dashboard consumes the one-time fragment authority, automatically logs in, and the server activates the health-checked, fixed-authority desktop worker in the same process; no restart is required. Native runtime state is placed under Tauri's per-user local application-data directory, outside both the packaged resource root and selected command workspace; standalone Node retains the repository-local `.agent-kernel` default. The native host generates the bootstrap secret, bridge secret, a private runtime-owner proof, its expected host PID, runtime path, and readiness values for the supervised child. Only the owner's SHA-256 proof hash is written to disk. Do not place per-launch values in `.env`.
 
 Run the development server:
 
@@ -170,14 +183,32 @@ npm run build
 npm start
 ```
 
-Build the web/server artifacts and launch or compile the native host on a prepared Windows machine:
+Build the web/server artifacts and launch or compile the native development host on a prepared Windows machine:
 
 ```bash
 npm run desktop:dev
 npm run desktop:build
 ```
 
-Bundling is intentionally disabled in v1. `desktop:build` verifies the host binary; it does not create an installer or configure automatic updates.
+`desktop:build` remains a development build with bundling disabled. The production NSIS pipeline is intentionally split across unsigned construction and protected signing:
+
+```bash
+npm run desktop:release:plan
+npm run desktop:release:build-unsigned
+npm run desktop:release:verify-unsigned -- <unsigned-payload>
+# Protected Windows environment only:
+npm run desktop:release:bundle-signed-native -- <unsigned-payload>
+```
+
+The public plan and unsigned build require an exact Node executable/version/hash/vendor signer, exact adjacent Node license/hash, a pinned and hashed `cargo-about`, Tauri updater public policy, a credential-free HTTPS `latest.json` endpoint, and a digest-pinned Docker image. The signing job additionally requires the protected certificate thumbprint, timestamp service, PFX, and updater private key. `desktop:release:plan` emits sanitized metadata only. `build-unsigned` builds the self-contained server, generates JavaScript and Rust notices, runs clean-resource smoke, compiles an unsigned native executable, and writes an exact-manifest-only payload. It has no certificate or private updater authority.
+
+The manual `Verified Windows desktop release` workflow preserves that unsigned payload, then allows a separate `production` environment job on `main` or a `v*` tag to re-download and revalidate it against distinct `PROVENANCE_PRODUCTION_*` values before exposing signing authority. It imports the PFX only for Authenticode bundling, removes the certificate and PFX before exposing the Tauri updater key, and publishes only for a matching `v*` tag when the protected `publish` input is selected.
+
+The protected job copies every manifest resource into a fresh release target and rehashes the exact tree before and after Tauri runs. Its hash-pinned custom sign command allows mutation only for the native executable, the constrained NSIS temporary uninstaller, and the exact final setup executable; the already vendor-signed Node runtime and five exact NSIS build plugins are verified no-op callbacks. Tauri 2.11.4 intentionally changes the native marker from `__TAURI_BUNDLE_TYPE_VAR_UNK` to `__TAURI_BUNDLE_TYPE_VAR_NSS` before its signing callback and restores the original unsigned target after bundling. The callback therefore captures the signed/patched native with create-new semantics. Verification permits only that one marker change, PE checksum/security-directory changes, zero alignment padding, and one aligned EOF `WIN_CERTIFICATE`; its hashes, marker offset, certificate digest, signer, timestamp, unsigned payload hash, and installer hash are bound into a signed bundle record.
+
+After the Authenticode certificate is removed, the workflow silently installs into a fresh path, checks the installer, installed native, and uninstaller signer/timestamp, requires the installed native to be byte-identical to the callback capture, rehashes every installed resource against the unsigned manifest, rejects extra files and reparse points, and silently uninstalls. The updater key then signs both the installer and bundle record. The exact public set is only the setup executable, its `.sig`, `latest.json`, and `release-attestation.json`; the canonical signed bundle record is embedded into the two JSON evidence documents. Repository code does not supply production variables, certificates, private updater keys, hosted artifacts, protected-environment approval, telemetry operations, or an external audit. No installer is considered produced or published merely because this pipeline exists.
+
+The verification/release toolchain is exact where it matters: CI uses Node.js `22.23.1` and Rust MSVC `1.97.0`; `@tauri-apps/cli` is fixed at `2.11.4` in both manifests and the installed tree; `cargo-about` is fixed at `0.9.1` with archive and executable SHA-256 pins; `spdx-expression-parse` is fixed at `5.0.0`; and the release record binds `package-lock.json`, `Cargo.lock`, the Rust notices, the runtime license, and the production Node binary. The bundled production Node version remains an explicit protected release variable, not an implicit use of the CI orchestration runtime.
 
 ## Verification
 
@@ -186,21 +217,28 @@ npm run lint
 npm test
 npm run build
 npm run verify-ledger
+npm run desktop:release:test
+npm run desktop:resource-smoke
+npm run desktop:acceptance
 npm run desktop:test
 npm run desktop:check
 ```
 
-The last baseline before the 2026-07-13 trust-boundary hardening was **242 tests across 51 files**, and that hardening closed at **297 tests across 62 files**. Durable Recurring Research v1 closed at **410 tests across 70 files**. Native Desktop Runtime v1 currently passes **455 tests across 78 files**; `npm test` remains the source of truth as the suite evolves. The 2026-07-15 ledger check authenticated **252 events**; that count is timestamped runtime evidence, not a fixed product invariant.
+Historical baselines were **242 tests across 51 files** before the 2026-07-13 trust-boundary hardening, **297 tests across 62 files** after it, **410 tests across 70 files** for Durable Recurring Research v1, and **455 tests across 78 files** for Native Desktop Runtime v1. The completed local Production Desktop Release v1 suite passed **532 tests across 85 files** on 2026-07-19. `npm test` remains the source of truth after later changes. The 2026-07-15 ledger check authenticated **252 events**; that count is timestamped runtime evidence, not a fixed product invariant.
 
-Native Desktop Runtime v1 has TypeScript integration and focused tests in this source tree. Rust/Cargo produced the committed `Cargo.lock`; clean WSL formatting and locked cross-target `cargo check --all-targets` plus Clippy with warnings denied pass for `x86_64-pc-windows-msvc`. The prepared Windows runner then completed TypeScript lint/tests/build, Rust formatting, native Rust tests, all-target checking, and Clippy in [Native desktop verification run 29398628867](https://github.com/A-Deb-byte/Provenance/actions/runs/29398628867). This development machine still lacks the local MSVC/Windows SDK link environment and local Windows `rustfmt` remains blocked by Application Control; the passing CI run establishes compilation/link/test evidence, not live interactive UI Automation evidence.
+`desktop:acceptance` is deterministic TypeScript evidence: it uses the real kernel and desktop worker but replaces the native bridge with a fixed fixture to cover health, discovery, inspection, approval continuation, click, hash-bound typing, payload consumption, and uncertain-outcome retry blocking. The ordinary Windows Rust test job now also creates a real temporary Win32 window and drives its checkbox and edit controls through UI Automation. That live fixture proves the broker against controlled Windows controls; it is not equivalent to product acceptance across arbitrary third-party applications or an external interactive security evaluation.
+
+The `Native desktop verification` workflow runs TypeScript lint/tests, release-policy tests, the production build, both locked third-party notice generators, clean packaged-server readiness smoke, Rust formatting, Rust tests, all-target checking, and Clippy with warnings denied on `windows-latest`. Local TypeScript/build/resource/acceptance gates can run independently, but this workstation's Rust tool invocation is blocked by Windows Application Control; the Windows workflow is therefore the source of truth for Rust formatting, tests, check, Clippy, and native license generation. The separate release workflow is not a verification substitute: an actual signed installer build still depends on external release inputs and protected publication approval.
 
 ## Deployment Boundaries
 
-- The Rust/Tauri host and authenticated desktop IPC compile and pass native Rust tests on the prepared Windows CI runner, but have not driven a real allowlisted application in an interactive Windows session. Availability stays health-gated; the TypeScript kernel remains the policy authority.
-- Docker supplies real command isolation when available. Without Docker, the runtime reports and uses a trusted-host fallback; the desktop host's child-process job does not provide a general command sandbox, and native Windows command isolation or Linux namespace/seccomp isolation is not implemented.
+- Windows CI drives a deterministic native Win32 UI Automation fixture, but representative third-party application acceptance and an external interactive security evaluation remain undone. Availability stays health-gated; the TypeScript kernel remains the policy authority.
+- Docker supplies command isolation only after daemon, digest-pinned image, and exact selected-workspace health checks pass. Native desktop command execution is disabled otherwise. Standalone source runs retain an explicitly reported trusted-host fallback; native Windows command isolation or Linux namespace/seccomp isolation is not implemented.
 - Desktop v1 is limited to allowlisted discovery, inspection, click, and hash-bound typing. Typed text lives only in a bounded, expiring, consume-once in-memory store; it is not written to the general artifact directory. A timeout, Stop All, transport loss, executor loss, or failed post-write observation after native mutation dispatch is recorded as `automation.run_uncertain` and blocks retry of that automation. Stop All cannot undo an OS side effect already accepted by UI Automation.
 - The host watches the Node child, bridge task, and UI Automation broker. Loss of any one clears web storage and closes the dashboard instead of leaving its loopback page active. The v1 browser-facing listener is still the supervised Node listener rather than a Rust-owned reverse proxy, so this is fail-closed monitoring rather than a formal proof against every same-user local port-rebinding race.
-- Shortcuts, elevation, shell authority, downloads, OAuth connector runtimes, plugins, installers, automatic updates, and arbitrary desktop missions are not implemented.
+- The unsigned-to-protected NSIS, Authenticode, silent install/uninstall, and signed-updater evidence pipeline is implemented, but the repository supplies no protected production values, certificate, updater key, actual signed installer, hosted `latest.json`, or published release. Updater failure is fail-closed and coded; automatic rollback of the installed trusted Tauri parent is not implemented.
+- Shortcuts, elevation, unrestricted shell authority, downloads, OAuth connector runtimes, plugins, and arbitrary desktop missions are not implemented.
+- The independent skill-evaluator resolver and evaluator allowlist are integration points with no production default. Skill suite creation fails unavailable until a release owner supplies that separate trust root.
 - Research missions do not provide generic web search, source discovery, crawling, redirect following, or automatic expansion beyond the explicit seed URLs.
 - Durable scheduling is currently limited to the fixed-source Research to Verified Report workflow; there is no generic cron, arbitrary command, connector, email, or desktop mission scheduler.
 - Exactly one native host or standalone Node server may own a given `.agent-kernel` runtime directory. Mutation and ledger queues are process-local; multi-process or high-availability sharing of one runtime is not supported.
@@ -208,5 +246,7 @@ Native Desktop Runtime v1 has TypeScript integration and focused tests in this s
 - Accounts share one local kernel state. There is no per-user goal/memory partitioning or SSO/OIDC.
 - Supervised releases do not hot-replace or proxy the trusted parent Express control plane; stable-port traffic switching remains a deployment concern.
 - Provider availability and model behavior depend on operator configuration and the upstream provider.
+- Installer v1 omits Playwright browser engines and the optional local `node-llama-cpp` runtime/model. Those capabilities remain unavailable in the installed build unless a future audited package includes them.
+- Authenticode certificate custody, updater private-key custody, production publication and hosted-manifest operations, representative-machine installer/update/UIA testing, telemetry policy and operations, and an independent external security audit remain release-owner responsibilities.
 
 For the concise capability matrix, see `docs/superpowers/CURRENT_STATE.md`. Design and implementation history live under `docs/superpowers/specs/` and `docs/superpowers/plans/`.

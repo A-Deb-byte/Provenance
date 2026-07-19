@@ -86,4 +86,18 @@ describe('desktop typed-payload API', () => {
     expect((await stage('x'.repeat(4_097), operatorToken)).status).toBe(400);
     expect(payloadStore.size()).toBe(0);
   });
+
+  it('reports a closed runtime authority gate as unavailable', async () => {
+    payloadStore.stage = async () => {
+      throw new Error('Desktop typed-payload staging is unavailable until desktop authority is active.');
+    };
+
+    const response = await stage('must not cross the authority transition', operatorToken);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      error: 'Desktop typed-payload staging is unavailable until desktop authority is active.',
+    });
+    expect(payloadStore.size()).toBe(0);
+  });
 });

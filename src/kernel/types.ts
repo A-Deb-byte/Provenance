@@ -80,6 +80,44 @@ export interface SkillCase {
   sourceEventId?: string;
 }
 
+export interface SkillOracleCase {
+  id: string;
+  input: string;
+  expectedOutput: string;
+  sourceRef: string;
+}
+
+export interface SkillEvaluationSource {
+  schemaVersion: 1;
+  authorityType: 'kernel-attested-evaluator-v1';
+  evaluatorId: string;
+  sourceId: string;
+  cases: SkillOracleCase[];
+  observedAt: string;
+  contentHash: string;
+}
+
+export interface SkillEvaluatorAuthority {
+  authorityType: 'kernel-attested-evaluator-v1';
+  evaluatorId: string;
+  sourceId: string;
+  sourceContentHash: string;
+  sourceEventId: string;
+  observedAt: string;
+}
+
+export interface SkillEvaluationSuite {
+  schemaVersion: 2;
+  id: string;
+  cases: SkillOracleCase[];
+  authority: SkillEvaluatorAuthority;
+  provenance: MemoryProvenance;
+  status: 'sealed';
+  suiteHash: string;
+  createdAt: string;
+  sealedAt: string;
+}
+
 export interface SkillManifest {
   schemaVersion: 1;
   name: string;
@@ -102,12 +140,19 @@ export interface SkillManifest {
 
 export type SkillPackageStatus = 'candidate' | 'evaluated' | 'canary' | 'promoted' | 'rejected' | 'rolled_back' | 'superseded';
 
+export interface SkillCandidateAuthor {
+  authorityType: 'authenticated-principal-v1';
+  principalId: string;
+}
+
 export interface SkillPackage {
   id: string;
   manifest: SkillManifest;
   program: PureTransformProgram;
   trainingCases: SkillCase[];
-  replayCases: SkillCase[];
+  author: SkillCandidateAuthor;
+  evaluationSuiteId: string;
+  evaluationSuiteHash: string;
   status: SkillPackageStatus;
   contentHash: string;
   previousVersionId?: string;
@@ -124,6 +169,8 @@ export interface SkillCaseResult {
 export interface SkillEvaluation {
   id: string;
   skillId: string;
+  candidateContentHash: string;
+  suiteId: string;
   suiteHash: string;
   candidateScore: number;
   baselineScore: number;
@@ -137,6 +184,8 @@ export interface SkillActivation {
   id: string;
   skillId: string;
   evaluationId: string;
+  candidateContentHash: string;
+  suiteId: string;
   suiteHash: string;
   replayCaseIds: string[];
   status: 'canary' | 'active' | 'rolled_back' | 'failed';
@@ -478,6 +527,7 @@ export interface KernelState {
   tasks: KernelTask[];
   approvals: ApprovalRecord[];
   memories: KernelMemoryRecord[];
+  skillEvaluationSuites?: SkillEvaluationSuite[];
   skillPackages: SkillPackage[];
   skillEvaluations: SkillEvaluation[];
   skillActivations: SkillActivation[];

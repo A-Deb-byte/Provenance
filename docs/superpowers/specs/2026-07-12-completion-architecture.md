@@ -50,7 +50,7 @@ Memory enters as a candidate. Promotion requires an explicit reason and independ
 
 Skill packages include a manifest, declared permissions, side effects, deterministic tests, provenance, platform support, rate limits, activation state, evaluations, and rollback instructions.
 
-Generated source remains untrusted. This repository executes only the bounded `pure-transform-v1` DSL; it does not execute arbitrary generated source as proof. Promotion requires a passing evaluation that beats its recorded baseline without expanding declared permissions. Canary runs accept no caller oracle and compare kernel-generated fixtures with a separate reference interpreter.
+Generated source remains untrusted. This repository executes only the bounded `pure-transform-v1` DSL; it does not execute arbitrary generated source as proof. Candidates bind their authenticated author and a pre-existing suite id/hash. A suite accepts no caller oracle: a separately configured, allowlisted evaluator resolver supplies hash-sealed held-out cases, the kernel attests that source before suite and candidate events, and same-author or training-overlap evidence is rejected. Evaluation and canary APIs expose metadata only. Without that evaluator trust root the feature fails unavailable.
 
 ## Phase 3: Provider Intelligence
 

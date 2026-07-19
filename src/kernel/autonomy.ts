@@ -515,6 +515,7 @@ export interface RuntimeReportInput {
   secretVault?: { status: 'available' | 'unavailable'; reason: string };
   accessControl?: { status: 'available' | 'unavailable'; reason: string };
   osSandbox?: { status: 'available' | 'unavailable'; reason: string };
+  commandExecution?: { status: 'available' | 'unavailable'; reason: string };
   recurringResearchScheduler?: {
     available: boolean;
     enabled: boolean;
@@ -539,6 +540,10 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
   const hasResearchWorker = input.workerReport.available.includes(WEB_INSPECT_WORKER_ID);
   const hasDesktopWorker = input.workerReport.available.includes(DESKTOP_WORKER_ID);
   const recurringScheduler = input.recurringResearchScheduler;
+  const commandExecution = input.commandExecution ?? {
+    status: 'available' as const,
+    reason: 'Standalone trusted-host fallback is enabled; commands are allowlisted but have no OS isolation.',
+  };
   const recurringSchedulerStatus: RuntimeFeatureStatus = !recurringScheduler
     ? {
       status: 'unavailable',
@@ -570,10 +575,10 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
 
   const features: Record<string, RuntimeFeatureStatus> = {
     verificationCommands: {
-      status: input.stopAll ? 'blocked' : 'available',
+      status: input.stopAll ? 'blocked' : commandExecution.status,
       reason: input.stopAll
         ? 'Stop All is active; command execution is halted until resumed.'
-        : 'Allowlisted npm verification commands run inside the configured workspace.',
+        : commandExecution.reason,
     },
     providerCalls: {
       status: input.stopAll ? 'blocked' : configuredProviders.length > 0 ? 'available' : 'unavailable',

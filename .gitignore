@@ -12,3 +12,5 @@ coverage/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/node.exe
+src-tauri/updater-private.key
+src-tauri/*.pfx

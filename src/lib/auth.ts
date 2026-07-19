@@ -23,6 +23,10 @@ interface LoginResponse {
 
 const SESSION_KEY = 'agent_kb_auth_session_v1';
 const AUTH_EVENT = 'agent-kb-auth-change';
+const FIRST_ADMIN_BOOTSTRAP_FRAGMENT = 'provenance-first-admin';
+const FIRST_ADMIN_BOOTSTRAP_HEADER = 'x-provenance-first-admin-bootstrap';
+const FIRST_ADMIN_BOOTSTRAP_SECRET = /^[A-Za-z0-9_-]{43}$/u;
+let firstAdminBootstrapSecret: string | undefined;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -42,6 +46,33 @@ const storage = (): Storage | undefined => {
     return globalThis.sessionStorage;
   } catch {
     return undefined;
+  }
+};
+
+/**
+ * Moves the native launch capability out of the URL before the app renders.
+ * The value remains process-local and is never written to browser storage.
+ */
+export const initializeFirstAdminBootstrapSecret = (): void => {
+  if (typeof window === 'undefined' || !window.location.hash) return;
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  if (!fragment.has(FIRST_ADMIN_BOOTSTRAP_FRAGMENT)) return;
+  const candidate = fragment.get(FIRST_ADMIN_BOOTSTRAP_FRAGMENT);
+  fragment.delete(FIRST_ADMIN_BOOTSTRAP_FRAGMENT);
+  const remaining = fragment.toString();
+  try {
+    window.history.replaceState(
+      window.history.state,
+      '',
+      `${window.location.pathname}${window.location.search}${remaining ? `#${remaining}` : ''}`,
+    );
+  } catch {
+    // Fail closed: do not retain a capability that could not be removed from
+    // the browser-visible URL.
+    return;
+  }
+  if (candidate && FIRST_ADMIN_BOOTSTRAP_SECRET.test(candidate)) {
+    firstAdminBootstrapSecret = candidate;
   }
 };
 
@@ -118,6 +149,7 @@ export const fetchAuthStatus = async (): Promise<AuthStatus> => {
       typeof payload.userCount !== 'number') {
     throw new Error('Authentication status response is invalid.');
   }
+  if (payload.userCount > 0) firstAdminBootstrapSecret = undefined;
   return { mode: payload.mode, userCount: payload.userCount };
 };
 
@@ -146,12 +178,17 @@ export const login = async (username: string, password: string): Promise<AuthSes
 };
 
 export const bootstrapAdmin = async (username: string, password: string): Promise<AuthSession> => {
+  const headers = new Headers({ 'content-type': 'application/json' });
+  if (firstAdminBootstrapSecret) {
+    headers.set(FIRST_ADMIN_BOOTSTRAP_HEADER, firstAdminBootstrapSecret);
+  }
   const response = await authenticatedFetch('/api/auth/users', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify({ username, password }),
   });
   if (!response.ok) throw new Error(await readError(response, 'Admin bootstrap failed.'));
+  firstAdminBootstrapSecret = undefined;
   return login(username, password);
 };
 

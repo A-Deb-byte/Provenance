@@ -8,6 +8,7 @@ export type IdPrefix =
   | 'cap'
   | 'mem'
   | 'skill'
+  | 'skill_suite'
   | 'eval'
   | 'activation'
   | 'automation'

@@ -4,14 +4,19 @@
  */
 
 import crypto from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { open, readFile, realpath, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import { createApplicationAiRouter } from './src/app-ai/router';
-import { accessControlStatus, createAccessGuard, resolveAccessMode } from './src/auth/accessControl';
+import {
+  accessControlStatus,
+  createAccessGuard,
+  getRequestAccessPrincipal,
+  resolveAccessMode,
+} from './src/auth/accessControl';
 import { createAuthApi } from './src/auth/api';
+import { createFirstAdminBootstrapAuthority } from './src/auth/bootstrapAuthority';
 import { createLoopbackRequestGuard, createSecurityHeaders } from './src/auth/loopbackGuard';
 import { resolveSessionSecret } from './src/auth/session';
 import { createUserStore } from './src/auth/users';
@@ -20,6 +25,7 @@ import { createCoreModelRuntime } from './src/core-model/runtime';
 import { resolveDesktopBridgeConfiguration } from './src/desktop/config';
 import { createDesktopBridgeClient } from './src/desktop/ipc';
 import { createMemoryDesktopPayloadStore, type DesktopPayloadStore } from './src/desktop/payloadStore';
+import { resolveDiagnosticBuildMetadata } from './src/diagnostics';
 import { createKernelRouter } from './src/kernel/api';
 import { createFileArtifactStore } from './src/kernel/artifacts/artifactStore';
 import {
@@ -38,9 +44,9 @@ import { createReleaseLifecycle } from './src/kernel/releases/lifecycle';
 import { createNodeReleaseSupervisor } from './src/kernel/releases/supervisor';
 import { createRecurringResearchScheduler } from './src/kernel/scheduler/service';
 import {
-  createHostSandbox,
   DEFAULT_DOCKER_SANDBOX_CONFIG,
-  detectDockerSandbox,
+  resolveCommandSandbox,
+  sandboxStatus,
 } from './src/kernel/sandbox/sandbox';
 import { createBrowserWorker, createPlaywrightDriver } from './src/kernel/workers/browserWorker';
 import { createDesktopWorker } from './src/kernel/workers/desktopWorker';
@@ -54,6 +60,9 @@ import { createVaultApi } from './src/vault/api';
 import { createPlatformVault, injectVaultSecretsIntoEnvironment } from './src/vault/index';
 
 const PROJECT_ROOT = path.resolve(process.env.PROVENANCE_PROJECT_ROOT?.trim() || process.cwd());
+const CONFIGURED_WORKSPACE_ROOT = path.resolve(
+  process.env.PROVENANCE_WORKSPACE_ROOT?.trim() || PROJECT_ROOT,
+);
 dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
 
 const app = express();
@@ -64,6 +73,44 @@ const PORT = Number.isSafeInteger(configuredPort) && configuredPort >= 0 && conf
 const RUNTIME_DIR = path.resolve(process.env.PROVENANCE_RUNTIME_DIR?.trim() || path.join(PROJECT_ROOT, '.agent-kernel'));
 const IS_DEVELOPMENT = process.env.NODE_ENV === 'development' || /\.[cm]?tsx?$/iu.test(process.argv[1] || '');
 const IS_RELEASE_CHILD = process.env.RELEASE_CHILD_MODE === '1';
+
+const publishReleaseReadiness = async (
+  nonce: string,
+  targetVersion: string,
+  contentHash: string,
+): Promise<void> => {
+  const record = {
+    schemaVersion: 1,
+    type: 'release.ready',
+    nonce,
+    targetVersion,
+    contentHash,
+    pid: process.pid,
+  } as const;
+  const readyPath = process.env.RELEASE_SUPERVISOR_READY_FILE;
+  if (!readyPath) {
+    if (!process.send) throw new Error('Release child has no authenticated readiness channel.');
+    process.send(record);
+    return;
+  }
+  if (!path.isAbsolute(readyPath) || path.basename(readyPath) !== `.release-ready-${nonce}.json`) {
+    throw new Error('Release readiness path is not bound to the supervisor nonce.');
+  }
+  const temporaryPath = `${readyPath}.${nonce}.tmp`;
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporaryPath, 'wx', 0o600);
+    await handle.writeFile(JSON.stringify(record), 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporaryPath, readyPath);
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+};
 const recurringResearchSchedulerSetting = process.env.RECURRING_RESEARCH_SCHEDULER_ENABLED?.trim().toLowerCase();
 const RECURRING_RESEARCH_SCHEDULER_ENABLED = !IS_RELEASE_CHILD &&
   !['0', 'false', 'no', 'off'].includes(recurringResearchSchedulerSetting ?? '');
@@ -96,20 +143,50 @@ app.use(createLoopbackRequestGuard());
 app.use(express.json({ limit: '32mb' }));
 
 const createServerContext = async () => {
+  const workspaceRoot = await realpath(CONFIGURED_WORKSPACE_ROOT);
   await injectVaultSecretsIntoEnvironment(vault, VAULT_INJECTED_SECRETS);
+  let configuredFirstAdminBootstrapSecret = process.env.PROVENANCE_FIRST_ADMIN_BOOTSTRAP_SECRET;
+  delete process.env.PROVENANCE_FIRST_ADMIN_BOOTSTRAP_SECRET;
+  const firstAdminBootstrapAuthority = createFirstAdminBootstrapAuthority(
+    configuredFirstAdminBootstrapSecret,
+    { required: Boolean(process.env.DESKTOP_RUNTIME_OWNER_NONCE?.trim()) },
+  );
+  configuredFirstAdminBootstrapSecret = undefined;
+  const diagnosticBuildMetadata = resolveDiagnosticBuildMetadata({
+    packageVersion: process.env.npm_package_version,
+    buildVersion: process.env.PROVENANCE_BUILD_VERSION,
+    buildCommit: process.env.PROVENANCE_BUILD_COMMIT,
+    builtAt: process.env.PROVENANCE_BUILD_TIMESTAMP,
+    mode: IS_DEVELOPMENT ? 'development' : 'production',
+  });
 
   const providerRuntime = createProviderRuntime();
   coreModelPromise = createCoreModelRuntime();
   const operatorToken = process.env.KERNEL_API_TOKEN;
   const userStore = await createUserStore(path.join(RUNTIME_DIR, 'users.json'));
+  if (userStore.count() > 0) firstAdminBootstrapAuthority?.completeAfterPersistence();
   const sessionSecret = resolveSessionSecret(process.env.SESSION_SECRET);
-  const accessGuard = createAccessGuard({ userStore, operatorToken, sessionSecret });
+  const accessGuard = createAccessGuard({
+    userStore,
+    operatorToken,
+    sessionSecret,
+    firstAdminBootstrapPending: () => Boolean(firstAdminBootstrapAuthority?.isPending()),
+  });
 
-  const sandbox = (await detectDockerSandbox(undefined, {
-    ...DEFAULT_DOCKER_SANDBOX_CONFIG,
-    dockerPath: process.env.DOCKER_PATH?.trim() || DEFAULT_DOCKER_SANDBOX_CONFIG.dockerPath,
-  })) ?? createHostSandbox();
-  console.log(`[Sandbox] Command execution isolation: ${sandbox.mode} (${sandbox.isolation}).`);
+  const sandboxSelection = await resolveCommandSandbox({
+    env: process.env,
+    workspaceRoot,
+    config: {
+      ...DEFAULT_DOCKER_SANDBOX_CONFIG,
+      dockerPath: process.env.DOCKER_PATH?.trim() || DEFAULT_DOCKER_SANDBOX_CONFIG.dockerPath,
+    },
+  });
+  const sandbox = sandboxSelection.runner;
+  const commandStatus = sandboxStatus(sandbox).commandExecution;
+  console.log(
+    `[Sandbox] Runtime=${sandboxSelection.runtimeMode}; mode=${sandbox.mode}; ` +
+    `commandExecution=${commandStatus.status} (${commandStatus.reason})`,
+  );
 
   const artifactStore = createFileArtifactStore(path.join(RUNTIME_DIR, 'artifacts'), {
     // Signed release packages are base64 encoded. Browser typing applies a
@@ -137,34 +214,68 @@ const createServerContext = async () => {
     )
     : undefined;
   let desktopWorker: KernelActionWorker | undefined;
-  let desktopPayloadStore: DesktopPayloadStore | undefined;
+  const desktopPayloadBacking = desktopConfiguration.configuration
+    ? createMemoryDesktopPayloadStore()
+    : undefined;
+  let desktopPayloadEnabled = false;
+  const desktopPayloadStore: DesktopPayloadStore | undefined = desktopPayloadBacking
+    ? {
+      stage: async (content) => {
+        if (!desktopPayloadEnabled) {
+          throw new Error('Desktop typed-payload staging is unavailable until desktop authority is active.');
+        }
+        return desktopPayloadBacking.stage(content);
+      },
+      consume: (id) => desktopPayloadEnabled
+        ? desktopPayloadBacking.consume(id)
+        : Promise.resolve(undefined),
+      clear: () => desktopPayloadBacking.clear(),
+      size: () => desktopPayloadEnabled ? desktopPayloadBacking.size() : 0,
+    }
+    : undefined;
+  const authenticateDesktopRuntime = async (): Promise<{
+    registration: NonNullable<typeof desktopRegistration>;
+    worker: KernelActionWorker;
+    status: RuntimeFeatureStatus;
+  }> => {
+    const configuration = desktopConfiguration.configuration;
+    if (!configuration || !desktopPayloadStore) {
+      throw new Error('Native desktop bridge configuration is unavailable.');
+    }
+    const bridge = createDesktopBridgeClient({
+      baseUrl: configuration.baseUrl,
+      token: configuration.token,
+    });
+    const health = await bridge.health();
+    const expectedApps = configuration.applications.map((application) => application.id).sort();
+    const healthyApps = [...new Set(health.allowedAppIds)].sort();
+    const capabilitiesMatch = DESKTOP_V1_ACTIONS.every((action) => health.capabilities.includes(action));
+    const allowlistMatches = expectedApps.length === healthyApps.length &&
+      expectedApps.every((appId, index) => appId === healthyApps[index]);
+    if (!capabilitiesMatch || !allowlistMatches) {
+      throw new Error('Native host capabilities or application allowlist do not match the server configuration.');
+    }
+    return {
+      registration: buildDesktopWorkerRegistration(expectedApps, { available: true }),
+      worker: createDesktopWorker(bridge, (id) => desktopPayloadStore.consume(id)),
+      status: {
+        status: 'available',
+        reason: `An authenticated Windows desktop host is available for ${expectedApps.length} allowlisted application(s).`,
+      },
+    };
+  };
   if (desktopConfiguration.configuration && !desktopAuthorityConfigured) {
     desktopIpcStatus = {
       status: 'blocked',
       reason: 'Native desktop execution is blocked until an operator token or multi-user access control is configured.',
     };
   } else if (desktopConfiguration.configuration) {
-    const bridge = createDesktopBridgeClient({
-      baseUrl: desktopConfiguration.configuration.baseUrl,
-      token: desktopConfiguration.configuration.token,
-    });
     try {
-      const health = await bridge.health();
-      const expectedApps = desktopConfiguration.configuration.applications.map((application) => application.id).sort();
-      const healthyApps = [...new Set(health.allowedAppIds)].sort();
-      const capabilitiesMatch = DESKTOP_V1_ACTIONS.every((action) => health.capabilities.includes(action));
-      const allowlistMatches = expectedApps.length === healthyApps.length &&
-        expectedApps.every((appId, index) => appId === healthyApps[index]);
-      if (!capabilitiesMatch || !allowlistMatches) {
-        throw new Error('Native host capabilities or application allowlist do not match the server configuration.');
-      }
-      desktopRegistration = buildDesktopWorkerRegistration(expectedApps, { available: true });
-      desktopPayloadStore = createMemoryDesktopPayloadStore();
-      desktopWorker = createDesktopWorker(bridge, (id) => desktopPayloadStore!.consume(id));
-      desktopIpcStatus = {
-        status: 'available',
-        reason: `An authenticated Windows desktop host is available for ${expectedApps.length} allowlisted application(s).`,
-      };
+      const runtime = await authenticateDesktopRuntime();
+      desktopPayloadEnabled = true;
+      desktopRegistration = runtime.registration;
+      desktopWorker = runtime.worker;
+      desktopIpcStatus = runtime.status;
     } catch {
       desktopIpcStatus = {
         status: 'configured',
@@ -269,7 +380,7 @@ const createServerContext = async () => {
   );
   const kernelConfig = {
     runtimeDir: RUNTIME_DIR,
-    allowedWorkspaceRoot: PROJECT_ROOT,
+    allowedWorkspaceRoot: workspaceRoot,
     providerRouter: providerRuntime.router,
     releaseSigningPublicKey: process.env.RELEASE_SIGNING_PUBLIC_KEY,
     workerRegistrations,
@@ -286,6 +397,45 @@ const createServerContext = async () => {
     recurringResearchTickMs: RECURRING_RESEARCH_TICK_MS,
   };
   const kernel = createKernelService(kernelConfig);
+  let desktopActivationPromise: Promise<void> | undefined;
+  const activateDesktopAuthority = async (): Promise<void> => {
+    if (!desktopConfiguration.configuration || desktopIpcStatus.status === 'available') return;
+    if (resolveAccessMode(userStore.count(), operatorToken) === 'open') {
+      throw new Error('Desktop authority cannot activate while access control is open.');
+    }
+    if (desktopActivationPromise) return desktopActivationPromise;
+
+    const pending = (async () => {
+      const runtime = await authenticateDesktopRuntime();
+      // Values staged before the authority transition cannot cross into the
+      // newly executable runtime, even if their opaque ids were retained.
+      desktopPayloadBacking!.clear();
+      desktopPayloadEnabled = true;
+      try {
+        kernel.activateWorkerRuntime(runtime.registration, runtime.worker);
+      } catch (error) {
+        desktopPayloadEnabled = false;
+        throw error;
+      }
+      desktopRegistration = runtime.registration;
+      desktopIpcStatus = runtime.status;
+      console.log('[Desktop] Authenticated Windows UI Automation worker activated after first-admin bootstrap.');
+    })();
+    desktopActivationPromise = pending;
+    try {
+      await pending;
+    } catch (error) {
+      desktopPayloadEnabled = false;
+      desktopPayloadBacking?.clear();
+      desktopIpcStatus = {
+        status: 'configured',
+        reason: 'Native desktop bridge settings are present, but its authenticated health check failed.',
+      };
+      throw error;
+    } finally {
+      if (desktopActivationPromise === pending) desktopActivationPromise = undefined;
+    }
+  };
   await kernel.recoverInterruptedTasks();
   const recurringResearchScheduler = IS_RELEASE_CHILD
     ? undefined
@@ -332,6 +482,7 @@ const createServerContext = async () => {
   let appGoal = state.goals.find((goal) => (
     goal.objective === appGoalObjective &&
     goal.status === 'active' &&
+    path.resolve(goal.workspaceRoot) === workspaceRoot &&
     goal.usage.providerCalls < goal.budget.maxProviderCalls &&
     goal.usage.operations < goal.budget.maxOperations
   ));
@@ -345,7 +496,7 @@ const createServerContext = async () => {
       successCriteria: ['Every application AI call is provider-routed and ledgered with provenance.'],
       constraints: ['Pinned provider/model policy', 'No application route may bypass the kernel call budget'],
       autonomyLevel: 'bounded',
-      workspaceRoot: PROJECT_ROOT,
+      workspaceRoot,
       verificationCommands: ['npm run lint'],
       budget: {
         maxOperations: maxProviderCalls,
@@ -359,7 +510,14 @@ const createServerContext = async () => {
 
   // Authentication endpoints self-check bootstrap/login/logout authority and
   // must remain reachable before the shared mutation guard.
-  app.use('/api/auth', createAuthApi({ userStore, sessionSecret, operatorToken }));
+  app.use('/api/auth', createAuthApi({
+    userStore,
+    sessionSecret,
+    operatorToken,
+    firstAdminBootstrapAuthority,
+    onFirstAdminCreated: activateDesktopAuthority,
+    onSuccessfulLogin: activateDesktopAuthority,
+  }));
   app.use('/api', accessGuard);
   app.use('/api/providers', createProviderApi(providerRuntime));
   app.use('/api/vault', createVaultApi(vault));
@@ -373,6 +531,7 @@ const createServerContext = async () => {
       return { status: status.status, reason: status.reason };
     },
     accessControlStatus: () => accessControlStatus(userStore.count(), operatorToken),
+    skillAuthorPrincipal: (request) => getRequestAccessPrincipal(request)?.principalId,
     recurringResearchSchedulerStatus: () => recurringResearchScheduler?.status() ?? {
       enabled: false,
       starting: false,
@@ -382,6 +541,75 @@ const createServerContext = async () => {
     },
     desktopIpcStatus: () => desktopIpcStatus,
     desktopPayloadStore,
+    diagnostics: {
+      build: diagnosticBuildMetadata,
+      runtime: {
+        ownershipMode: process.env.DESKTOP_RUNTIME_OWNER_NONCE?.trim()
+          ? 'desktop-host'
+          : 'node-standalone',
+        desktopHost: Boolean(process.env.DESKTOP_RUNTIME_OWNER_NONCE?.trim()),
+      },
+      health: () => {
+        const configuredProviders = providerRuntime.statuses.filter((status) => status.configured).length;
+        const accessMode = resolveAccessMode(userStore.count(), operatorToken);
+        const schedulerStatus = recurringResearchScheduler?.status();
+        const desktopHealth = desktopIpcStatus.status === 'available'
+          ? { status: 'ok' as const, reasonCode: 'available' }
+          : desktopIpcStatus.status === 'blocked'
+            ? { status: 'blocked' as const, reasonCode: 'blocked' }
+            : desktopIpcStatus.status === 'configured'
+              ? { status: 'degraded' as const, reasonCode: 'configured' }
+              : { status: 'unavailable' as const, reasonCode: 'unavailable' };
+        return [
+          {
+            component: 'access.control',
+            status: accessMode === 'open' ? 'degraded' as const : 'ok' as const,
+            reasonCode: accessMode,
+            metrics: { users: userStore.count() },
+          },
+          {
+            component: 'command.sandbox',
+            status: commandStatus.status === 'unavailable'
+              ? 'blocked' as const
+              : sandboxSelection.trustedHostFallback ? 'degraded' as const : 'ok' as const,
+            reasonCode: commandStatus.status === 'unavailable'
+              ? 'disabled'
+              : sandboxSelection.trustedHostFallback ? 'trusted_host' : 'isolated',
+            metrics: {
+              docker_healthy: sandboxSelection.dockerHealthy,
+              trusted_host_fallback: sandboxSelection.trustedHostFallback,
+            },
+          },
+          {
+            component: 'desktop.bridge',
+            ...desktopHealth,
+            metrics: {
+              configured_apps: desktopConfiguration.configuration?.applications.length ?? 0,
+            },
+          },
+          {
+            component: 'provider.router',
+            status: configuredProviders > 0 ? 'ok' as const : 'unavailable' as const,
+            reasonCode: configuredProviders > 0 ? 'available' : 'not_configured',
+            metrics: { configured: configuredProviders, total: providerRuntime.statuses.length },
+          },
+          {
+            component: 'scheduler.research',
+            status: !RECURRING_RESEARCH_SCHEDULER_ENABLED
+              ? 'unavailable' as const
+              : schedulerStatus?.running ? 'ok' as const : 'degraded' as const,
+            reasonCode: !RECURRING_RESEARCH_SCHEDULER_ENABLED
+              ? 'disabled'
+              : schedulerStatus?.running ? 'running' : 'stopped',
+            metrics: {
+              enabled: RECURRING_RESEARCH_SCHEDULER_ENABLED,
+              running: schedulerStatus?.running ?? false,
+              tick_in_progress: schedulerStatus?.tickInProgress ?? false,
+            },
+          },
+        ];
+      },
+    },
     recoverOnStart: false,
   }));
   app.use('/api', createApplicationAiRouter({
@@ -416,6 +644,7 @@ async function start() {
     const { recurringResearchScheduler, releaseLifecycle } = await createServerContext();
 
     if (IS_DEVELOPMENT) {
+      const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
         server: { middlewareMode: true },
         appType: 'spa',
@@ -450,10 +679,12 @@ async function start() {
       const nonce = process.env.RELEASE_SUPERVISOR_NONCE;
       const targetVersion = process.env.RELEASE_TARGET_VERSION;
       const contentHash = process.env.RELEASE_CONTENT_HASH;
-      if (process.send && nonce && targetVersion && contentHash) {
-        process.send({ type: 'release.ready', nonce, targetVersion, contentHash });
-      }
-      void desktopReady!.publish(listeningPort).catch((error) => {
+      const releaseReady = IS_RELEASE_CHILD
+        ? nonce && targetVersion && contentHash
+          ? publishReleaseReadiness(nonce, targetVersion, contentHash)
+          : Promise.reject(new Error('Release child readiness metadata is incomplete.'))
+        : Promise.resolve();
+      void releaseReady.then(() => desktopReady!.publish(listeningPort)).catch((error) => {
         console.error('[Desktop] Failed to publish authenticated host readiness:', error instanceof Error ? error.message : error);
         void shutdown().finally(() => { process.exitCode = 1; });
       });

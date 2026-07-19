@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createKernelService } from './kernel';
+import { createSkillEvaluationSource } from './skills/evaluationSuite';
 import { SkillManifest } from './types';
 
 let runtimeDir = '';
@@ -126,7 +127,22 @@ describe('kernel learning service', () => {
   });
 
   it('synthesizes, evaluates, canaries, promotes, and invokes a bounded pure skill', async () => {
-    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    const evaluatorSource = createSkillEvaluationSource({
+      evaluatorId: 'evaluator:release-quality',
+      sourceId: 'evaluation-source:trim-release-v1',
+      cases: [
+        { id: 'oracle_1', input: ' C ', expectedOutput: 'C', sourceRef: 'fixture:trim_release_v1' },
+      ],
+      observedAt: '2026-07-12T00:00:00.000Z',
+    });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      skillEvaluatorAllowlist: [evaluatorSource.evaluatorId],
+      skillEvaluationSourceResolver: async (sourceId) => (
+        sourceId === evaluatorSource.sourceId ? evaluatorSource : undefined
+      ),
+    });
     const manifest: SkillManifest = {
       schemaVersion: 1,
       name: 'TrimReleaseInput',
@@ -152,15 +168,21 @@ describe('kernel learning service', () => {
       },
     };
 
+    const evaluationSuite = await kernel.createSkillEvaluationSuite({
+      sourceId: evaluatorSource.sourceId,
+    });
     const skill = await kernel.synthesizeSkill({
       manifest,
       trainingCases: [
         { id: 'train_1', input: ' A ', expectedOutput: 'A', kind: 'train' },
         { id: 'train_2', input: ' B ', expectedOutput: 'B', kind: 'train' },
       ],
-      replayCases: [
-        { id: 'replay_1', input: ' C ', expectedOutput: 'C', kind: 'replay' },
-      ],
+      author: {
+        authorityType: 'authenticated-principal-v1',
+        principalId: 'user:skill-author',
+      },
+      evaluationSuiteId: evaluationSuite.id,
+      evaluationSuiteHash: evaluationSuite.suiteHash,
     });
     expect(skill.status).toBe('candidate');
     expect(skill.program.steps).toEqual([{ operation: 'trim' }]);
@@ -171,13 +193,20 @@ describe('kernel learning service', () => {
     expect(activation.status).toBe('canary');
     const run = await kernel.runSkillCanary(skill.id);
     expect(run.passed).toBe(true);
-    expect(run.caseId).toBe('kernel_canary_v1_0');
+    expect(run.caseId).toBe('oracle_1');
     expect(run).not.toHaveProperty('output');
     const promoted = await kernel.promoteSkillPackage(skill.id);
     expect(promoted.status).toBe('promoted');
     expect(await kernel.invokeSkill(skill.id, ' E ')).toBe('E');
 
-    const ledger = JSON.stringify(await kernel.getEvents());
+    const events = await kernel.getEvents();
+    const sourceIndex = events.findIndex((event) => event.type === 'skill.evaluation_source_attested');
+    const sealIndex = events.findIndex((event) => event.type === 'skill.evaluation_suite_sealed');
+    const candidateIndex = events.findIndex((event) => event.type === 'skill.candidate_created');
+    expect(sourceIndex).toBeGreaterThanOrEqual(0);
+    expect(sourceIndex).toBeLessThan(sealIndex);
+    expect(sealIndex).toBeLessThan(candidateIndex);
+    const ledger = JSON.stringify(events);
     expect(ledger).not.toContain(' C ');
     expect(ledger).not.toContain(' E ');
   });

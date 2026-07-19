@@ -1,12 +1,19 @@
 import {
   PureTransformProgram,
   SkillActivation,
+  SkillCandidateAuthor,
   SkillCase,
   SkillEvaluation,
+  SkillEvaluationSuite,
   SkillManifest,
   SkillPackage,
 } from '../types';
 import { computeSkillContentHash } from './evaluation';
+import {
+  assertIndependentSkillEvaluation,
+  assertSkillEvaluationSuiteIntegrity,
+  getSkillOracleCase,
+} from './evaluationSuite';
 import {
   HARD_MAX_INPUT_CHARS,
   HARD_MAX_OUTPUT_CHARS,
@@ -20,7 +27,8 @@ export interface CreateSkillCandidateInput {
   manifest: SkillManifest;
   program: PureTransformProgram;
   trainingCases: SkillCase[];
-  replayCases: SkillCase[];
+  author: SkillCandidateAuthor;
+  evaluationSuite: SkillEvaluationSuite;
   previousVersionId?: string;
   createdAt: string;
 }
@@ -41,58 +49,6 @@ export interface SkillAndActivation {
   activation: SkillActivation;
 }
 
-export interface KernelCanaryCase {
-  id: string;
-  input: string;
-  expectedOutput: string;
-}
-
-const KERNEL_CANARY_INPUTS = Object.freeze([
-  '  Alpha   beta  ',
-  'zeta\r\nAlpha\nbeta',
-  '\tMiXeD Case\n',
-  'line 3\nline 1\nline 2',
-]);
-
-// This reference interpreter is intentionally separate from the executable
-// runtime so a canary does not compare the runtime with itself.
-const runReferenceTransform = (program: PureTransformProgram, input: string): string => {
-  let output = input;
-  for (const step of program.steps) {
-    switch (step.operation) {
-      case 'trim':
-        output = output.trim();
-        break;
-      case 'collapse_whitespace':
-        output = output.replace(/\s+/gu, ' ');
-        break;
-      case 'lowercase':
-        output = output.toLowerCase();
-        break;
-      case 'uppercase':
-        output = output.toUpperCase();
-        break;
-      case 'sort_lines':
-        output = output.replace(/\r\n?/gu, '\n').split('\n').sort(compareText).join('\n');
-        break;
-      default:
-        throw new Error('Kernel canary encountered an unsupported transform operation.');
-    }
-  }
-  return output;
-};
-
-export const getKernelCanaryCase = (skill: SkillPackage, runIndex: number): KernelCanaryCase => {
-  if (!Number.isSafeInteger(runIndex) || runIndex < 0) throw new Error('Kernel canary run index is invalid.');
-  const fixture = KERNEL_CANARY_INPUTS[runIndex % KERNEL_CANARY_INPUTS.length];
-  const input = fixture.slice(0, skill.manifest.maxInputChars);
-  return {
-    id: `kernel_canary_v1_${runIndex}`,
-    input,
-    expectedOutput: runReferenceTransform(skill.program, input),
-  };
-};
-
 export interface SkillPackageLedgerMetadata {
   skillId: string;
   name: string;
@@ -100,9 +56,11 @@ export interface SkillPackageLedgerMetadata {
   runtime: SkillManifest['runtime'];
   status: SkillPackage['status'];
   contentHash: string;
+  evaluationSuiteId: string;
+  evaluationSuiteHash: string;
+  authorPrincipalId: string;
   permissionScopes: string[];
   trainingCaseCount: number;
-  replayCaseCount: number;
   previousVersionId?: string;
 }
 
@@ -110,6 +68,8 @@ export interface SkillActivationLedgerMetadata {
   activationId: string;
   skillId: string;
   evaluationId: string;
+  candidateContentHash: string;
+  suiteId: string;
   suiteHash: string;
   replayCaseIds: string[];
   status: SkillActivation['status'];
@@ -192,27 +152,22 @@ const validateManifest = (manifest: SkillManifest): void => {
 
 const validateCases = (
   trainingCases: SkillCase[],
-  replayCases: SkillCase[],
   maxInputChars: number,
 ): void => {
-  if (trainingCases.length === 0 || replayCases.length === 0) {
-    throw new Error('A skill candidate requires training and held-out replay cases.');
+  if (trainingCases.length === 0) {
+    throw new Error('A skill candidate requires training cases.');
   }
-  if (trainingCases.length > MAX_SKILL_CASES || replayCases.length > MAX_SKILL_CASES) {
-    throw new Error(`A skill candidate accepts at most ${MAX_SKILL_CASES} cases per suite.`);
+  if (trainingCases.length > MAX_SKILL_CASES) {
+    throw new Error(`A skill candidate accepts at most ${MAX_SKILL_CASES} training cases.`);
   }
   if (trainingCases.some((item) => item.kind !== 'train')) {
     throw new Error('Training suites may contain training cases only.');
   }
-  if (replayCases.some((item) => item.kind !== 'replay')) {
-    throw new Error('Replay suites may contain replay cases only.');
+  const ids = new Set(trainingCases.map((item) => item.id));
+  if (ids.size !== trainingCases.length || trainingCases.some((item) => !item.id.trim())) {
+    throw new Error('Skill training case ids must be non-empty and unique.');
   }
-  const allCases = [...trainingCases, ...replayCases];
-  const ids = new Set(allCases.map((item) => item.id));
-  if (ids.size !== allCases.length || allCases.some((item) => !item.id.trim())) {
-    throw new Error('Skill case ids must be non-empty and unique across suites.');
-  }
-  for (const item of allCases) {
+  for (const item of trainingCases) {
     if (item.input.length > maxInputChars || item.expectedOutput.length > HARD_MAX_OUTPUT_CHARS) {
       throw new Error('Skill case content exceeds the package limits.');
     }
@@ -220,6 +175,13 @@ const validateCases = (
 };
 
 const assertSkillContentIntegrity = (skill: SkillPackage): void => {
+  if (
+    skill.author?.authorityType !== 'authenticated-principal-v1' ||
+    typeof skill.author.principalId !== 'string' ||
+    !skill.author.principalId.trim()
+  ) {
+    throw new Error('Legacy skill package lacks authenticated author authority.');
+  }
   if (computeSkillContentHash(skill) !== skill.contentHash) {
     throw new Error('Skill package content hash does not match its content.');
   }
@@ -227,15 +189,25 @@ const assertSkillContentIntegrity = (skill: SkillPackage): void => {
 
 export const createSkillCandidate = (input: CreateSkillCandidateInput): SkillPackage => {
   if (!input.id.trim()) throw new Error('Skill id is required.');
+  if (!Number.isFinite(Date.parse(input.createdAt))) {
+    throw new Error('Skill candidate creation timestamp is invalid.');
+  }
   const manifest = normalizeManifest(input.manifest);
   const trainingCases = sortCases(input.trainingCases);
-  const replayCases = sortCases(input.replayCases);
+  assertSkillEvaluationSuiteIntegrity(input.evaluationSuite);
+  if (Date.parse(input.evaluationSuite.sealedAt) > Date.parse(input.createdAt)) {
+    throw new Error('Skill evaluation suite must be sealed before candidate creation.');
+  }
   const program: PureTransformProgram = {
     runtime: input.program.runtime,
     steps: input.program.steps.map((step) => ({ ...step })),
   };
   validateManifest(manifest);
-  validateCases(trainingCases, replayCases, manifest.maxInputChars);
+  validateCases(trainingCases, manifest.maxInputChars);
+  assertIndependentSkillEvaluation(trainingCases, input.author, input.evaluationSuite);
+  if (input.evaluationSuite.cases.some((item) => item.input.length > manifest.maxInputChars)) {
+    throw new Error('Skill evaluation suite input exceeds the candidate package limit.');
+  }
   runPureTransform(program, '', {
     maxInputChars: manifest.maxInputChars,
     maxSteps: manifest.maxSteps,
@@ -246,7 +218,9 @@ export const createSkillCandidate = (input: CreateSkillCandidateInput): SkillPac
     manifest,
     program,
     trainingCases,
-    replayCases,
+    author: { ...input.author },
+    evaluationSuiteId: input.evaluationSuite.id,
+    evaluationSuiteHash: input.evaluationSuite.suiteHash,
     status: 'candidate',
     contentHash: '',
     previousVersionId: input.previousVersionId,
@@ -268,6 +242,13 @@ export const applySkillEvaluation = (
   if (evaluation.skillId !== skill.id) {
     throw new Error('Skill evaluation does not belong to this package.');
   }
+  if (
+    evaluation.candidateContentHash !== skill.contentHash ||
+    evaluation.suiteId !== skill.evaluationSuiteId ||
+    evaluation.suiteHash !== skill.evaluationSuiteHash
+  ) {
+    throw new Error('Skill evaluation does not match the candidate and sealed oracle binding.');
+  }
   return {
     ...skill,
     status: evaluation.eligibleForCanary ? 'evaluated' : 'rejected',
@@ -278,25 +259,45 @@ export const applySkillEvaluation = (
 export const activateSkillCanary = (
   skill: SkillPackage,
   evaluation: SkillEvaluation,
+  suite: SkillEvaluationSuite,
   input: ActivateSkillCanaryInput,
 ): SkillAndActivation => {
   assertSkillContentIntegrity(skill);
+  assertSkillEvaluationSuiteIntegrity(suite);
   if (skill.status !== 'evaluated' || !evaluation.eligibleForCanary) {
     throw new Error('Only an evaluated, eligible skill can enter canary activation.');
   }
   if (evaluation.skillId !== skill.id) {
     throw new Error('Skill evaluation does not belong to this package.');
   }
+  if (
+    skill.evaluationSuiteId !== suite.id ||
+    skill.evaluationSuiteHash !== suite.suiteHash ||
+    evaluation.candidateContentHash !== skill.contentHash ||
+    evaluation.suiteId !== suite.id ||
+    evaluation.suiteHash !== suite.suiteHash
+  ) {
+    throw new Error('Canary activation does not match the candidate and sealed oracle binding.');
+  }
   if (!input.activationId.trim()) throw new Error('Skill activation id is required.');
   if (!Number.isInteger(input.maxRuns) || input.maxRuns < 1 || input.maxRuns > 100) {
     throw new Error('Canary maxRuns must be between 1 and 100.');
   }
+  if (input.maxRuns > suite.cases.length) {
+    throw new Error('Canary maxRuns exceeds the sealed oracle case count.');
+  }
   if (evaluation.caseResults.length === 0 || evaluation.caseResults.some((result) => !result.passed)) {
     throw new Error('Canary activation requires a successful held-out evaluation suite.');
   }
+  if (
+    evaluation.caseResults.length !== suite.cases.length ||
+    evaluation.caseResults.some((result, index) => result.caseId !== suite.cases[index].id)
+  ) {
+    throw new Error('Canary activation evaluation order does not match the sealed oracle suite.');
+  }
   const replayCaseIds = Array.from(
     { length: input.maxRuns },
-    (_, index) => getKernelCanaryCase(skill, index).id,
+    (_, index) => getSkillOracleCase(suite, index).id,
   );
 
   return {
@@ -305,7 +306,9 @@ export const activateSkillCanary = (
       id: input.activationId,
       skillId: skill.id,
       evaluationId: evaluation.id,
-      suiteHash: skill.contentHash,
+      candidateContentHash: skill.contentHash,
+      suiteId: suite.id,
+      suiteHash: suite.suiteHash,
       replayCaseIds,
       status: 'canary',
       maxRuns: input.maxRuns,
@@ -326,6 +329,13 @@ export const recordCanaryRun = (
   assertSkillContentIntegrity(skill);
   if (skill.status !== 'canary' || activation.skillId !== skill.id) {
     throw new Error('Canary activation does not belong to an active canary skill.');
+  }
+  if (
+    activation.candidateContentHash !== skill.contentHash ||
+    activation.suiteId !== skill.evaluationSuiteId ||
+    activation.suiteHash !== skill.evaluationSuiteHash
+  ) {
+    throw new Error('Canary activation does not match the candidate and sealed oracle binding.');
   }
   if (activation.status !== 'canary' || activation.usedRuns >= activation.maxRuns) {
     throw new Error('Canary activation is not accepting additional runs.');
@@ -348,6 +358,13 @@ export const promoteSkill = (
   assertSkillContentIntegrity(skill);
   if (skill.status !== 'canary' || activation.skillId !== skill.id || activation.status !== 'canary') {
     throw new Error('Only an active canary skill can be promoted.');
+  }
+  if (
+    activation.candidateContentHash !== skill.contentHash ||
+    activation.suiteId !== skill.evaluationSuiteId ||
+    activation.suiteHash !== skill.evaluationSuiteHash
+  ) {
+    throw new Error('Skill promotion oracle binding does not match the candidate.');
   }
   if (
     activation.usedRuns !== activation.maxRuns ||
@@ -396,9 +413,11 @@ export const getSkillPackageLedgerMetadata = (
   runtime: skill.manifest.runtime,
   status: skill.status,
   contentHash: skill.contentHash,
+  evaluationSuiteId: skill.evaluationSuiteId,
+  evaluationSuiteHash: skill.evaluationSuiteHash,
+  authorPrincipalId: skill.author.principalId,
   permissionScopes: [...skill.manifest.permissionScopes],
   trainingCaseCount: skill.trainingCases.length,
-  replayCaseCount: skill.replayCases.length,
   previousVersionId: skill.previousVersionId,
 });
 
@@ -408,6 +427,8 @@ export const getSkillActivationLedgerMetadata = (
   activationId: activation.id,
   skillId: activation.skillId,
   evaluationId: activation.evaluationId,
+  candidateContentHash: activation.candidateContentHash,
+  suiteId: activation.suiteId,
   suiteHash: activation.suiteHash,
   replayCaseIds: [...activation.replayCaseIds],
   status: activation.status,

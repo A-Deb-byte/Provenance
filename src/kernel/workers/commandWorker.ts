@@ -1,7 +1,7 @@
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { useCapabilityToken } from '../capabilities';
-import { createHostSandbox, SandboxRunner } from '../sandbox/sandbox';
+import { createHostSandbox, sandboxStatus, SandboxRunner } from '../sandbox/sandbox';
 import { CapabilityToken, KernelCommandRequest, KernelEvidence } from '../types';
 
 const allowedNpmArguments = new Set(['test', 'run lint', 'run build', '--version']);
@@ -48,7 +48,7 @@ const isTokenScopedToRequest = (token: CapabilityToken, request: KernelCommandRe
 
 export interface CommandWorkerOptions {
   timeoutMs?: number;
-  /** Isolation boundary for execution. Defaults to the trusted host. */
+  /** Server-selected isolation boundary. Direct standalone callers default to the trusted host. */
   sandbox?: SandboxRunner;
 }
 
@@ -97,6 +97,17 @@ export const runKernelCommand = async (
       stderr: 'Command request is not allowlisted.',
     };
   }
+  const sandbox = options.sandbox ?? createHostSandbox();
+  if (sandbox.mode === 'disabled') {
+    return {
+      kind: 'command_output',
+      summary: 'Command execution is unavailable.',
+      command: `${request.command} ${request.args.join(' ')}`,
+      exitCode: 126,
+      durationMs: Date.now() - started,
+      stderr: sandboxStatus(sandbox).commandExecution.reason,
+    };
+  }
   const capabilityUse = useCapabilityToken(token);
   if (!capabilityUse.allowed) {
     return {
@@ -108,7 +119,6 @@ export const runKernelCommand = async (
   }
   token.usedOperations = capabilityUse.token.usedOperations;
 
-  const sandbox = options.sandbox ?? createHostSandbox();
   const result = await sandbox.run({
     command: request.command,
     args: request.args,

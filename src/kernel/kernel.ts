@@ -49,10 +49,18 @@ import {
 import { decidePolicyForCommand } from './policy';
 import { evaluateSkillPackage, getSkillEvaluationLedgerMetadata } from './skills/evaluation';
 import {
+  assertIndependentSkillEvaluation,
+  assertSkillEvaluationSourceIntegrity,
+  createSkillEvaluationSuite as createSkillEvaluationSuiteRecord,
+  getSkillEvaluationSourceLedgerMetadata,
+  getSkillEvaluationSuiteLedgerMetadata,
+  getSkillOracleCase,
+  type SkillEvaluationSourceResolver,
+} from './skills/evaluationSuite';
+import {
   activateSkillCanary,
   applySkillEvaluation,
   createSkillCandidate,
-  getKernelCanaryCase,
   getSkillActivationLedgerMetadata,
   getSkillPackageLedgerMetadata,
   promoteSkill,
@@ -132,8 +140,10 @@ import {
   ResearchMissionSource,
   ResearchMissionStage,
   SkillActivation,
+  SkillCandidateAuthor,
   SkillCase,
   SkillEvaluation,
+  SkillEvaluationSuite,
   SkillManifest,
   SkillPackage,
 } from './types';
@@ -157,6 +167,16 @@ export interface KernelActionWorker {
     signal?: AbortSignal;
   }): Promise<KernelActionWorkerResult>;
 }
+
+const outcomeUncertainMutationFamily = (actionType: string): 'desktop' | 'browser' | undefined => {
+  if (actionType === 'desktop.click' || actionType === 'desktop.type' || actionType === 'desktop.shortcut') {
+    return 'desktop';
+  }
+  if (actionType === 'browser.navigate' || actionType === 'browser.click' || actionType === 'browser.type') {
+    return 'browser';
+  }
+  return undefined;
+};
 
 /** May only tighten: heuristic assessment stays the floor on any failure. */
 export type KernelObservationAssessor = (content: string) => Promise<{
@@ -203,6 +223,8 @@ export interface KernelServiceOptions {
   recurringResearchSchedulerEnabled?: boolean;
   recurringResearchTickMs?: number;
   schedulerInstanceId?: string;
+  skillEvaluationSourceResolver?: SkillEvaluationSourceResolver;
+  skillEvaluatorAllowlist?: readonly string[];
 }
 
 export interface KernelStepResult {
@@ -266,8 +288,14 @@ export type KernelMemoryCandidateInput = Omit<CreateMemoryCandidateInput, 'evide
 export interface KernelSkillSynthesisInput {
   manifest: SkillManifest;
   trainingCases: SkillCase[];
-  replayCases: SkillCase[];
+  author: SkillCandidateAuthor;
+  evaluationSuiteId: string;
+  evaluationSuiteHash: string;
   previousVersionId?: string;
+}
+
+export interface KernelSkillEvaluationSuiteInput {
+  sourceId: string;
 }
 
 const isWithinRoot = (root: string, candidate: string): boolean => {
@@ -362,6 +390,67 @@ const exactStringArray = (value: unknown, expected: readonly string[]): boolean 
   value.length === expected.length &&
   value.every((item, index) => typeof item === 'string' && item === expected[index])
 );
+
+const skillEvaluationSuites = (state: KernelState): SkillEvaluationSuite[] => (
+  Array.isArray(state.skillEvaluationSuites) ? state.skillEvaluationSuites : []
+);
+
+const assertSkillSuiteLedgerSeal = (
+  events: KernelEvent[],
+  suite: SkillEvaluationSuite,
+  skill?: SkillPackage,
+): void => {
+  const metadata = getSkillEvaluationSuiteLedgerMetadata(suite);
+  const sourceMetadata = {
+    authorityType: suite.authority.authorityType,
+    evaluatorId: suite.authority.evaluatorId,
+    sourceId: suite.authority.sourceId,
+    sourceContentHash: suite.authority.sourceContentHash,
+    caseCount: suite.cases.length,
+    observedAt: suite.authority.observedAt,
+  };
+  const sourceIndexes = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => event.id === suite.authority.sourceEventId);
+  const sealIndexes = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => (
+      event.type === 'skill.evaluation_suite_sealed' &&
+      event.entityType === 'skill_eval' &&
+      event.entityId === suite.id
+    ));
+  if (
+    sourceIndexes.length !== 1 ||
+    sourceIndexes[0].event.actor !== 'kernel' ||
+    sourceIndexes[0].event.type !== 'skill.evaluation_source_attested' ||
+    sourceIndexes[0].event.entityType !== 'skill_eval' ||
+    sourceIndexes[0].event.entityId !== suite.authority.sourceId ||
+    stableHash(sourceIndexes[0].event.payload) !== stableHash(sourceMetadata) ||
+    sealIndexes.length !== 1 ||
+    sealIndexes[0].event.actor !== 'kernel' ||
+    stableHash(sealIndexes[0].event.payload) !== stableHash(metadata) ||
+    sourceIndexes[0].index >= sealIndexes[0].index
+  ) {
+    throw new Error('Skill evaluation suite is not authenticated by ordered evaluator-source and kernel-seal events.');
+  }
+  if (!skill) return;
+  const candidateIndexes = events
+    .map((event, index) => ({ event, index }))
+    .filter(({ event }) => (
+      event.type === 'skill.candidate_created' &&
+      event.entityType === 'skill' &&
+      event.entityId === skill.id
+    ));
+  if (
+    candidateIndexes.length !== 1 ||
+    sealIndexes[0].index >= candidateIndexes[0].index ||
+    candidateIndexes[0].event.payload.evaluationSuiteId !== suite.id ||
+    candidateIndexes[0].event.payload.evaluationSuiteHash !== suite.suiteHash ||
+    candidateIndexes[0].event.payload.contentHash !== skill.contentHash
+  ) {
+    throw new Error('Skill evaluation suite was not sealed before this candidate was created.');
+  }
+};
 
 const RECURRING_RESEARCH_STATE_SCHEMA = 1 as const;
 const RECURRING_RESEARCH_DEFAULT_TICK_MS = 15_000;
@@ -583,10 +672,14 @@ const normalizeRecurringResearchScheduleInput = (
 
 export const createKernelService = (options: KernelServiceOptions) => {
   const workerRegistry = createWorkerRegistry(options.workerRegistrations ?? defaultWorkerRegistrations());
+  const actionWorkers: Record<string, KernelActionWorker> = { ...(options.actionWorkers ?? {}) };
   const capabilityGrantStore = options.capabilityGrantStore ?? createMemoryCapabilityGrantStore();
   const activeProviderControllers = new Map<string, AbortController>();
   const activeActionControllers = new Map<string, AbortController>();
   const activeRecurringResearchControllers = new Map<string, AbortController>();
+  const skillEvaluatorAllowlist = new Set(
+    (options.skillEvaluatorAllowlist ?? []).map((id) => id.trim()).filter(Boolean),
+  );
   const schedulerInstanceId = options.schedulerInstanceId?.trim() || `scheduler_${crypto.randomUUID()}`;
   const configuredTickMs = options.recurringResearchTickMs ?? RECURRING_RESEARCH_DEFAULT_TICK_MS;
   const recurringResearchTickMs = Number.isSafeInteger(configuredTickMs)
@@ -1234,8 +1327,87 @@ export const createKernelService = (options: KernelServiceOptions) => {
     return listActiveMemories(state.memories).filter((record) => record.status === 'promoted');
   };
 
+  const createSkillEvaluationSuite = (
+    input: KernelSkillEvaluationSuiteInput,
+  ): Promise<SkillEvaluationSuite> => withMutation(async () => {
+    let state = await readConsistentState();
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      Object.keys(input).some((key) => key !== 'sourceId') ||
+      typeof input.sourceId !== 'string' ||
+      !input.sourceId.trim()
+    ) {
+      throw new Error('Raw oracle expectations and authority claims are not accepted; reference one evaluator source id.');
+    }
+    if (!options.skillEvaluationSourceResolver || skillEvaluatorAllowlist.size === 0) {
+      throw new Error('Trusted skill evaluator source resolution is unavailable.');
+    }
+    const requestedSourceId = input.sourceId.trim();
+    const source = await options.skillEvaluationSourceResolver(requestedSourceId);
+    if (!source || source.sourceId !== requestedSourceId) {
+      throw new Error('Trusted skill evaluation source was not found.');
+    }
+    assertSkillEvaluationSourceIntegrity(source);
+    if (!skillEvaluatorAllowlist.has(source.evaluatorId)) {
+      throw new Error('Skill evaluation source evaluator is not allowlisted.');
+    }
+    if (skillEvaluationSuites(state).some((suite) => suite.authority?.sourceId === source.sourceId)) {
+      throw new Error('Skill evaluation source has already been consumed by a sealed suite.');
+    }
+    const sourceAttestedAt = new Date().toISOString();
+    if (Date.parse(source.observedAt) > Date.parse(sourceAttestedAt)) {
+      throw new Error('Skill evaluation source cannot postdate its kernel attestation.');
+    }
+    const sourceAppended = await appendEvent(state, {
+      actor: 'kernel',
+      type: 'skill.evaluation_source_attested',
+      entityId: source.sourceId,
+      entityType: 'skill_eval',
+      payload: { ...getSkillEvaluationSourceLedgerMetadata(source) },
+    });
+    state = sourceAppended.state;
+    const createdAt = new Date().toISOString();
+    const suite = createSkillEvaluationSuiteRecord({
+      id: createKernelId('skill_suite'),
+      source,
+      sourceEventId: sourceAppended.event.id,
+      createdAt,
+    });
+    const appended = await appendEvent(state, {
+      actor: 'kernel',
+      type: 'skill.evaluation_suite_sealed',
+      entityId: suite.id,
+      entityType: 'skill_eval',
+      payload: { ...getSkillEvaluationSuiteLedgerMetadata(suite) },
+    });
+    state = appended.state;
+    await commitState({
+      ...state,
+      skillEvaluationSuites: [...skillEvaluationSuites(state), suite],
+    });
+    return suite;
+  });
+
   const synthesizeSkill = (input: KernelSkillSynthesisInput): Promise<SkillPackage> => withMutation(async () => {
     let state = await readConsistentState();
+    if (Object.prototype.hasOwnProperty.call(input, 'replayCases')) {
+      throw new Error('Raw replay expectations are not accepted; reference a pre-sealed evaluation suite.');
+    }
+    if (
+      typeof input.evaluationSuiteId !== 'string' ||
+      !input.evaluationSuiteId.trim() ||
+      typeof input.evaluationSuiteHash !== 'string' ||
+      !input.evaluationSuiteHash.trim()
+    ) {
+      throw new Error('Skill synthesis requires a pre-sealed evaluation suite id and hash.');
+    }
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === input.evaluationSuiteId);
+    if (!suite || suite.suiteHash !== input.evaluationSuiteHash) {
+      throw new Error('Skill evaluation suite not found or hash does not match its seal.');
+    }
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite);
+    assertIndependentSkillEvaluation(input.trainingCases, input.author, suite);
     const synthesis = synthesizePureTransform(input.trainingCases, {
       maxSteps: input.manifest.maxSteps,
       maxInputChars: input.manifest.maxInputChars,
@@ -1249,12 +1421,13 @@ export const createKernelService = (options: KernelServiceOptions) => {
       manifest: input.manifest,
       program: synthesis.program,
       trainingCases: input.trainingCases,
-      replayCases: input.replayCases,
+      author: input.author,
+      evaluationSuite: suite,
       previousVersionId: input.previousVersionId,
       createdAt: now,
     });
     const appended = await appendEvent(state, {
-      actor: input.manifest.provenance.actor,
+      actor: 'user',
       type: 'skill.candidate_created',
       entityId: skill.id,
       entityType: 'skill',
@@ -1272,8 +1445,11 @@ export const createKernelService = (options: KernelServiceOptions) => {
     let state = await readConsistentState();
     const skill = state.skillPackages.find((candidate) => candidate.id === skillId);
     if (!skill) throw new Error('Skill not found.');
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === skill.evaluationSuiteId);
+    if (!suite) throw new Error('Skill evaluation suite not found.');
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite, skill);
     const createdAt = new Date().toISOString();
-    const evaluation = evaluateSkillPackage(skill, {
+    const evaluation = evaluateSkillPackage(skill, suite, {
       evaluationId: createKernelId('eval'),
       createdAt,
     });
@@ -1300,8 +1476,11 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!skill) throw new Error('Skill not found.');
     const evaluation = [...state.skillEvaluations].reverse().find((candidate) => candidate.skillId === skillId);
     if (!evaluation) throw new Error('Skill evaluation not found.');
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === skill.evaluationSuiteId);
+    if (!suite) throw new Error('Skill evaluation suite not found.');
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite, skill);
     const now = new Date().toISOString();
-    const canary = activateSkillCanary(skill, evaluation, {
+    const canary = activateSkillCanary(skill, evaluation, suite, {
       activationId: createKernelId('activation'),
       maxRuns,
       createdAt: now,
@@ -1332,23 +1511,35 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!activation) throw new Error('Skill activation not found.');
     if (
       typeof activation.evaluationId !== 'string' ||
+      typeof activation.candidateContentHash !== 'string' ||
+      typeof activation.suiteId !== 'string' ||
       typeof activation.suiteHash !== 'string' ||
       !Array.isArray(activation.replayCaseIds)
     ) {
       throw new Error('Legacy skill canary must be restarted with kernel-owned replay evidence.');
     }
     const evaluation = state.skillEvaluations.find((candidate) => candidate.id === activation.evaluationId);
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === activation.suiteId);
     if (
       !evaluation ||
+      !suite ||
       evaluation.skillId !== skill.id ||
       !evaluation.eligibleForCanary ||
-      activation.suiteHash !== skill.contentHash
+      evaluation.candidateContentHash !== skill.contentHash ||
+      evaluation.suiteId !== suite.id ||
+      evaluation.suiteHash !== suite.suiteHash ||
+      activation.candidateContentHash !== skill.contentHash ||
+      activation.suiteId !== suite.id ||
+      activation.suiteHash !== suite.suiteHash ||
+      skill.evaluationSuiteId !== suite.id ||
+      skill.evaluationSuiteHash !== suite.suiteHash
     ) {
       throw new Error('Skill canary evaluation evidence is missing or does not match its activation.');
     }
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite, skill);
     const caseId = activation.replayCaseIds[activation.usedRuns];
-    const canaryCase = getKernelCanaryCase(skill, activation.usedRuns);
-    if (caseId !== canaryCase.id) throw new Error('Skill canary kernel-owned case sequence is invalid.');
+    const canaryCase = getSkillOracleCase(suite, activation.usedRuns);
+    if (caseId !== canaryCase.id) throw new Error('Skill canary sealed oracle case sequence is invalid.');
     const output = runPureTransform(skill.program, canaryCase.input, {
       maxInputChars: skill.manifest.maxInputChars,
       maxSteps: skill.manifest.maxSteps,
@@ -1384,6 +1575,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!skill) throw new Error('Skill not found.');
     const activation = [...state.skillActivations].reverse().find((candidate) => candidate.skillId === skillId);
     if (!activation) throw new Error('Skill activation not found.');
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === skill.evaluationSuiteId);
+    if (!suite) throw new Error('Skill evaluation suite not found.');
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite, skill);
     const promoted = promoteSkill(skill, activation, new Date().toISOString());
     const appended = await appendEvent(state, {
       actor: 'user',
@@ -1435,6 +1629,21 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (skill.status !== 'promoted' || activation?.status !== 'active') {
       throw new Error('Skill is not active.');
     }
+    const suite = skillEvaluationSuites(state).find((candidate) => candidate.id === skill.evaluationSuiteId);
+    const evaluation = state.skillEvaluations.find((candidate) => candidate.id === activation.evaluationId);
+    if (
+      !suite ||
+      !evaluation ||
+      evaluation.candidateContentHash !== skill.contentHash ||
+      evaluation.suiteId !== suite.id ||
+      evaluation.suiteHash !== suite.suiteHash ||
+      activation.candidateContentHash !== skill.contentHash ||
+      activation.suiteId !== suite.id ||
+      activation.suiteHash !== suite.suiteHash
+    ) {
+      throw new Error('Skill activation is missing its sealed evaluation oracle.');
+    }
+    assertSkillSuiteLedgerSeal(await readKernelEvents(options.runtimeDir), suite, skill);
     const output = runPureTransform(skill.program, input, {
       maxInputChars: skill.manifest.maxInputChars,
       maxSteps: skill.manifest.maxSteps,
@@ -1703,7 +1912,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!options.artifactStore) {
       return { available: false, reason: 'The authenticated artifact store is unavailable.', allowedOrigins, maxSources: MAX_RESEARCH_SOURCES };
     }
-    if (!workerId || registration?.availability !== 'available' || !options.actionWorkers?.[workerId]) {
+    if (!workerId || registration?.availability !== 'available' || !actionWorkers[workerId]) {
       return { available: false, reason: 'The read-only web inspection worker is unavailable.', allowedOrigins, maxSources: MAX_RESEARCH_SOURCES };
     }
     if (allowedOrigins.length === 0) {
@@ -1993,7 +2202,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
     const workerId = options.researchWorkerId?.trim();
     const registration = workerId ? workerRegistry.get(workerId) : undefined;
-    const worker = workerId ? options.actionWorkers?.[workerId] : undefined;
+    const worker = workerId ? actionWorkers[workerId] : undefined;
     if (!workerId || !registration || registration.availability !== 'available' || !worker) {
       throw new Error('The read-only web inspection worker is unavailable.');
     }
@@ -3869,6 +4078,26 @@ export const createKernelService = (options: KernelServiceOptions) => {
     report: workerRegistry.report(),
   });
 
+  const activateWorkerRuntime = (
+    registration: WorkerRegistration,
+    worker: KernelActionWorker,
+  ): void => {
+    if (!worker || typeof worker.execute !== 'function') {
+      throw new Error(`Worker activation requires an executable runtime: ${registration.id}.`);
+    }
+    const previous = actionWorkers[registration.id];
+    actionWorkers[registration.id] = worker;
+    try {
+      // The registry enforces a one-way availability transition and rejects
+      // any action or scope change at this late authority boundary.
+      workerRegistry.activate(registration);
+    } catch (error) {
+      if (previous) actionWorkers[registration.id] = previous;
+      else delete actionWorkers[registration.id];
+      throw error;
+    }
+  };
+
   const createAutomation = (value: unknown): Promise<AutomationContract> => withMutation(async () => {
     if (!isAutomationContractInput(value)) throw new Error('Invalid automation input.');
     let state = await readConsistentState();
@@ -4017,7 +4246,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (events.some((event) => (
       event.type === 'automation.run_uncertain' && event.payload.automationId === automationId
     ))) {
-      throw new Error('Automation has an unresolved uncertain desktop outcome and cannot be retried.');
+      throw new Error('Automation has an unresolved uncertain mutation outcome and cannot be retried.');
     }
     const runEvents = events.filter((event) => (
       terminalRunTypes.has(event.type) &&
@@ -4112,7 +4341,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       return { kind: 'result', result: { decision, approvalId } };
     }
 
-    const worker = options.actionWorkers?.[automation.workerId];
+    const worker = actionWorkers[automation.workerId];
     const registration = workerRegistry.get(automation.workerId);
     if (!worker || !registration) {
       throw new Error('No executable worker runtime is registered for this automation.');
@@ -4238,16 +4467,15 @@ export const createKernelService = (options: KernelServiceOptions) => {
       fenceErrorCode = 'stale_dispatch';
     }
 
-    const desktopMutation = prepared.intent.action.type === 'desktop.click' ||
-      prepared.intent.action.type === 'desktop.type' || prepared.intent.action.type === 'desktop.shortcut';
+    const mutationFamily = outcomeUncertainMutationFamily(prepared.intent.action.type);
     let dispatch: KernelActionWorkerResult = fenceReason
       ? {
-        status: desktopMutation ? 'uncertain' : 'failed',
-        summary: desktopMutation
-          ? `${fenceReason} The desktop mutation may have completed and must not be retried automatically.`
+        status: mutationFamily ? 'uncertain' : 'failed',
+        summary: mutationFamily
+          ? `${fenceReason} The ${mutationFamily} mutation may have completed and must not be retried automatically.`
           : fenceReason,
         sourceRef: `automation:${prepared.automationId}`,
-        errorCode: desktopMutation ? 'desktop_outcome_uncertain' : fenceErrorCode,
+        errorCode: mutationFamily ? `${mutationFamily}_outcome_uncertain` : fenceErrorCode,
       }
       : dispatched;
     let content = dispatch.content ?? '';
@@ -4376,13 +4604,12 @@ export const createKernelService = (options: KernelServiceOptions) => {
           'Automation dispatch was cancelled before completion.',
         );
       } catch {
-        const desktopMutation = prepared.intent.action.type === 'desktop.click' ||
-          prepared.intent.action.type === 'desktop.type' || prepared.intent.action.type === 'desktop.shortcut';
-        const uncertain = desktopMutation && (timedOut || prepared.controller.signal.aborted);
+        const mutationFamily = outcomeUncertainMutationFamily(prepared.intent.action.type);
+        const uncertain = Boolean(mutationFamily) && (timedOut || prepared.controller.signal.aborted);
         dispatch = {
           status: uncertain ? 'uncertain' : 'failed',
           summary: uncertain
-            ? 'Desktop dispatch was interrupted after authorization; its native side effect may have completed and must not be retried automatically.'
+            ? `${mutationFamily === 'desktop' ? 'Desktop' : 'Browser'} dispatch was interrupted after authorization; its side effect may have completed and must not be retried automatically.`
             : timedOut
             ? 'Worker execution timed out after capability authorization.'
             : prepared.controller.signal.aborted
@@ -4390,7 +4617,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
               : 'Worker execution failed after capability authorization.',
           sourceRef: `automation:${prepared.automationId}`,
           errorCode: uncertain
-            ? 'desktop_outcome_uncertain'
+            ? `${mutationFamily}_outcome_uncertain`
             : timedOut ? 'timeout' : prepared.controller.signal.aborted ? 'cancelled' : 'worker_exception',
         };
       }
@@ -4885,6 +5112,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     promoteMemory,
     revokeMemory,
     getActiveMemories,
+    createSkillEvaluationSuite,
     synthesizeSkill,
     evaluateSkill,
     startSkillCanary,
@@ -4910,6 +5138,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     skipRecurringResearchOccurrence,
     abortRecurringResearchRuns,
     getWorkers,
+    activateWorkerRuntime,
     createAutomation,
     setAutomationEnabled,
     evaluateAutomation,
