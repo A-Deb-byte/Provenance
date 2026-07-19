@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import crypto from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';

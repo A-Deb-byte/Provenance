@@ -16,6 +16,14 @@ const bundleTypeNsis = Buffer.from('__TAURI_BUNDLE_TYPE_VAR_NSS', 'ascii');
 let cargoAboutFixture: { executable: string; sha256: string; version: string };
 let nodeSignerThumbprint: string;
 
+function windowsPowerShellEnvironment(overrides: NodeJS.ProcessEnv = {}) {
+  const environment = { ...process.env, ...overrides };
+  for (const name of Object.keys(environment)) {
+    if (name.toUpperCase() === 'PSMODULEPATH') delete environment[name];
+  }
+  return environment;
+}
+
 beforeAll(async () => {
   const configured = (
     process.env.PROVENANCE_TEST_CARGO_ABOUT ?? process.env.PROVENANCE_CARGO_ABOUT
@@ -66,7 +74,9 @@ beforeAll(async () => {
 beforeAll(async () => {
   const command = [
     '$ErrorActionPreference = "Stop"',
-    '$signature = Get-AuthenticodeSignature -LiteralPath $env:PROVENANCE_TEST_NODE',
+    '$securityModule = Join-Path $PSHOME "Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1"',
+    'Import-Module -Name $securityModule -RequiredVersion 3.0.0.0 -Force -ErrorAction Stop',
+    '$signature = Microsoft.PowerShell.Security\\Get-AuthenticodeSignature -LiteralPath $env:PROVENANCE_TEST_NODE',
     'if ($signature.Status -ne "Valid" -or $null -eq $signature.SignerCertificate -or $null -eq $signature.TimeStamperCertificate) { throw "Test Node signature is invalid." }',
     '$signature.SignerCertificate.Thumbprint',
   ].join('\n');
@@ -74,7 +84,7 @@ beforeAll(async () => {
     '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
     '-Command', command,
   ], {
-    env: { ...process.env, PROVENANCE_TEST_NODE: process.execPath },
+    env: windowsPowerShellEnvironment({ PROVENANCE_TEST_NODE: process.execPath }),
     timeout: 30_000,
   })).stdout.trim().toUpperCase();
   if (!/^[A-F0-9]{40}$/.test(nodeSignerThumbprint)) {
@@ -370,6 +380,7 @@ describe('desktop release planner', () => {
         TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'password-marker',
         WINDOWS_PFX_BASE64: 'pfx-marker',
         PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT: 'certificate-marker',
+        PsMoDuLePaTh: 'C:\\Program Files\\PowerShell\\7\\Modules',
         PROVENANCE_BUILD_MARKER: 'present',
       },
     });
@@ -378,6 +389,7 @@ describe('desktop release planner', () => {
       privateKeyPassword: false,
       pfx: false,
       certificate: false,
+      powerShellModulePath: false,
       ordinaryMarker: true,
     });
     expect(result.stdout).not.toContain(privateKeyMarker);

@@ -257,7 +257,8 @@ function assertSameStringSet(actual, expected, label) {
 function sanitizedBuildEnvironment(environment) {
   const blocked = /(?:TAURI_SIGNING_PRIVATE_KEY|WINDOWS_PFX|CERTIFICATE|PFX_PASSWORD)/i;
   return Object.fromEntries(
-    Object.entries(environment).filter(([name]) => !blocked.test(name)),
+    Object.entries(environment).filter(([name]) =>
+      !blocked.test(name) && name.toUpperCase() !== 'PSMODULEPATH'),
   );
 }
 
@@ -990,9 +991,11 @@ function readAuthenticode(artifact) {
   if (process.platform !== 'win32') throw new Error('Authenticode verification must run on Windows.');
   const script = [
     '$ErrorActionPreference = "Stop"',
+    '$securityModule = Join-Path $PSHOME "Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1"',
+    'Import-Module -Name $securityModule -RequiredVersion 3.0.0.0 -Force -ErrorAction Stop',
     '$artifact = [Environment]::GetEnvironmentVariable("PROVENANCE_AUTHENTICODE_ARTIFACT")',
     'if ([string]::IsNullOrWhiteSpace($artifact)) { throw "Authenticode artifact is unavailable." }',
-    '$signature = Get-AuthenticodeSignature -LiteralPath $artifact',
+    '$signature = Microsoft.PowerShell.Security\\Get-AuthenticodeSignature -LiteralPath $artifact',
     '$result = [pscustomobject]@{',
     '  status = [string]$signature.Status',
     '  signerThumbprint = if ($signature.SignerCertificate) { $signature.SignerCertificate.Thumbprint } else { $null }',
@@ -1636,6 +1639,9 @@ try {
       privateKeyPassword: Object.hasOwn(environment, 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'),
       pfx: Object.hasOwn(environment, 'WINDOWS_PFX_BASE64'),
       certificate: Object.hasOwn(environment, 'PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT'),
+      powerShellModulePath: Object.keys(environment).some(
+        (name) => name.toUpperCase() === 'PSMODULEPATH',
+      ),
       ordinaryMarker: environment.PROVENANCE_BUILD_MARKER === 'present',
     })}\n`);
   } else if (command === 'manifest') {
