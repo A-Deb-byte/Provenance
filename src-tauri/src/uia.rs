@@ -1338,10 +1338,16 @@ mod tests {
                 .iter()
                 .find(|node| node["name"].as_str() == Some(TOGGLE_NAME))
                 .expect("fixture toggle was not present in the UIA tree");
-            let edit_node = nodes
+            let edit_nodes = nodes
                 .iter()
-                .find(|node| node["name"].as_str() == Some(EDIT_NAME))
-                .expect("fixture edit was not present in the UIA tree");
+                .filter(|node| node["role"].as_str() == Some("edit"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                edit_nodes.len(),
+                1,
+                "fixture UIA tree did not contain exactly one edit control"
+            );
+            let edit_node = edit_nodes[0];
             let toggle_node_id = toggle_node["nodeId"].as_str().unwrap().to_string();
             let edit_node_id = edit_node["nodeId"].as_str().unwrap().to_string();
 
