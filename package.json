@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "A local-first, self-hosted AI agent with a trusted kernel — models propose, the kernel decides, and every action leaves verifiable evidence.",
+  "license": "BUSL-1.1",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
