@@ -946,7 +946,7 @@ export const DesktopPanel: React.FC = () => {
               <label className="block text-[9px] uppercase tracking-wider text-slate-500">Desktop action reason
                 <input aria-label="Desktop action reason" value={auditReason} onChange={(event) => setAuditReason(event.target.value)} disabled={!canMutate} className="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950 p-2 text-xs normal-case text-slate-200 disabled:opacity-50" />
               </label>
-              <button type="button" onClick={() => void discoverWindows()} disabled={!canMutate || !selectedApp?.operations.includes('desktop.discover') || !selectedGoal} className="inline-flex items-center gap-1.5 rounded-lg border border-sky-800 bg-sky-950/20 px-3 py-2 text-xs font-bold text-sky-200 disabled:opacity-40">
+              <button type="button" onClick={() => void discoverWindows()} disabled={!canMutate || !selectedApp?.operations.includes('desktop.discover') || !selectedGoal || !auditReason.trim()} className="inline-flex items-center gap-1.5 rounded-lg border border-sky-800 bg-sky-950/20 px-3 py-2 text-xs font-bold text-sky-200 disabled:opacity-40">
                 <RefreshCw size={12} className={activeAction === 'discover' ? 'animate-spin' : ''} /> {activeAction === 'discover' ? 'Discovering...' : 'Discover windows'}
               </button>
             </div>
@@ -965,7 +965,7 @@ export const DesktopPanel: React.FC = () => {
                 <div className="mt-1 break-all font-mono text-[9px] text-slate-500">{window.windowId} / {window.treeRevision}</div>
               </button>)}
             </div>
-            <button type="button" onClick={() => void inspectWindow()} disabled={!canMutate || !selectedWindow || !selectedApp?.operations.includes('desktop.inspect')} className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-cyan-800 px-3 py-2 text-xs font-bold text-cyan-200 disabled:opacity-40">
+            <button type="button" onClick={() => void inspectWindow()} disabled={!canMutate || !selectedWindow || !selectedGoal || !auditReason.trim() || !selectedApp?.operations.includes('desktop.inspect')} className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-cyan-800 px-3 py-2 text-xs font-bold text-cyan-200 disabled:opacity-40">
               <Eye size={12} /> {activeAction === 'inspect' ? 'Inspecting...' : 'Inspect controls'}
             </button>
           </div>
@@ -985,10 +985,10 @@ export const DesktopPanel: React.FC = () => {
             {selectedNode && <div className="mt-4 rounded-xl border border-sky-900/50 bg-sky-950/10 p-3">
               <div className="text-xs font-bold text-sky-200">Selected: {selectedNode.name || selectedNode.nodeId}</div>
               <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
-                <button type="button" onClick={() => void requestMutation('click')} disabled={!canMutate || !selectedApp?.operations.includes('desktop.click') || !selectedNode.enabled} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-amber-800 px-3 py-2 text-xs font-bold text-amber-200 disabled:opacity-40"><MousePointer2 size={12} /> Request click approval</button>
+                <button type="button" onClick={() => void requestMutation('click')} disabled={!canMutate || !selectedGoal || !auditReason.trim() || !selectedApp?.operations.includes('desktop.click') || !selectedNode.enabled} className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-amber-800 px-3 py-2 text-xs font-bold text-amber-200 disabled:opacity-40"><MousePointer2 size={12} /> Request click approval</button>
                 <div className="space-y-2">
                   <textarea aria-label="Desktop typing payload" value={typePayload} onChange={(event) => setTypePayload(event.target.value)} maxLength={4_096} rows={3} disabled={!canMutate || !selectedApp?.operations.includes('desktop.type')} className="w-full rounded-lg border border-slate-800 bg-slate-950 p-2 text-xs text-slate-200 disabled:opacity-50" />
-                  <button type="button" onClick={() => void requestMutation('type')} disabled={!canMutate || !selectedApp?.operations.includes('desktop.type') || !selectedNode.enabled || typePayload.length === 0} className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-amber-800 px-3 py-2 text-xs font-bold text-amber-200 disabled:opacity-40"><TypeIcon size={12} /> Request type approval</button>
+                  <button type="button" onClick={() => void requestMutation('type')} disabled={!canMutate || !selectedGoal || !auditReason.trim() || !selectedApp?.operations.includes('desktop.type') || !selectedNode.enabled || typePayload.length === 0} className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-amber-800 px-3 py-2 text-xs font-bold text-amber-200 disabled:opacity-40"><TypeIcon size={12} /> Request type approval</button>
                 </div>
               </div>
               {lastPayload && <div className="mt-2 break-all font-mono text-[9px] text-slate-600">Last staged payload: {lastPayload.id} / {lastPayload.contentHash}</div>}

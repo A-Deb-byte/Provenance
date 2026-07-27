@@ -2,7 +2,7 @@
 /**
  * Independent kernel ledger verifier.
  *
- *   node scripts/verify-ledger.mjs [runtimeDir]
+ *   node scripts/verify-ledger.mjs [--require-events] [runtimeDir]
  *
  * Replays .agent-kernel/events.jsonl, recomputing each event's SHA-256 hash
  * over the same canonical form the kernel uses and checking that every event's
@@ -18,10 +18,6 @@ import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-const runtimeDir = process.argv[2] ?? '.agent-kernel';
-const ledgerPath = path.join(runtimeDir, 'events.jsonl');
-const statePath = path.join(runtimeDir, 'state.json');
-
 const hashEvent = (event) => {
   const { hash, ...withoutHash } = event;
   return crypto.createHash('sha256').update(JSON.stringify(withoutHash)).digest('hex');
@@ -32,11 +28,36 @@ const fail = (message) => {
   process.exit(1);
 };
 
+let requireEvents = false;
+let runtimeDir = '.agent-kernel';
+let runtimeDirProvided = false;
+
+for (const argument of process.argv.slice(2)) {
+  if (argument === '--require-events') {
+    requireEvents = true;
+    continue;
+  }
+  if (argument.startsWith('--')) {
+    fail(`unknown option ${argument}.`);
+  }
+  if (runtimeDirProvided) {
+    fail('expected at most one runtime directory.');
+  }
+  runtimeDir = argument;
+  runtimeDirProvided = true;
+}
+
+const ledgerPath = path.join(runtimeDir, 'events.jsonl');
+const statePath = path.join(runtimeDir, 'state.json');
+
 let raw;
 try {
   raw = readFileSync(ledgerPath, 'utf8');
 } catch (error) {
   if (error.code === 'ENOENT') {
+    if (requireEvents) {
+      fail('required ledger events.jsonl was not found.');
+    }
     console.log('No ledger found; nothing to verify (0 events).');
     process.exit(0);
   }
@@ -44,6 +65,9 @@ try {
 }
 
 const lines = raw.split('\n').map((line) => line.trim()).filter(Boolean);
+if (requireEvents && lines.length === 0) {
+  fail('required ledger contains no events.');
+}
 let previousHash = null;
 let count = 0;
 

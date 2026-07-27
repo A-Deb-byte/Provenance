@@ -26,8 +26,10 @@ export type GrantFailureReason =
   | 'grant_invalid'
   | 'grant_revoked'
   | 'grant_consumed'
+  | 'grant_not_yet_valid'
   | 'grant_expired'
   | 'intent_mismatch'
+  | 'approval_mismatch'
   | 'worker_mismatch'
   | 'worker_unavailable'
   | 'scope_mismatch'
@@ -47,6 +49,13 @@ export interface ConsumeGrantInput {
 export interface ConsumeGrantResult extends GrantValidationResult {
   grant: CapabilityGrant;
 }
+
+/**
+ * Version of the observable grant-validation and consumption semantics.
+ * Bump this whenever validation order, reason codes, status transitions, or
+ * operation-budget behavior changes.
+ */
+export const CAPABILITY_GRANT_POLICY_VERSION = '2026-07-26.2';
 
 const normalizeScope = (scope: CapabilityScope): CapabilityScope => {
   if (scope.family === 'browser') return {
@@ -77,8 +86,16 @@ export const createCapabilityGrant = (
 ): CapabilityGrant => {
   if (!isActionIntent(intent)) throw new Error('Cannot issue a grant for an invalid action intent.');
   if (intent.riskLevel === 'L4') throw new Error('Cannot issue a grant for a forbidden L4 action.');
-  if ((intent.riskLevel === 'L2' || intent.riskLevel === 'L3') && !input.approvalId?.trim()) {
-    throw new Error(`${intent.riskLevel} grants require an approval id.`);
+  if (intent.riskLevel === 'L2' || intent.riskLevel === 'L3') {
+    if (!input.approvalId?.trim()) {
+      throw new Error(`${intent.riskLevel} grants require an approval id.`);
+    }
+    if (
+      intent.authority.kind !== 'approval' ||
+      intent.authority.referenceId !== input.approvalId
+    ) {
+      throw new Error(`${intent.riskLevel} grants require intent authority bound to the exact approval id.`);
+    }
   }
   const issuedAt = Date.parse(input.issuedAt);
   const expiresAt = Date.parse(input.expiresAt);
@@ -122,11 +139,34 @@ export const validateCapabilityGrant = (
   if (!isActionIntent(intent as unknown)) return rejected('intent_mismatch', 'Action intent is invalid.');
   if (grant.status === 'revoked') return rejected('grant_revoked', 'Capability grant was revoked.');
   if (grant.status === 'consumed') return rejected('grant_consumed', 'Capability grant has already been consumed.');
-  if (!Number.isFinite(Date.parse(now)) || Date.parse(now) >= Date.parse(grant.expiresAt)) {
+  const validatedAt = Date.parse(now);
+  if (!Number.isFinite(validatedAt)) {
     return rejected('grant_expired', 'Capability grant is expired.');
   }
-  if (grant.intentId !== intent.id || grant.intentHash !== hashActionIntent(intent)) {
+  if (validatedAt < Date.parse(grant.issuedAt)) {
+    return rejected('grant_not_yet_valid', 'Capability grant is not yet valid.');
+  }
+  if (validatedAt >= Date.parse(grant.expiresAt)) {
+    return rejected('grant_expired', 'Capability grant is expired.');
+  }
+  if (
+    grant.intentId !== intent.id ||
+    grant.intentHash !== hashActionIntent(intent) ||
+    grant.riskLevel !== intent.riskLevel
+  ) {
     return rejected('intent_mismatch', 'Capability grant does not match the action intent.');
+  }
+  if (
+    (grant.riskLevel === 'L2' || grant.riskLevel === 'L3') &&
+    (
+      intent.authority.kind !== 'approval' ||
+      grant.approvalId !== intent.authority.referenceId
+    )
+  ) {
+    return rejected(
+      'approval_mismatch',
+      'Capability grant does not match the intent approval authority.',
+    );
   }
   if (grant.workerId !== intent.workerId || worker.id !== grant.workerId) {
     return rejected('worker_mismatch', 'Capability grant does not match the worker.');

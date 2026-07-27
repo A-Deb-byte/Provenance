@@ -5,6 +5,7 @@ export interface CreateApprovalInput {
   goalId: string;
   taskId: string;
   requestedAction: string;
+  authorityBindingHash?: string;
   riskLevel: RiskLevel;
   reason: string;
 }
@@ -15,6 +16,7 @@ export const createApprovalRecord = (input: CreateApprovalInput, now = new Date(
   taskId: input.taskId,
   status: 'pending',
   requestedAction: input.requestedAction,
+  authorityBindingHash: input.authorityBindingHash,
   riskLevel: input.riskLevel,
   reason: input.reason,
   createdAt: now,

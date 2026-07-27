@@ -2,25 +2,30 @@
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { chmod, copyFile, cp, mkdir, mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
-import { builtinModules } from 'node:module';
+import {
+  access,
+  chmod,
+  copyFile,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeRuntimeResourceManifest } from './runtime-resource-manifest.mjs';
+import { assertServerBundleHasBuiltinOnlyExternals } from './server-bundle-contract.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'provenance-packaged-smoke-'));
 const runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'provenance-packaged-runtime-'));
 const maximumLogChars = 32 * 1024;
 const startupTimeoutMs = 120_000;
-const builtins = new Set([...builtinModules, ...builtinModules.map((name) => `node:${name}`)]);
-const auditedOptionalExternals = new Set([
-  // Optional terminal coloring and ws native accelerators. Their callers use
-  // guarded require calls and the clean-root launch below proves fallbacks.
-  'supports-color',
-  'bufferutil',
-  'utf-8-validate',
-]);
 
 const argument = (name) => {
   const index = process.argv.indexOf(name);
@@ -38,6 +43,30 @@ const digestFile = (file) => new Promise((resolve, reject) => {
     .once('error', reject)
     .once('end', () => resolve(hash.digest('hex')));
 });
+
+const inventoryFiles = async (directory, relative = '') => {
+  const files = [];
+  for (const entry of await readdir(path.join(directory, relative), { withFileTypes: true })) {
+    const entryRelative = relative ? `${relative}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...await inventoryFiles(directory, entryRelative));
+    } else if (entry.isFile()) {
+      files.push(entryRelative);
+    } else {
+      throw new Error(`Packaged smoke resource ${entryRelative} is not a regular file.`);
+    }
+  }
+  return files;
+};
+
+const fileExists = async (file) => {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 let child;
 let stdout = '';
@@ -90,15 +119,45 @@ try {
   if (!serverOutput || !Array.isArray(serverOutput.imports)) {
     throw new Error('The packaged server esbuild metadata is missing.');
   }
-  const unexpectedExternalImports = serverOutput.imports.filter((item) => (
-    item.external && !builtins.has(item.path) && !auditedOptionalExternals.has(item.path) &&
-    !(item.path === 'vite' && item.kind === 'dynamic-import')
-  ));
-  if (unexpectedExternalImports.length > 0) {
-    throw new Error(
-      `Packaged server has unexpected external imports: ${unexpectedExternalImports.map((item) => item.path).join(', ')}`,
-    );
-  }
+  assertServerBundleHasBuiltinOnlyExternals(metafile);
+  const maliciousModuleMarker = path.join(runtimeDir, 'unsigned-sibling-module-executed.txt');
+  const maliciousModules = [
+    'bufferutil',
+    'dotenv',
+    'express',
+    'node-llama-cpp',
+    'playwright-core',
+    'supports-color',
+    'utf-8-validate',
+    'vite',
+  ];
+  await Promise.all(maliciousModules.map(async (name) => {
+    const directory = path.join(temporaryRoot, 'node_modules', name);
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, 'package.json'), `${JSON.stringify({
+      name,
+      version: '0.0.0-unsigned-smoke',
+      main: 'index.cjs',
+    })}\n`, 'utf8');
+    await writeFile(path.join(directory, 'index.cjs'), [
+      "const fs = require('node:fs');",
+      "fs.appendFileSync(process.env.PROVENANCE_MALICIOUS_MODULE_MARKER, 'executed\\n');",
+      'function plantedModule() { return true; }',
+      'plantedModule.stderr = { level: 0 };',
+      'plantedModule.mask = () => undefined;',
+      'plantedModule.unmask = () => undefined;',
+      'plantedModule.chromium = { executablePath: () => "" };',
+      'plantedModule.createServer = async () => ({ middlewares: () => undefined });',
+      'module.exports = plantedModule;',
+      '',
+    ].join('\n'), 'utf8');
+  }));
+  await writeFile(path.join(temporaryRoot, '.env'), [
+    'BROWSER_WRITE_ORIGINS=https://unsigned-sibling.invalid',
+    'OPENAI_API_KEY=must-not-enter-packaged-runtime',
+    'PROVENANCE_FIRST_ADMIN_BOOTSTRAP_SECRET=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    '',
+  ].join('\n'), 'utf8');
   const nodeDirectory = path.join(temporaryRoot, 'node');
   const packagedNode = path.join(nodeDirectory, process.platform === 'win32' ? 'node.exe' : 'node');
   await mkdir(nodeDirectory);
@@ -108,6 +167,21 @@ try {
   if (expectedNodeHash && (!/^[a-f0-9]{64}$/.test(expectedNodeHash) || nodeSha256 !== expectedNodeHash)) {
     throw new Error('The copied packaged Node runtime failed its expected SHA-256 check.');
   }
+  const authenticatedManifest = writeRuntimeResourceManifest([
+    {
+      source: path.join(temporaryRoot, 'dist', 'index.html'),
+      destination: 'dist/index.html',
+    },
+    ...await inventoryFiles(path.join(temporaryRoot, 'dist', 'assets')).then((assets) => (
+      assets.map((asset) => ({
+        source: path.join(temporaryRoot, 'dist', 'assets', ...asset.split('/')),
+        destination: `dist/assets/${asset}`,
+      }))
+    )),
+  ], path.join(
+    runtimeDir,
+    '.desktop-resource-manifest-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json',
+  ));
   const inherited = Object.fromEntries(
     ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'USERPROFILE', 'HOME', 'LOCALAPPDATA', 'APPDATA', 'PROGRAMDATA']
       .flatMap((name) => process.env[name] === undefined ? [] : [[name, process.env[name]]]),
@@ -122,6 +196,9 @@ try {
       PROVENANCE_PROJECT_ROOT: temporaryRoot,
       PROVENANCE_RUNTIME_DIR: runtimeDir,
       DESKTOP_PACKAGED_RELEASE: '1',
+      PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_PATH: authenticatedManifest.path,
+      PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_SHA256: authenticatedManifest.sha256,
+      PROVENANCE_MALICIOUS_MODULE_MARKER: maliciousModuleMarker,
       // Fail before Docker I/O; this smoke isolates resource completeness.
       PROVENANCE_SANDBOX_IMAGE: 'unpinned-smoke-image',
     },
@@ -130,24 +207,36 @@ try {
   });
 
   const serverUrl = await waitForServerUrl();
-  const [auth, diagnostics, runtime] = await Promise.all([
+  const [auth, diagnostics, runtime, source, noticeResponse, unknownAsset] = await Promise.all([
     fetch(`${serverUrl}/api/auth/status`, { headers: { Accept: 'application/json' } }),
     fetch(`${serverUrl}/api/kernel/diagnostics`, { headers: { Accept: 'application/json' } }),
     fetch(`${serverUrl}/api/kernel/runtime-report`, { headers: { Accept: 'application/json' } }),
+    fetch(`${serverUrl}/server.cjs`),
+    fetch(`${serverUrl}/THIRD_PARTY_NOTICES.txt`),
+    fetch(`${serverUrl}/assets/not-in-the-signed-manifest.js`),
   ]);
   if (!auth.ok || !diagnostics.ok || !runtime.ok) {
     throw new Error(
       `Packaged API probes failed: auth=${auth.status}, diagnostics=${diagnostics.status}, runtime=${runtime.status}.`,
     );
   }
+  if (source.status !== 404 || noticeResponse.status !== 404 || unknownAsset.status !== 404) {
+    throw new Error(
+      'Packaged static serving exposed a server, notice, or unlisted asset resource.',
+    );
+  }
   const authBody = await auth.json();
   const diagnosticsBody = await diagnostics.json();
   const runtimeBody = await runtime.json();
   if (typeof authBody !== 'object' || authBody === null || diagnosticsBody?.schemaVersion !== 1 ||
+    runtimeBody?.providers?.configured?.length !== 0 ||
     runtimeBody?.features?.verificationCommands?.status !== 'unavailable' ||
     runtimeBody?.features?.coreModel?.status !== 'unavailable' ||
     runtimeBody?.workers?.available?.includes('worker.browser.playwright')) {
     throw new Error('Packaged API probes returned invalid contracts.');
+  }
+  if (await fileExists(maliciousModuleMarker)) {
+    throw new Error('Packaged startup executed a dependency from unsigned sibling node_modules.');
   }
   const nodeVersion = diagnosticsBody?.runtime?.nodeVersion;
   const nodeArchitecture = diagnosticsBody?.runtime?.architecture;
@@ -163,8 +252,9 @@ try {
   process.stdout.write(`${JSON.stringify({
     schemaVersion: 1,
     cleanResourceRoot: true,
-    staticBundleExternalImports: ['vite:development-only-dynamic-import'],
-    auditedOptionalFallbacks: [...auditedOptionalExternals],
+    nonBuiltinExternalImports: [],
+    unsignedSiblingModulesIgnored: maliciousModules,
+    packagedDotenvIgnored: true,
     readiness: 'passed',
     diagnosticsSchemaVersion: diagnosticsBody.schemaVersion,
     nodeVersion,

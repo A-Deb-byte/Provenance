@@ -10,6 +10,11 @@ import {
   createMemoryCapabilityGrantStore,
   type CapabilityGrantStore,
 } from '../capabilities/grantStore';
+import {
+  buildDispatchDecisionRecord,
+  buildPolicyDecisionRecord,
+  hashIntentAuthorityBinding,
+} from '../capabilities/decisionRecord';
 import { analyzePromptInjection, createUntrustedObservation } from '../capabilities/injection';
 import { CapabilityPolicyDecision, decideActionPolicy } from '../capabilities/policy';
 import { createWorkerRegistry } from '../capabilities/registry';
@@ -357,12 +362,17 @@ const isIndependentMemoryEvidence = (
   if (record.provenance.sourceType === 'kernel_event') {
     return event.id === record.provenance.sourceId;
   }
+  if (record.provenance.sourceType === 'import') {
+    return event.payload.sourceId === record.provenance.sourceId &&
+      event.payload.contentHash === record.contentHash &&
+      (event.type !== 'memory.source_attested' || event.payload.sourceType === 'import');
+  }
   if (event.type === 'memory.source_attested') {
     return event.payload.sourceType === record.provenance.sourceType &&
       event.payload.sourceId === record.provenance.sourceId &&
       event.payload.contentHash === record.contentHash;
   }
-  return true;
+  return false;
 };
 
 const researchReportInputHash = (mission: ResearchMission): string => stableHash({
@@ -1192,12 +1202,22 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!reason.trim()) throw new Error('Approval decision reason is required.');
 
     const decided = decideApprovalRecord(approval, status, reason);
+    const approvalAutomationId = approval.taskId.startsWith('automation:')
+      ? approval.taskId.slice('automation:'.length)
+      : undefined;
     const appended = await appendEvent(state, {
       actor: 'user',
       type: `approval.${status}`,
       entityId: approvalId,
       entityType: 'approval',
-      payload: { goalId: approval.goalId, taskId: approval.taskId, reason },
+      payload: {
+        goalId: approval.goalId,
+        taskId: approval.taskId,
+        automationId: approvalAutomationId,
+        riskLevel: approval.riskLevel,
+        authorityBindingHash: approval.authorityBindingHash,
+        reason,
+      },
     });
     state = appended.state;
     const automationApproval = approval.taskId.startsWith('automation:') && state.automations.some(
@@ -2231,16 +2251,38 @@ export const createKernelService = (options: KernelServiceOptions) => {
       maxOps: 1,
     });
     await capabilityGrantStore.create(grant);
+    // Captured rather than inlined: the injected clock is a decision input, so
+    // the ledger must record the same value the decision actually consumed.
+    const dispatchNow = new Date().toISOString();
+    const dispatchOperationsUsed = 1;
     const authorized = await authorizeCapabilityDispatch(
       capabilityGrantStore,
       grant.id,
       intent,
       registration,
-      { now: new Date().toISOString(), operationsUsed: 1 },
+      { now: dispatchNow, operationsUsed: dispatchOperationsUsed },
     );
     if (!authorized.allowed || !authorized.authorization || !authorized.grant) {
       throw new Error(`Capability authorization failed before research dispatch: ${authorized.reason}`);
     }
+    const decisionRecord = buildDispatchDecisionRecord(
+      {
+        grant,
+        intent,
+        worker: registration,
+        now: dispatchNow,
+        operationsUsed: dispatchOperationsUsed,
+      },
+      {
+        allowed: true,
+        reasonCode: 'allowed',
+        reason: 'Capability grant consumed.',
+        riskLevel: intent.riskLevel,
+        grantStatus: authorized.grant.status,
+        usedOps: authorized.grant.usedOps,
+        consumedAt: authorized.grant.consumedAt ?? null,
+      },
+    );
     const activeStep: ResearchMissionActiveStep = {
       id: createKernelId('mission_step'),
       stage: 'collecting',
@@ -2261,6 +2303,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         intentId: intent.id,
         grantId: grant.id,
         grantStatus: authorized.grant.status,
+        decision: decisionRecord,
       },
     });
     state = appended.state;
@@ -4265,19 +4308,16 @@ export const createKernelService = (options: KernelServiceOptions) => {
     }
 
     const approvalTaskId = `automation:${automation.id}`;
-    const approvalRequest = `automation-run:${automation.id}:${stableHash({
-      workerId: automation.workerId,
-      riskLevel: automation.riskLevel,
-      action: automation.action,
-      scope: automation.scope,
-    })}`;
+    let intent = buildAutomationIntent(automation);
+    const authorityBindingHash = hashIntentAuthorityBinding(intent);
+    const approvalRequest = `automation-run:${automation.id}:${authorityBindingHash}`;
     let approval = [...state.approvals].reverse().find((candidate) => (
       candidate.goalId === automation.goalId &&
       candidate.taskId === approvalTaskId &&
       candidate.requestedAction === approvalRequest &&
+      candidate.authorityBindingHash === authorityBindingHash &&
       (candidate.status === 'pending' || candidate.status === 'approved')
     ));
-    let intent = buildAutomationIntent(automation);
     let decision = decideActionPolicy(intent, workerRegistry);
 
     if (decision.kind === 'approval_required' && approval?.status !== 'approved') {
@@ -4288,6 +4328,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
           goalId: automation.goalId,
           taskId: approvalTaskId,
           requestedAction: approvalRequest,
+          authorityBindingHash,
           riskLevel: automation.riskLevel,
           reason: decision.reason,
         });
@@ -4301,6 +4342,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
             taskId: approvalTaskId,
             automationId,
             riskLevel: automation.riskLevel,
+            authorityBindingHash,
             reason: decision.reason,
           },
         });
@@ -4310,7 +4352,20 @@ export const createKernelService = (options: KernelServiceOptions) => {
           type: 'automation.run_blocked',
           entityId: automationId,
           entityType: 'automation',
-          payload: { automationId, intentId: intent.id, approvalId: approval.id, reasonCode: decision.reasonCode, reason: decision.reason },
+          payload: {
+            automationId,
+            intentId: intent.id,
+            approvalId: approval.id,
+            reasonCode: decision.reasonCode,
+            riskLevel: decision.riskLevel,
+            reason: decision.reason,
+            // A refusal is the claim most worth proving: it must be
+            // re-derivable that the kernel *had* to stop here.
+            decision: buildPolicyDecisionRecord(
+              { intent, worker: workerRegistry.get(intent.workerId), now: intent.createdAt },
+              decision,
+            ),
+          },
         });
         state = appended.state;
         await commitState({
@@ -4335,7 +4390,17 @@ export const createKernelService = (options: KernelServiceOptions) => {
         type: 'automation.run_denied',
         entityId: automationId,
         entityType: 'automation',
-        payload: { automationId, intentId: intent.id, reasonCode: decision.reasonCode, reason: decision.reason },
+        payload: {
+          automationId,
+          intentId: intent.id,
+          reasonCode: decision.reasonCode,
+          riskLevel: decision.riskLevel,
+          reason: decision.reason,
+          decision: buildPolicyDecisionRecord(
+            { intent, worker: workerRegistry.get(intent.workerId), now: intent.createdAt },
+            decision,
+          ),
+        },
       });
       await commitState(appended.state);
       return { kind: 'result', result: { decision, approvalId } };
@@ -4358,12 +4423,16 @@ export const createKernelService = (options: KernelServiceOptions) => {
       approvalId,
     });
     await capabilityGrantStore.create(grant);
+    // Captured rather than inlined: the injected clock is a decision input, so
+    // the ledger must record the same value the decision actually consumed.
+    const dispatchNow = new Date().toISOString();
+    const dispatchOperationsUsed = 1;
     const authorized = await authorizeCapabilityDispatch(
       capabilityGrantStore,
       grant.id,
       intent,
       registration,
-      { now: new Date().toISOString(), operationsUsed: 1 },
+      { now: dispatchNow, operationsUsed: dispatchOperationsUsed },
     );
     if (!authorized.allowed || !authorized.authorization || !authorized.grant) {
       throw new Error(`Capability authorization failed before dispatch: ${authorized.reason}`);
@@ -4380,6 +4449,24 @@ export const createKernelService = (options: KernelServiceOptions) => {
         grantId: grant.id,
         approvalId,
         grantStatus: authorized.grant.status,
+        decision: buildDispatchDecisionRecord(
+          {
+            grant,
+            intent,
+            worker: registration,
+            now: dispatchNow,
+            operationsUsed: dispatchOperationsUsed,
+          },
+          {
+            allowed: true,
+            reasonCode: 'allowed',
+            reason: 'Capability grant consumed.',
+            riskLevel: intent.riskLevel,
+            grantStatus: authorized.grant.status,
+            usedOps: authorized.grant.usedOps,
+            consumedAt: authorized.grant.consumedAt ?? null,
+          },
+        ),
       },
     });
     state = appended.state;

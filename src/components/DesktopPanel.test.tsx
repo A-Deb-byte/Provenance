@@ -194,8 +194,8 @@ const createFixture = (options: { invalidDiscovery?: boolean; unauthorizedRun?: 
 };
 
 const discoverAndInspect = async (user: ReturnType<typeof userEvent.setup>) => {
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
   await user.type(await screen.findByLabelText('Desktop action reason'), 'Inspect the operator-selected Notepad window.');
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
   await user.click(screen.getByRole('button', { name: 'Discover windows' }));
   expect(await screen.findByTestId('desktop-window-window_1')).toHaveTextContent('Untitled - Notepad');
   await user.click(screen.getByRole('button', { name: 'Inspect controls' }));
@@ -326,8 +326,8 @@ describe('DesktopPanel', () => {
     vi.stubGlobal('fetch', invalid.fetchMock);
     const user = userEvent.setup();
     const view = render(<DesktopPanel />);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.type(await screen.findByLabelText('Desktop action reason'), 'Parse only trusted worker schemas.');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: 'Discover windows' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('invalid JSON');
     expect(screen.getByText('No window discovery result in this authenticated view.')).toBeInTheDocument();
@@ -338,8 +338,8 @@ describe('DesktopPanel', () => {
     const unauthorized = createFixture({ unauthorizedRun: true });
     vi.stubGlobal('fetch', unauthorized.fetchMock);
     render(<DesktopPanel />);
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.type(await screen.findByLabelText('Desktop action reason'), 'This draft must be purged.');
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: 'Discover windows' }));
 
     await waitFor(() => expect(screen.getByLabelText('Desktop action reason')).toHaveValue(''));

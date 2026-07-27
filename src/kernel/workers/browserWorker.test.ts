@@ -24,13 +24,20 @@ let grantSequence = 0;
 
 const authorize = async (rawIntent: ActionIntent) => {
   const action = rawIntent.action as BrowserAction;
+  grantSequence += 1;
+  const approvalId = `approval_browser_${grantSequence}`;
   const scope: BrowserCapabilityScope = {
     family: 'browser',
     operations: [action.type],
     origins: [action.origin],
     downloadRoots: action.type === 'browser.download' ? [action.downloadRoot] : [],
   };
-  const intent: ActionIntent = { ...rawIntent, riskLevel: 'L2', scope };
+  const intent: ActionIntent = {
+    ...rawIntent,
+    riskLevel: 'L2',
+    scope,
+    authority: { kind: 'approval', referenceId: approvalId },
+  };
   const registration: WorkerRegistration = {
     id: intent.workerId,
     family: 'browser',
@@ -39,13 +46,12 @@ const authorize = async (rawIntent: ActionIntent) => {
     configuredScopes: [scope],
     registeredAt: '2026-07-12T00:00:00.000Z',
   };
-  grantSequence += 1;
   const grant = createCapabilityGrant(intent, {
     id: `grant_browser_${grantSequence}`,
     issuedAt: '2026-07-12T00:02:00.000Z',
     expiresAt: '2026-07-12T00:12:00.000Z',
     maxOps: 1,
-    approvalId: `approval_browser_${grantSequence}`,
+    approvalId,
   });
   const store = createMemoryCapabilityGrantStore([grant]);
   const result = await authorizeCapabilityDispatch(store, grant.id, intent, registration, {
@@ -127,6 +133,25 @@ describe('browser write worker', () => {
     expect(result.errorCode).toBe('timeout');
   });
 
+  it('treats an opaque driver exception after dispatch as outcome-uncertain', async () => {
+    const worker = createBrowserWorker(fakeDriver({
+      perform: async () => {
+        throw new Error('The browser connection closed before returning a result.');
+      },
+    }));
+    const dispatch = await authorize(browserIntent({
+      action: { type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/slow' },
+    }));
+
+    const result = await worker.execute(dispatch.intent, dispatch.options);
+
+    expect(result).toMatchObject({
+      status: 'uncertain',
+      errorCode: 'browser_outcome_uncertain',
+    });
+    expect(result.summary).toMatch(/must not be retried automatically/iu);
+  });
+
   it('fails closed when even an injected driver reports an off-origin final URL', async () => {
     const worker = createBrowserWorker(fakeDriver({
       perform: async () => ({ status: 'succeeded', finalUrl: 'https://evil.invalid/', content: 'secret page' }),
@@ -135,7 +160,7 @@ describe('browser write worker', () => {
       action: { type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/start' },
     }));
     const result = await worker.execute(dispatch.intent, dispatch.options);
-    expect(result).toMatchObject({ status: 'failed', errorCode: 'origin_drift' });
+    expect(result).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
     expect(result.content).toBeUndefined();
   });
 });
@@ -263,7 +288,64 @@ describe('Playwright driver origin confinement', () => {
 
   const createDriver = (page: TestPage) => createHarness(page).driver;
 
-  it('rejects a redirect before clicking', async () => {
+  it('marks navigate, click, and type errors after dispatch as outcome-uncertain', async () => {
+    for (const type of ['browser.navigate', 'browser.click', 'browser.type'] as const) {
+      const failAfterDispatch = vi.fn(async () => {
+        throw new Error('The browser transport failed after accepting the operation.');
+      });
+      const page: TestPage = {
+        goto: vi.fn(type === 'browser.navigate' ? failAfterDispatch : async () => undefined),
+        click: vi.fn(type === 'browser.click' ? failAfterDispatch : async () => undefined),
+        fill: vi.fn(type === 'browser.type' ? failAfterDispatch : async () => undefined),
+        url: () => type === 'browser.navigate' ? 'about:blank' : 'https://example.com/account',
+        innerText: vi.fn(async () => ''),
+        close: vi.fn(async () => undefined),
+      };
+      const harness = createHarness(page);
+
+      const result = await harness.driver.perform({
+        type,
+        origin: 'https://example.com',
+        url: 'https://example.com/account',
+        selector: type === 'browser.navigate' ? undefined : '#field',
+        text: type === 'browser.type' ? 'value' : undefined,
+        timeoutMs: 1000,
+      });
+
+      expect(result).toMatchObject({
+        status: 'uncertain',
+        errorCode: 'browser_outcome_uncertain',
+      });
+      expect(harness.contextClose).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('keeps a pre-dispatch cancellation as a normal failure', async () => {
+    const page: TestPage = {
+      goto: vi.fn(async () => undefined),
+      click: vi.fn(async () => undefined),
+      fill: vi.fn(async () => undefined),
+      url: () => 'about:blank',
+      innerText: vi.fn(async () => ''),
+      close: vi.fn(async () => undefined),
+    };
+    const harness = createHarness(page);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await harness.driver.perform({
+      type: 'browser.navigate',
+      origin: 'https://example.com',
+      url: 'https://example.com/account',
+      timeoutMs: 1000,
+    }, { signal: controller.signal });
+
+    expect(result).toMatchObject({ status: 'failed', errorCode: 'cancelled' });
+    expect(page.goto).not.toHaveBeenCalled();
+    expect(harness.contextClose).not.toHaveBeenCalled();
+  });
+
+  it('marks a redirect after navigation dispatch as outcome-uncertain before clicking', async () => {
     let currentUrl = 'about:blank';
     const page = {
       goto: vi.fn(async () => { currentUrl = 'https://evil.invalid/redirected'; }),
@@ -276,7 +358,11 @@ describe('Playwright driver origin confinement', () => {
     const result = await createDriver(page).perform({
       type: 'browser.click', origin: 'https://example.com', url: 'https://example.com/account', selector: '#ok', timeoutMs: 1000,
     });
-    expect(result).toMatchObject({ status: 'failed', errorCode: 'origin_drift', finalUrl: 'https://evil.invalid/redirected' });
+    expect(result).toMatchObject({
+      status: 'uncertain',
+      errorCode: 'browser_outcome_uncertain',
+      finalUrl: 'https://evil.invalid/redirected',
+    });
     expect(page.click).not.toHaveBeenCalled();
   });
 
@@ -295,7 +381,7 @@ describe('Playwright driver origin confinement', () => {
       const result = await createDriver(page).perform({
         type, origin: 'https://example.com', url: 'https://example.com/account', selector: '#field', text: 'value', timeoutMs: 1000,
       });
-      expect(result).toMatchObject({ status: 'failed', errorCode: 'origin_drift' });
+      expect(result).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
       expect(page.innerText).not.toHaveBeenCalled();
     }
   });
@@ -321,7 +407,7 @@ describe('Playwright driver origin confinement', () => {
       type: 'browser.click', origin: 'https://example.com', url: 'https://example.com/account', selector: '#export', timeoutMs: 1000,
     });
 
-    expect(result).toMatchObject({ status: 'failed', errorCode: 'download_blocked' });
+    expect(result).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
     expect(harness.launchOptions()).toMatchObject({ acceptDownloads: false });
     expect(download.cancel).toHaveBeenCalledOnce();
     expect(download.delete).toHaveBeenCalledOnce();
@@ -357,7 +443,9 @@ describe('Playwright driver origin confinement', () => {
     });
 
     expect(result).toMatchObject({
-      status: 'failed', errorCode: 'origin_drift', finalUrl: 'https://evil.invalid/redirected',
+      status: 'uncertain',
+      errorCode: 'browser_outcome_uncertain',
+      finalUrl: 'https://evil.invalid/redirected',
     });
     expect(dispatched).toEqual(['https://example.com/start']);
     expect(page.url()).toBe('https://example.com/start');
@@ -394,7 +482,11 @@ describe('Playwright driver origin confinement', () => {
       type: 'browser.click', origin: 'https://example.com', url: 'https://example.com/account', selector: '#open', timeoutMs: 1000,
     });
 
-    expect(result).toMatchObject({ status: 'failed', errorCode: 'origin_drift', finalUrl: popup.url() });
+    expect(result).toMatchObject({
+      status: 'uncertain',
+      errorCode: 'browser_outcome_uncertain',
+      finalUrl: popup.url(),
+    });
     expect(popupRoute?.abort).toHaveBeenCalledOnce();
     expect(popupRoute?.continueRequest).not.toHaveBeenCalled();
     expect(popup.close).toHaveBeenCalled();
@@ -421,7 +513,7 @@ describe('Playwright driver origin confinement', () => {
     controller.abort();
     const result = await pending;
 
-    expect(result).toMatchObject({ status: 'failed', errorCode: 'cancelled' });
+    expect(result).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
     expect(page.close).toHaveBeenCalled();
     expect(harness.contextClose).toHaveBeenCalledOnce();
   });

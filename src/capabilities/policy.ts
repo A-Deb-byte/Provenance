@@ -27,6 +27,17 @@ export interface CapabilityPolicyDecision {
   riskLevel: CapabilityRiskLevel;
 }
 
+/**
+ * Identifies the decision semantics in this module. A ledger decision record
+ * pins the version that produced it so an independent replayer can refuse to
+ * re-derive a decision under rules that did not exist when it was made.
+ *
+ * Bump on ANY change to observable decision behaviour: the risk floor table,
+ * the accepted authority kinds, the ordering of checks, or the reason codes.
+ * Do not bump for refactors that cannot change an outcome.
+ */
+export const CAPABILITY_POLICY_VERSION = '2026-07-25.1';
+
 const riskRank: Record<CapabilityRiskLevel, number> = { L0: 0, L1: 1, L2: 2, L3: 3, L4: 4 };
 
 export const minimumRiskForAction = (action: CapabilityAction): CapabilityRiskLevel => {

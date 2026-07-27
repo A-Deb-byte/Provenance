@@ -3,8 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createKernelService } from './kernel';
+import { appendKernelEvent } from './ledger';
+import { hashMemoryContent } from './memory';
 import { createSkillEvaluationSource } from './skills/evaluationSuite';
-import { SkillManifest } from './types';
+import { hashKernelStateContent, writeKernelRecoveryState, writeKernelState } from './store';
+import type { KernelState, SkillManifest } from './types';
 
 let runtimeDir = '';
 let workspaceRoot = '';
@@ -20,6 +23,54 @@ afterEach(async () => {
     rm(workspaceRoot, { recursive: true, force: true }),
   ]);
 });
+
+const appendAuthenticatedImportEvents = async (
+  state: KernelState,
+  payloads: Array<{ sourceId: string; contentHash: string }>,
+): Promise<string[]> => {
+  let previousHash = state.lastEventHash;
+  const eventIds: string[] = [];
+  for (const [index, payload] of payloads.entries()) {
+    const artifactId = `artifact_import_${index + 1}`;
+    const event = await appendKernelEvent(runtimeDir, previousHash, {
+      actor: 'system',
+      type: 'artifact.created',
+      entityId: artifactId,
+      entityType: 'artifact',
+      payload: { artifactId, byteLength: 1, ...payload },
+    });
+    previousHash = event.hash;
+    eventIds.push(event.id);
+  }
+
+  const stateAtSourceHead = { ...state, lastEventHash: previousHash };
+  const stateHash = hashKernelStateContent(stateAtSourceHead);
+  const prepared = await appendKernelEvent(runtimeDir, previousHash, {
+    actor: 'system',
+    type: 'system.snapshot_prepared',
+    entityId: 'kernel-state',
+    entityType: 'system',
+    payload: { schemaVersion: 1, baseEventHash: previousHash, stateHash },
+  });
+  const committed = await appendKernelEvent(runtimeDir, prepared.hash, {
+    actor: 'system',
+    type: 'system.snapshot_committed',
+    entityId: 'kernel-state',
+    entityType: 'system',
+    payload: {
+      schemaVersion: 1,
+      baseEventHash: prepared.hash,
+      preparedEventHash: prepared.hash,
+      stateHash,
+    },
+  });
+  const committedState = { ...stateAtSourceHead, lastEventHash: committed.hash };
+  await Promise.all([
+    writeKernelState(runtimeDir, committedState),
+    writeKernelRecoveryState(runtimeDir, committedState),
+  ]);
+  return eventIds;
+};
 
 describe('kernel learning service', () => {
   it('persists evidence-backed memory promotion without writing raw content to the ledger', async () => {
@@ -97,6 +148,94 @@ describe('kernel learning service', () => {
 
     expect(derived.evidenceRefs).toEqual([{ eventId: candidateEvent.id }]);
     await expect(kernel.promoteMemory(derived.id, 'Attempt circular promotion.'))
+      .rejects.toThrow(/independent source-backed evidence/i);
+  });
+
+  it('accepts artifact import evidence without an artifact ref only when source id and content hash match', async () => {
+    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    const content = 'Imported release procedure from the authenticated archive.';
+    const sourceId = 'import_archive_1';
+    const [sourceEventId] = await appendAuthenticatedImportEvents(
+      await kernel.getState(),
+      [{ sourceId, contentHash: hashMemoryContent(content) }],
+    );
+    const candidate = await kernel.createMemoryCandidate({
+      kind: 'procedural',
+      content,
+      confidence: 0.8,
+      scope: { kind: 'workspace', id: workspaceRoot },
+      sensitivity: 'internal',
+      retention: { kind: 'durable' },
+      provenance: {
+        sourceType: 'import',
+        sourceId,
+        actor: 'system',
+        observedAt: '2026-07-12T00:00:00.000Z',
+      },
+      evidenceRefs: [{ eventId: sourceEventId }],
+      contradictionIds: [],
+      supersedesIds: [],
+    });
+
+    await expect(kernel.promoteMemory(candidate.id, 'Verified exact imported source.'))
+      .resolves.toMatchObject({ status: 'promoted' });
+  });
+
+  it('rejects imported evidence when either the source id or content hash belongs to another import', async () => {
+    const kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
+    const sourceMismatchContent = 'Imported fact with an unrelated source event.';
+    const hashMismatchContent = 'Imported fact whose event authenticates different bytes.';
+    const [wrongSourceEventId, wrongHashEventId] = await appendAuthenticatedImportEvents(
+      await kernel.getState(),
+      [
+        {
+          sourceId: 'different_import_source',
+          contentHash: hashMemoryContent(sourceMismatchContent),
+        },
+        {
+          sourceId: 'import_archive_hash_mismatch',
+          contentHash: hashMemoryContent('Different imported bytes.'),
+        },
+      ],
+    );
+    const wrongSource = await kernel.createMemoryCandidate({
+      kind: 'semantic',
+      content: sourceMismatchContent,
+      confidence: 0.7,
+      scope: { kind: 'global' },
+      sensitivity: 'internal',
+      retention: { kind: 'durable' },
+      provenance: {
+        sourceType: 'import',
+        sourceId: 'import_archive_source_mismatch',
+        actor: 'system',
+        observedAt: '2026-07-12T00:00:00.000Z',
+      },
+      evidenceRefs: [{ eventId: wrongSourceEventId }],
+      contradictionIds: [],
+      supersedesIds: [],
+    });
+    const wrongHash = await kernel.createMemoryCandidate({
+      kind: 'semantic',
+      content: hashMismatchContent,
+      confidence: 0.7,
+      scope: { kind: 'global' },
+      sensitivity: 'internal',
+      retention: { kind: 'durable' },
+      provenance: {
+        sourceType: 'import',
+        sourceId: 'import_archive_hash_mismatch',
+        actor: 'system',
+        observedAt: '2026-07-12T00:01:00.000Z',
+      },
+      evidenceRefs: [{ eventId: wrongHashEventId }],
+      contradictionIds: [],
+      supersedesIds: [],
+    });
+
+    await expect(kernel.promoteMemory(wrongSource.id, 'Attempt source substitution.'))
+      .rejects.toThrow(/independent source-backed evidence/i);
+    await expect(kernel.promoteMemory(wrongHash.id, 'Attempt content substitution.'))
       .rejects.toThrow(/independent source-backed evidence/i);
   });
 

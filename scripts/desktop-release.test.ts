@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { createRuntimeResourceManifest } from './runtime-resource-manifest.mjs';
 
 const execFileAsync = promisify(execFile);
 const roots: string[] = [];
@@ -182,8 +183,10 @@ async function createUnsignedPayload(
   await writeFile(nativePath, nativeBytes);
 
   const licenseBytes = await readFile(env.PROVENANCE_BUNDLED_NODE_LICENSE!);
+  const applicationLicenseBytes = await readFile(path.join(process.cwd(), 'LICENSE'));
   const rustNoticeBytes = Buffer.from(`Rust third-party notices fixture\n${'license\n'.repeat(200)}`);
   const resources = [
+    ['LICENSE', 'application-license', applicationLicenseBytes],
     ['dist/RUST_THIRD_PARTY_NOTICES.txt', 'native-third-party-notices', rustNoticeBytes],
     ['dist/THIRD_PARTY_NOTICES.txt', 'third-party-notices', Buffer.from('JavaScript notices')],
     ['dist/assets/index-fixture.css', 'application-ui', Buffer.from('body{color:#111}')],
@@ -220,6 +223,7 @@ async function createUnsignedPayload(
   const rustNotices = manifestResources.find(
     (resource) => resource.destination === 'dist/RUST_THIRD_PARTY_NOTICES.txt',
   )!;
+  const runtimeResourceManifest = createRuntimeResourceManifest(manifestResources);
   const cargoLock = await readFile(path.join(process.cwd(), 'src-tauri', 'Cargo.lock'));
   const packageLock = await readFile(path.join(process.cwd(), 'package-lock.json'));
   const manifest = {
@@ -245,12 +249,15 @@ async function createUnsignedPayload(
       nodeVersion: env.PROVENANCE_BUNDLED_NODE_VERSION,
       nodeArchitecture: 'x64',
       nodeLicenseSha256: env.PROVENANCE_BUNDLED_NODE_LICENSE_SHA256,
+      applicationLicense: 'BUSL-1.1',
+      applicationLicenseSha256: sha256(applicationLicenseBytes),
       cargoAboutSha256: env.PROVENANCE_CARGO_ABOUT_SHA256,
       cargoAboutVersion: env.PROVENANCE_CARGO_ABOUT_VERSION,
       tauriCliVersion: '2.11.4',
       packageLockSha256: sha256(packageLock),
       cargoLockSha256: sha256(cargoLock),
       rustThirdPartyNoticesSha256: rustNotices.sha256,
+      runtimeResourceManifestSha256: runtimeResourceManifest.sha256,
       sandboxImage: env.PROVENANCE_SANDBOX_IMAGE,
     },
   };
@@ -280,6 +287,9 @@ describe('desktop release planner', () => {
       nodeArchitecture: 'x64',
       nodeSignerThumbprint,
       nodeLicenseResource: 'node/LICENSE',
+      applicationLicense: 'BUSL-1.1',
+      applicationLicenseResource: 'LICENSE',
+      applicationLicenseSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       cargoAboutSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       cargoAboutVersion: cargoAboutFixture.version,
       tauriCliVersion: '2.11.4',
@@ -381,6 +391,11 @@ describe('desktop release planner', () => {
         WINDOWS_PFX_BASE64: 'pfx-marker',
         PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT: 'certificate-marker',
         PsMoDuLePaTh: 'C:\\Program Files\\PowerShell\\7\\Modules',
+        OPENROUTER_API_KEY: 'provider-key-marker',
+        AWS_SECRET_ACCESS_KEY: 'aws-secret-marker',
+        GITHUB_TOKEN: 'github-token-marker',
+        UNRELATED_SERVICE_SECRET: 'generic-secret-marker',
+        PROVENANCE_CARGO_ABOUT: 'cargo-about-marker',
         PROVENANCE_BUILD_MARKER: 'present',
       },
     });
@@ -390,9 +405,18 @@ describe('desktop release planner', () => {
       pfx: false,
       certificate: false,
       powerShellModulePath: false,
-      ordinaryMarker: true,
+      openRouterKey: false,
+      awsSecret: false,
+      githubToken: false,
+      genericSecret: false,
+      cargoAbout: true,
+      ordinaryMarker: false,
     });
     expect(result.stdout).not.toContain(privateKeyMarker);
+    expect(result.stdout).not.toContain('provider-key-marker');
+    expect(result.stdout).not.toContain('aws-secret-marker');
+    expect(result.stdout).not.toContain('github-token-marker');
+    expect(result.stdout).not.toContain('generic-secret-marker');
   });
 
   it('verifies an exact symlink-free unsigned native payload', async () => {
@@ -423,6 +447,23 @@ describe('desktop release planner', () => {
       execFileAsync(process.execPath, [script, 'verify-unsigned', payload], { env }),
     ).rejects.toMatchObject({
       stderr: expect.stringContaining('does not match its hash manifest'),
+    });
+  });
+
+  it('rejects a payload that omits the application license', async () => {
+    const env = await fixtureEnvironment();
+    const { payload, manifest } = await createUnsignedPayload(env, { materializeRuntime: false });
+    const licenseIndex = manifest.resources.findIndex(
+      (resource) => resource.destination === 'LICENSE',
+    );
+    const [license] = manifest.resources.splice(licenseIndex, 1);
+    await rm(path.join(payload, ...license.path.split('/')));
+    await writeFile(path.join(payload, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+
+    await expect(
+      execFileAsync(process.execPath, [script, 'verify-unsigned', payload], { env }),
+    ).rejects.toMatchObject({
+      stderr: expect.stringContaining('missing required LICENSE resource metadata'),
     });
   });
 
@@ -528,5 +569,16 @@ describe('desktop release planner', () => {
       stderr: expect.stringMatching(/signature format|canonical base64/i),
     });
     await expect(readFile(output, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('uses the self-removing NSIS silent-uninstall mode in protected acceptance', async () => {
+    const workflow = await readFile(
+      path.join(process.cwd(), '.github', 'workflows', 'windows-release.yml'),
+      'utf8',
+    );
+    expect(workflow).not.toContain('_?=');
+    expect(workflow).toMatch(
+      /\$uninstall = Start-Process -FilePath \$uninstaller[\s\S]{0,160}-ArgumentList @\('\/S'\)/u,
+    );
   });
 });

@@ -28,9 +28,26 @@ describe('desktop host readiness publisher', () => {
       DESKTOP_HOST_READY_FILE: readyPath,
       DESKTOP_RUNTIME_OWNER_NONCE: 'o'.repeat(48),
     }, 707);
-    await publisher.publish(43123);
+    await publisher.publish({
+      port: 43123,
+      hostInstanceId: `desktop-host-${'a'.repeat(32)}`,
+      kernelReady: true,
+      accessMode: 'multi_user',
+      bridgeAuthenticated: true,
+      schedulerEnabled: false,
+      desktopStatus: 'available',
+    });
     expect(JSON.parse(await readFile(readyPath, 'utf8'))).toEqual({
-      schemaVersion: 1, nonce: 'h'.repeat(48), pid: 707, port: 43123,
+      schemaVersion: 3,
+      nonce: 'h'.repeat(48),
+      pid: 707,
+      port: 43123,
+      hostInstanceId: `desktop-host-${'a'.repeat(32)}`,
+      kernelReady: true,
+      accessMode: 'multi_user',
+      bridgeAuthenticated: true,
+      schedulerEnabled: false,
+      desktopStatus: 'available',
     });
     await publisher.cleanup();
     await expect(readFile(readyPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
@@ -54,6 +71,15 @@ describe('desktop host readiness publisher', () => {
       DESKTOP_RUNTIME_OWNER_NONCE: 'o'.repeat(48),
     }, 808);
     await writeFile(readyPath, 'occupied');
-    await expect(publisher.publish(43123)).rejects.toMatchObject({ code: 'EEXIST' });
+    await expect(publisher.publish({
+      port: 43123,
+      hostInstanceId: `desktop-host-${'a'.repeat(32)}`,
+      kernelReady: true,
+      accessMode: 'multi_user',
+      bridgeAuthenticated: true,
+      schedulerEnabled: false,
+      desktopStatus: 'available',
+    }))
+      .rejects.toMatchObject({ code: 'EEXIST' });
   });
 });

@@ -10,6 +10,7 @@ import { createKernelService } from './kernel';
 import { appendKernelEvent } from './ledger';
 import { hashKernelStateContent, writeKernelRecoveryState, writeKernelState } from './store';
 import type { KernelState } from './types';
+import { createBrowserWorker } from './workers/browserWorker';
 
 let runtimeDir = '';
 let workspaceRoot = '';
@@ -600,6 +601,53 @@ describe('automation execution', () => {
     expect(outcome.dispatch).toMatchObject({ status: 'uncertain', errorCode: 'browser_outcome_uncertain' });
     expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
     await expect(kernel.runAutomation(automation.id)).rejects.toThrow(/unresolved uncertain mutation outcome/);
+  });
+
+  it('preserves an ordinary post-dispatch browser exception as uncertain and blocks retry', async () => {
+    let driverCalls = 0;
+    const actionWorker = createBrowserWorker({
+      isAvailable: async () => true,
+      perform: async () => {
+        driverCalls += 1;
+        throw new Error('Browser transport closed after accepting navigation.');
+      },
+      close: async () => undefined,
+    });
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      workerRegistrations: [browserWorker],
+      actionWorkers: { [browserWorker.id]: actionWorker },
+    });
+    const goal = await kernel.createGoal(goalInput());
+    const automation = await kernel.createAutomation({
+      ...automationInput(goal.id),
+      name: 'Navigate with an ambiguous driver result',
+      riskLevel: 'L2',
+      action: {
+        type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/account',
+      },
+      budget: { maxRuns: 2, maxConsecutiveFailures: 1, maxRuntimeMsPerRun: 5_000 },
+    });
+    await kernel.setAutomationEnabled(automation.id, true, 'Enable uncertain-result test.');
+    const approval = await kernel.runAutomation(automation.id);
+    await kernel.decideApproval(
+      approval.approvalId!,
+      'approved',
+      'Approve one exact browser navigation.',
+    );
+
+    const outcome = await kernel.runAutomation(automation.id);
+
+    expect(driverCalls).toBe(1);
+    expect(outcome.dispatch).toMatchObject({
+      status: 'uncertain',
+      errorCode: 'browser_outcome_uncertain',
+    });
+    expect((await kernel.getEvents()).map((event) => event.type)).toContain('automation.run_uncertain');
+    await expect(kernel.runAutomation(automation.id))
+      .rejects.toThrow(/unresolved uncertain mutation outcome/);
+    expect(driverCalls).toBe(1);
   });
 
   it('fences a browser mutation interrupted by Stop All as uncertain', async () => {

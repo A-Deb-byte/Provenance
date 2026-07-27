@@ -1,4 +1,9 @@
+import crypto from 'node:crypto';
 import parseSpdxExpression from 'spdx-expression-parse';
+
+export const applicationLicenseIdentifier = 'BUSL-1.1';
+export const applicationLicenseSha256 =
+  'a1795552d1786d8f443187ac3de2b4a869bc94c706cfdc74b5825cbc13a5327b';
 
 const acceptedLicenses = new Set([
   '0BSD',
@@ -43,3 +48,36 @@ export const validateLicenseExpression = (expression) => {
 };
 
 export const acceptedLicenseIdentifiers = () => [...acceptedLicenses].sort();
+
+export const digestApplicationLicenseText = (licenseText) => {
+  if (typeof licenseText !== 'string') {
+    throw new Error('LICENSE must be UTF-8 text.');
+  }
+  const normalizedText = licenseText.replace(/\r\n?/g, '\n');
+  return crypto.createHash('sha256').update(normalizedText, 'utf8').digest('hex');
+};
+
+export const validateApplicationLicenseContract = ({
+  packageLicense,
+  packageLockLicense,
+  cargoLicense,
+  licenseText,
+}) => {
+  for (const [source, value] of [
+    ['package.json', packageLicense],
+    ['package-lock.json', packageLockLicense],
+    ['src-tauri/Cargo.toml', cargoLicense],
+  ]) {
+    if (value !== applicationLicenseIdentifier) {
+      throw new Error(
+        `${source} must declare the application license as ${applicationLicenseIdentifier}.`,
+      );
+    }
+  }
+  if (digestApplicationLicenseText(licenseText) !== applicationLicenseSha256) {
+    throw new Error(
+      'LICENSE must exactly match the authenticated Business Source License 1.1 text.',
+    );
+  }
+  return applicationLicenseIdentifier;
+};

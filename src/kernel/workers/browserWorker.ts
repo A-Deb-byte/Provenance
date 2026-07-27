@@ -32,7 +32,7 @@ export interface BrowserActionRequest {
 export type ArtifactResolver = (id: string) => Promise<{ content: string; contentHash: string } | undefined>;
 
 export interface BrowserActionResult {
-  status: 'succeeded' | 'failed';
+  status: 'succeeded' | 'failed' | 'uncertain';
   finalUrl: string;
   content: string;
   errorCode?: string;
@@ -46,7 +46,7 @@ export interface BrowserDriver {
 }
 
 export interface BrowserWorkerResult {
-  status: 'succeeded' | 'failed';
+  status: 'succeeded' | 'failed' | 'uncertain';
   summary: string;
   sourceRef: string;
   content?: string;
@@ -64,6 +64,13 @@ const isWriteAction = (action: BrowserAction): action is WriteAction => (
 
 const fail = (summary: string, sourceRef: string, errorCode: string): BrowserWorkerResult => ({
   status: 'failed', summary, sourceRef, errorCode,
+});
+
+const uncertain = (summary: string, sourceRef: string): BrowserWorkerResult => ({
+  status: 'uncertain',
+  summary,
+  sourceRef,
+  errorCode: 'browser_outcome_uncertain',
 });
 
 export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: ArtifactResolver) => ({
@@ -115,24 +122,38 @@ export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: Ar
       text = resolved.content;
     }
 
-    const result = await driver.perform(
-      {
-        type: action.type,
-        origin: action.origin,
-        url: action.url,
-        selector: action.type === 'browser.navigate' ? undefined : action.selector,
-        text,
-        timeoutMs: Math.min(options.timeoutMs, 30_000),
-      },
-      { signal: options.signal },
-    );
+    let result: BrowserActionResult;
+    try {
+      result = await driver.perform(
+        {
+          type: action.type,
+          origin: action.origin,
+          url: action.url,
+          selector: action.type === 'browser.navigate' ? undefined : action.selector,
+          text,
+          timeoutMs: Math.min(options.timeoutMs, 30_000),
+        },
+        { signal: options.signal },
+      );
+    } catch {
+      return uncertain(
+        'Browser dispatch lost its result after authorization; its side effect may have completed and must not be retried automatically.',
+        action.url,
+      );
+    }
 
     try {
       if (new URL(result.finalUrl).origin !== action.origin) {
-        return fail('Browser origin drifted outside the authorized origin.', result.finalUrl, 'origin_drift');
+        return uncertain(
+          'Browser origin drifted after dispatch; its side effect may have completed and must not be retried automatically.',
+          result.finalUrl,
+        );
       }
     } catch {
-      return fail('Browser returned an invalid final URL.', result.finalUrl || action.url, 'origin_drift');
+      return uncertain(
+        'Browser returned an invalid final URL after dispatch; its side effect may have completed and must not be retried automatically.',
+        result.finalUrl || action.url,
+      );
     }
 
     // The typed value itself is never echoed into the summary (it may be
@@ -144,10 +165,14 @@ export const createBrowserWorker = (driver: BrowserDriver, artifactResolver?: Ar
       status: result.status,
       summary: result.status === 'succeeded'
         ? `${action.type} on ${action.origin} succeeded${detail}.`
-        : `${action.type} on ${action.origin} failed.`,
+        : result.status === 'uncertain'
+          ? `${action.type} on ${action.origin} has an uncertain outcome and must not be retried automatically.`
+          : `${action.type} on ${action.origin} failed before a side effect was dispatched.`,
       sourceRef: result.finalUrl || action.url,
-      content: result.content.slice(0, MAX_CONTENT_CHARS),
-      errorCode: result.errorCode,
+      content: result.status === 'succeeded'
+        ? result.content.slice(0, MAX_CONTENT_CHARS)
+        : undefined,
+      errorCode: result.status === 'uncertain' ? 'browser_outcome_uncertain' : result.errorCode,
     };
   },
 });
@@ -437,6 +462,7 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
     };
     activePolicy = policy;
     expectedOrigin = request.origin;
+    let mutationDispatched = false;
     let abortCleanup: Promise<void> | undefined;
     const onAbort = () => {
       policy.aborted = true;
@@ -453,16 +479,20 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
       if (signal?.aborted) throw new BrowserAbortError();
 
       if (request.type === 'browser.navigate') {
+        mutationDispatched = true;
         await page.goto(request.url, { timeout: request.timeoutMs, waitUntil: 'domcontentloaded' });
       } else {
         if (page.url() !== request.url) {
+          mutationDispatched = true;
           await page.goto(request.url, { timeout: request.timeoutMs, waitUntil: 'domcontentloaded' });
         }
         if (policy.blockedUrl) throw new OriginDriftError(policy.blockedUrl);
         requirePageOrigin(page, request.origin);
         if (request.type === 'browser.type') {
+          mutationDispatched = true;
           await page.fill(request.selector ?? '', request.text ?? '', { timeout: request.timeoutMs });
         } else {
+          mutationDispatched = true;
           await page.click(request.selector ?? '', { timeout: request.timeoutMs });
         }
       }
@@ -486,17 +516,20 @@ export const createPlaywrightDriver = (options: PlaywrightDriverOptions): Browse
       if (policy.blockedUrl) error = new OriginDriftError(policy.blockedUrl);
       if (error instanceof OriginDriftError && policy.page) await trackClose(policy.page, policy);
       await Promise.allSettled(policy.cleanup);
+      if (mutationDispatched) await closeContextAndPages();
       return {
-        status: 'failed',
+        status: mutationDispatched ? 'uncertain' : 'failed',
         finalUrl: error instanceof OriginDriftError ? error.finalUrl : request.url,
         content: '',
-        errorCode: policy.aborted || error instanceof BrowserAbortError
-          ? 'cancelled'
-          : error instanceof OriginDriftError
-            ? 'origin_drift'
-            : error instanceof UnscopedDownloadError
-              ? 'download_blocked'
-            : error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport',
+        errorCode: mutationDispatched
+          ? 'browser_outcome_uncertain'
+          : policy.aborted || error instanceof BrowserAbortError
+            ? 'cancelled'
+            : error instanceof OriginDriftError
+              ? 'origin_drift'
+              : error instanceof UnscopedDownloadError
+                ? 'download_blocked'
+                : error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport',
       };
     } finally {
       signal?.removeEventListener('abort', onAbort);

@@ -12,5 +12,8 @@ coverage/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/resources/node.exe
+src-tauri/pilot-staging/
 src-tauri/updater-private.key
+src-tauri/*.key
+src-tauri/*.key.pub
 src-tauri/*.pfx

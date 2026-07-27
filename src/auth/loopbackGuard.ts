@@ -50,19 +50,37 @@ export const createLoopbackRequestGuard = (): express.RequestHandler => (req, re
 };
 
 export const createSecurityHeaders = (
-  options: { allowViteDevelopment?: boolean } = {},
-): express.RequestHandler => (_req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader(
-    'Content-Security-Policy',
-    options.allowViteDevelopment
-      ? "default-src 'self'; connect-src 'self' ws:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-      : "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-  );
-  next();
+  options: {
+    allowViteDevelopment?: boolean;
+    nativeAcceptanceMountOrigin?: string;
+  } = {},
+): express.RequestHandler => {
+  const mountOrigin = options.nativeAcceptanceMountOrigin;
+  if (mountOrigin) {
+    const parsed = new URL(mountOrigin);
+    if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1'
+        || !parsed.port || parsed.pathname !== '/' || parsed.search || parsed.hash
+        || parsed.username || parsed.password || parsed.origin !== mountOrigin) {
+      throw new Error('Native acceptance requires one exact IPv4 loopback mount origin.');
+    }
+  }
+  const connectSources = ["'self'"];
+  if (options.allowViteDevelopment) connectSources.push('ws:');
+  if (mountOrigin) connectSources.push(mountOrigin);
+  const scriptSources = options.allowViteDevelopment ? "'self' 'unsafe-inline'" : "'self'";
+  return (_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    res.setHeader(
+      'Content-Security-Policy',
+      `default-src 'self'; connect-src ${connectSources.join(' ')}; img-src 'self' data:; ` +
+        `style-src 'self' 'unsafe-inline'; script-src ${scriptSources}; frame-ancestors 'none'; ` +
+        "base-uri 'none'; form-action 'self'",
+    );
+    next();
+  };
 };
 
 export const securityHeaders = createSecurityHeaders();

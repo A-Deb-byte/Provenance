@@ -20,6 +20,7 @@ afterEach(async () => {
 const navigationIntent = () => browserIntent({
   riskLevel: 'L2',
   action: { type: 'browser.navigate', origin: 'https://example.com', url: 'https://example.com/account' },
+  authority: { kind: 'approval', referenceId: 'approval_1' },
 });
 
 const approvedGrant = () => createCapabilityGrant(navigationIntent(), {

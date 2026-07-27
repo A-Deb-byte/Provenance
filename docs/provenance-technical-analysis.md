@@ -1,194 +1,142 @@
-# Provenance — A Technical Analysis of an Evidence-Gated Local Agent Control Plane
+# Provenance: Technical Analysis and Release Posture
 
-Author of system: A. Deb (github.com/A-Deb-byte)
-Analysis date: 2026-07-14
-Scope: `github.com/A-Deb-byte/Provenance` (this repository)
+- Analysis date: 2026-07-26
+- Scope: the current `codex/production-desktop-release-v1` working tree
+- Status: implementation analysis, not an external audit or release approval
 
-> Every claim in this document is anchored to a file or module in the repository and was checked against the source and the test suite. Where a capability is partial, unverified, or deliberately absent, this document says so. That discipline — *state only what the code does, report the rest as unavailable rather than simulated* — is itself a core design property of the system, so an analysis of it should hold to the same standard.
+This document separates implemented controls from evidence that still has to be produced. A file in the repository can prove that a gate exists; only a successful run against an identified commit and artifact proves that the gate passed for that candidate.
 
----
+## 1. What Provenance is
 
-## 1. What Provenance is (and is not)
+Provenance is a local-first agent control plane with three cooperating layers:
 
-Provenance is a **local-first, single-tenant agent control plane**: a TypeScript/Express server and a React/Vite dashboard in which a *deterministic trusted kernel* mediates every action a language model proposes. Its guiding thesis is that agent safety is a **systems-engineering problem**, not a model-alignment problem — safe behaviour is enforced by kernel code, capability tokens, and a tamper-evident ledger, not by prompt wording or trained-in refusals.
+1. A TypeScript/Express application and trusted kernel own goals, tasks, budgets, approvals, capabilities, automations, memory, skills, and the hash-chained ledger.
+2. A React dashboard exposes authenticated operator workflows without storing authoritative memory, skill, provider, approval, or release state in browser storage.
+3. On Windows, a Tauri/Rust host owns the native runtime, supervises the Node control plane, authenticates the native bridge, and brokers bounded UI Automation.
 
-It is **not** an Electron application, a desktop-client launcher, an ASAR/packaging wrapper, or a supply-chain signer for third-party binaries. It ships no bundled browser client, performs no cryptographic pinning of external runtimes, and contains no Claude Desktop / ChatGPT packaging logic. Its dependency set is `express, react, vite, @google/genai, node-llama-cpp, playwright-core` and testing tooling — a web service plus an in-process kernel, across ~159 TypeScript source files.
+The defensible design principle is: **models propose; deterministic policy grants authority; workers consume one-use dispatch authorization; the ledger records the result.** This is not unrestricted self-modification, generic remote administration, or proof that model output is true.
 
-The operative slogan, implemented rather than asserted, is: **models propose; the kernel decides; the ledger proves.**
+Authentication and vault persistence have their own server-owned stores. Therefore, the precise claim is that the kernel is the authoritative writer for agent goals, actions, approvals, capability state, memory, skills, automations, and controlled releases, not that every byte written by the application goes through one kernel queue.
 
----
+## 2. Authority and evidence
 
-## 2. Architecture at a glance
+Consequential worker actions are intent-hash bound. Capability grants are persisted and consumed before worker I/O, then converted into an opaque, one-use dispatch authorization that the selected worker must claim immediately before acting. Browser and desktop writes have a minimum L2 risk and require a matching approved record before dispatch.
 
+The JSONL event ledger is hash chained and can be checked independently. A release gate must use `npm run verify-ledger:strict -- <populated-evidence-runtime>`; the non-strict default can validly report zero events and therefore is not candidate evidence. Capability authorization events additionally retain raw-value-omitting schema-2 semantic commitments. Raw values are not copied into those records, but exact URL and relation commitments can still be guessed when their source values have low entropy. `npm run replay-ledger:gate` drives the real kernel through approvals and dispatch in an isolated persisted runtime, then requires the separately implemented replayer to derive every decision under strict mode. This covers capability policy and grant consumption, not every kernel decision. Snapshots are authenticated by ledgered prepare and commit events containing the canonical state hash, and startup validates both the primary and recovery copy. This authenticates the saved snapshot against the ledger; it does not mean every historical state can be reconstructed solely from domain-event payloads. The chain is local tamper evidence rather than non-repudiation because replacing the complete ledger and every retained head reference is outside its claim.
+
+Memory promotion rejects a candidate's own creation event as evidence. The bounded skill foundry accepts only the `pure-transform-v1` DSL, and production canaries depend on an independently configured evaluator resolver rather than caller-supplied oracle outputs.
+
+## 3. Access control
+
+The server supports three explicit modes:
+
+- `multi_user`: signed, expiring sessions with persisted session versions; admin and operator roles may mutate, while viewers are read-only.
+- `operator_token`: a configured bearer token protects authoritative reads and mutations and is required to bootstrap the first administrator.
+- `open`: available only when neither accounts nor an operator token exist, on the loopback-only deployment.
+
+Mutating application, provider, kernel, and vault routes share the access guard. Sanitized auth, provider, core-model, and runtime capability surfaces remain public so an unauthenticated dashboard can render a login or availability screen. Logout and explicit session revocation advance the persisted session version, while deleting an account makes its outstanding sessions fail user lookup. Password and role editing are not implemented.
+
+The native acceptance path does not treat process survival as readiness. It pre-seeds an isolated multi-user runtime, logs in through the actual API, verifies the returned session, and proves an authenticated kernel read before accepting readiness. The Node record must also assert kernel readiness, `multi_user` access, authenticated bridge health, a valid host-instance id, disabled scheduler state, and available desktop authority.
+
+## 4. Browser and command boundaries
+
+`browser.inspect` is read-only L0 work. `browser.navigate`, `browser.click`, and `browser.type` are minimum L2 writes. The Playwright driver checks the allowed origin before dispatch, intercepts off-origin top-level requests, rechecks after navigation or click-driven navigation, closes unexpected pages, and rejects downloads caused by a write. `browser.download` is not implemented.
+
+This is bounded browser automation, not unrestricted browsing. Research missions accept only explicit HTTPS seed URLs on configured origins; they do not search, crawl, follow redirects, or let a provider widen the source set.
+
+Command isolation depends on Docker plus an exact selected-workspace health probe and a digest-pinned image. Native desktop launches fail closed when that boundary is unhealthy and never fall back to host command execution. Standalone source/development runs can retain a separately reported trusted-host fallback; that is a degraded execution mode, not an OS sandbox.
+
+## 5. Native desktop boundary
+
+The Windows host uses separate compiled application identities:
+
+| Profile | Identifier | Purpose |
+| --- | --- | --- |
+| Development | `dev.provenance.desktop.development` | Local and ordinary CI native verification |
+| Pilot | `dev.provenance.desktop.pilot` | Isolated unsigned local pilot only |
+| Production | `dev.provenance.desktop` | Protected signed release workflow |
+
+The host exclusively owns its per-user runtime, launches a fixed Node entrypoint under a kill-on-close Windows Job Object, and monitors the Node child, bridge, and UI Automation broker. Packaged builds embed a canonical resource manifest; launch authenticates declared paths, sizes, and hashes, rejects undeclared, reparse-point, or non-regular entries in the exact `dist` inventory, and retains the opened files for the supervised lifetime. Node accepts the locked manifest copy published by Rust and exposes only its authenticated index and asset entries as static content; the protected workflow separately verifies the complete installed inventory. Acceptance requires an explicit monitor-start handshake rather than inferring monitoring from later process state. The bridge uses per-launch HMAC-SHA256 authentication with request ids, timestamps, body hashes, and replay protection. The frontend mount challenge is separate one-use authority accepted only by a Rust-owned loopback endpoint after exact Host, Origin, and body validation; Node does not receive that token. Desktop authority is fixed by a persisted executable allowlist and registered operations; model output cannot expand it.
+
+Desktop discovery and inspection are L0. Clicking and hash-bound typing are at least L2, consume approval and one-use capability authority, and revalidate the process, window, tree revision, path, and node identity immediately before mutation. UI Automation admission uses a bounded nonblocking queue and per-request generation and deadline checks. Queue-full, expired, or invalidated work fails before mutation; once a Windows COM mutation starts it cannot be cancelled safely, so timeout or failed post-write verification becomes `OutcomeUncertain` and blocks automatic retry. A broker-level timeout additionally marks UI Automation unhealthy. UI Automation output is evidence, never authority.
+
+The native host remains a local userspace boundary. The browser-facing listener is the supervised Node listener rather than a Rust-owned reverse proxy, so monitoring reduces but does not formally eliminate every same-user loopback port-rebinding race. Stop All also cannot undo an OS side effect already accepted by UI Automation.
+
+## 6. Authenticated native acceptance
+
+`scripts/native-host-smoke.mjs` now implements an authenticated acceptance gate rather than a liveness check. Each run:
+
+1. Reserves fresh identity-specific local and roaming profiles and a fresh scratch project.
+2. Creates an isolated multi-user account store, fixed Notepad allowlist, and workspace.
+3. Starts the native binary with a random 32-byte acceptance nonce, recurring scheduling disabled, and updater network activity suppressed.
+4. Logs in through the real multi-user API, verifies the session, performs a protected kernel read, and waits for the monitor-start handshake.
+5. Waits for a bounded HMAC attestation that binds the nonce, compiled application identifier, Tauri application version, runtime-resource manifest, host and Node pids, and host-instance id.
+6. Requires runtime ownership, authenticated bridge health, healthy UI Automation, available desktop authority, exact-origin native navigation, and a fresh Rust-owned mount challenge.
+7. Closes the real window through authenticated Node graceful shutdown, requires a clean zero exit, proves the attested Node pid is dead, and verifies that the owner record and acceptance proof are removed. Forced containment is a failure, even when cleanup succeeds.
+
+Development, pilot, and production profiles are not interchangeable. The production guard requires caller-provided CI markers and refuses an existing production profile, which prevents accidental reuse in the intended workflow. Those markers are not authenticated GitHub provenance; the protected workflow URL, same candidate SHA, environment approval, and signed artifact hashes supply the release evidence.
+
+The ordinary native workflow builds and exercises the development binary through this gate. The protected Windows release workflow silently installs the signed NSIS artifact into a fresh path, proves the installed executable is byte-identical to the captured signed native, verifies the exact installed resource inventory, revalidates the preserved unsigned payload immediately before startup, and supplies the immutable unsigned-job resource digest to the same authenticated gate. Only then may it silently uninstall.
+
+These controls are implemented in the current working tree. They become release evidence only after the applicable workflow succeeds on the exact candidate commit and its run URL and hashes are retained.
+
+## 7. Packaging, updater, and licensing
+
+Production packaging is split between unsigned construction and protected signing. It pins the orchestration versions, Node runtime identity and license hash, Rust notice generator, updater policy, and sandbox image; embeds a canonical resource-manifest digest; rehashes resources after native compilation and protected staging; applies Authenticode and updater signatures in separate authority phases; and emits signed release evidence.
+
+The application license contract is consistently declared as BUSL-1.1 in `package.json`, `package-lock.json`, and `src-tauri/Cargo.toml`. The complete root `LICENSE` is a mandatory, hash-bound top-level production resource. It is distinct from the adjacent Node runtime `LICENSE` and generated JavaScript and Rust third-party notices.
+
+The isolated pilot installer includes the application `LICENSE`, JavaScript and Rust third-party notices, and the Node runtime `LICENSE`. Its bounded non-secret evidence sidecar records the exact license inventory and hashes, the bundled Node hash, and the installer and resource-manifest digests needed by packaged acceptance. That complete notice inventory does not make the pilot distributable: the application, installer, and local Node runtime are not authenticated under the protected production signing policy; the updater uses a local pilot key and credential-free HTTPS `.invalid` endpoint; the sandbox image is deliberately unresolvable; and no protected release attestation exists.
+
+BUSL-1.1 is source-available, not an OSI open-source license. With no Additional Use Grant, the repository text permits non-production use; production use, including internal production use, requires a commercial license until the applicable Change Date. Licensing and attribution conclusions still require counsel, not an engineering test.
+
+The trusted Tauri updater verifies its configured HTTPS manifest and Tauri signatures and asks before installation. A failed network, manifest, or signature check installs no candidate and leaves the current trusted version running with coded diagnostics. It does not implement automatic rollback of an already installed trusted Tauri parent. The separate controlled Node-child release lifecycle has pre-commit health checks and rollback, but that does not substitute for installer rollback.
+
+## 8. Verification status
+
+Do not copy an old test total into a release claim. The historical Production Desktop Release v1 baseline was 532 TypeScript tests across 85 files on 2026-07-19. The current count changes as hardening tests are added; the output of `npm test` on the exact candidate commit is the only current total.
+
+The repository-defined local gates include:
+
+```powershell
+npm ci
+npm run lint
+npm test
+npm run build
+npm run verify-ledger:strict -- <populated-evidence-runtime>
+npm run replay-ledger:gate
+npm run desktop:release:test
+npm run desktop:acceptance
+npm run desktop:resource-smoke
+npm audit --audit-level=high
+npm audit --omit=dev --audit-level=high
+cargo +1.97.0 fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo +1.97.0 test --manifest-path src-tauri/Cargo.toml
+cargo +1.97.0 check --manifest-path src-tauri/Cargo.toml --all-targets
+cargo +1.97.0 clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
-Browser dashboard (React/Vite)
-        │  authenticated fetch (bearer)
-        ▼
-Express API  ──  access guard (open | operator-token | multi-user)
-        │
-        ▼
-Trusted kernel (single serialized mutation queue)
-  ├─ goal contracts + evidence-gated task graph
-  ├─ policy engine (risk ladder L0–L4) + approval broker
-  ├─ capability grants (single-use, exact-scoped, pre-dispatch authorization)
-  ├─ hash-chained event ledger + authenticated snapshots
-  ├─ budgets (operations / runtime / approvals / provider calls)
-  └─ evidence-backed memory + bounded skill foundry
-        │
-        ▼
-Workers (receive short-lived capability authorizations, mint none)
-  ├─ command worker  → Docker sandbox (no-network, read-only) or host fallback
-  ├─ web-inspect worker (read-only, L0)   ├─ Playwright browser worker (write, min L2)
-  ├─ provider router (6 providers, server-side secrets)
-  └─ in-process core model (MiniCPM5-1B via node-llama-cpp)
-```
 
-The kernel is the **only writer of authoritative state**. All mutations pass through one serialized queue in a single trusted process; workers never mint authority, only consume scoped, one-use authorizations.
+The ledger path must contain candidate-generated events; a missing or empty runtime fails strict verification. The npm audit is deliberately production-only and does not review Rust, Tauri, native build tools, NSIS, or WebView2. An independent advisory review of `Cargo.lock` and the release/build dependency chain must be attached to the candidate evidence.
 
----
+Windows native and protected release workflows add pinned dependency provisioning, third-party notice generation, operational decision replay, actual native startup, installed-file verification, Authenticode verification, installed-binary acceptance, uninstall verification, and updater evidence.
 
-## 3. The tamper-evident event ledger
+This document does **not** claim that the current local gates or remote workflows are green. Record those results, the commit, workflow URL, artifact hashes, and any waivers in the external audit and pilot packet.
 
-Every authoritative action appends a record to an append-only JSONL ledger under `.agent-kernel/`. Each event carries `previousHash` and `hash`, where the hash is `SHA-256(JSON(event-without-hash))`, chaining events so that altering any past record breaks every subsequent link.
+## 9. Remaining product and release boundaries
 
-Two properties make this more than logging:
+- No independent external security audit, penetration test, certification, external-user pilot, or soak period has been completed by this repository work.
+- No release is distributable until the protected workflow produces and validates a signed installer using real release-owner keys and certificate custody.
+- The installed package deliberately omits Playwright browser engines and the optional local-model runtime/model; those features are unavailable in that artifact unless a later audited package adds them.
+- Desktop v1 is limited to allowlisted discover, inspect, click, and type operations. Shortcuts, elevation, arbitrary shell authority, downloads, email, OAuth connectors, and generic desktop missions are absent.
+- The scheduler is limited to fixed-source Research to Verified Report missions, not arbitrary commands, connectors, email, or desktop jobs.
+- Accounts share one local kernel state; there is no per-user data partitioning, SSO/OIDC, multi-process shared runtime, or high-availability mode.
+- macOS Keychain and Linux Secret Service adapters still require live validation on their own platforms.
+- Provider availability and output quality remain operator and upstream dependencies. Citation grounding proves correspondence to captured text, not truth.
+- A provider credential was previously exposed outside the vault during project work. It must be revoked or rotated before pilot or release, and neither the old nor replacement value may appear in source, logs, screenshots, documentation, or retained evidence.
+- Telemetry policy, incident response ownership, updater hosting, key custody, representative third-party UI Automation testing, and manual installer rollback must be established operationally.
 
-- **Verified on read.** The kernel re-checks the chain head against the persisted snapshot before serving state; a mismatch refuses the read rather than returning divergent state.
-- **Independently replayable.** `scripts/verify-ledger.mjs` (`npm run verify-ledger`) recomputes every hash and link and confirms the snapshot head, using **zero project imports**. This is a deliberate portability proof: the ledger format can be validated by a future compiled/Rust verifier without trusting the TypeScript kernel. In live testing it verified 71 events after a session of real activity, and larger counts after mission runs.
+## 10. Release decision
 
-Snapshots use a **prepare / pending / commit** protocol: the ledger records the canonical state hash, the pending snapshot is checked against it, and both the primary and an authenticated recovery copy must match a ledgered commit. Startup can finish an interrupted commit and records hashes for an abandoned tail before restoring the latest authenticated snapshot. This authenticates snapshot *contents* against ledger events; it does not claim full state reconstruction from every event payload, and says so.
+The project now has a credible, testable release architecture: authenticated readiness instead of liveness, isolated identities, fail-closed desktop and command authority, exact installed-binary verification, and license-bound artifacts. That is materially stronger than a conventional agent demo.
 
----
-
-## 4. The capability model
-
-Authority to act is never ambient. When the kernel schedules an action it mints a **capability grant** that is:
-
-- **Exact-scoped** — bound to a specific command + args + working directory (for command execution) or a specific action type + origin/URL (for browser actions).
-- **Single-use** — an operation counter and expiry; reuse is rejected.
-- **Pre-dispatch and hash-bound** — the grant is validated and moved out of `active` state in a serialized persistent store (`src/capabilities/grantStore.ts`, `dispatch.ts`) *before* an opaque one-use dispatch authorization is minted. The worker must claim that authorization, bound to the exact intent hash and worker id, immediately before performing I/O. Authorization reuse or post-dispatch validation is rejected.
-
-This closes the common agent-runtime gap where a broad, reusable permission is granted once and then replayed. Here a worker holds only a hash-pinned, one-shot token valid for exactly one intent.
-
----
-
-## 5. Policy, the risk ladder, and approvals
-
-Actions are classified L0–L4 (`src/capabilities/policy.ts`):
-
-- **L0** (e.g. `browser.inspect`) — read-only, auto-allowed inside scope.
-- **L1** — bounded local execution (e.g. allowlisted verification commands).
-- **L2 / L3** — require an explicit, recorded human approval before dispatch. All browser *writes* — `browser.navigate`, `browser.click`, `browser.type`, `browser.download` — carry a **minimum L2** risk and therefore cannot run without approval.
-- **L4** — forbidden by policy.
-
-Approvals are durable and continuation-based: an L2/L3 automation run **persists an approval request and stops**. A later run may consume only a matching *approved* record and rebuild the intent with approval authority; denied, stale, unrelated, or already-consumed approvals cannot authorize dispatch. Untrusted content (web pages, tool output) is tagged at ingestion and **cannot grant authority** — it can inform a proposal, never authorize an action.
-
----
-
-## 6. Execution isolation
-
-Verification commands run through a `SandboxRunner` boundary (`src/kernel/sandbox/`). When a Docker daemon is reachable, commands execute in an ephemeral container with `--network none`, a read-only root filesystem, a writable tmpfs, bounded memory/pids/cpu, `--cap-drop ALL`, `--security-opt no-new-privileges`, and a workspace-only mount. When Docker is absent the runner falls back to the trusted host and **reports that honestly** in the runtime capability report — it never presents host execution as isolation.
-
-This was verified live: a kernel goal ran `npm run lint` inside the container to a clean exit with `platform=linux` on a Windows host (proving real isolation) and a DNS lookup failing under `--network none` (proving network isolation). Live testing also surfaced — and fixed — a configuration trap in which a mis-escaped Docker path silently disabled the sandbox; the fix and the class of bug are documented in the implementation records.
-
----
-
-## 7. Browser workers and keystroke-injection resistance
-
-Two browser workers exist. The **web-inspect** worker is strictly read-only (L0): a bounded `fetch` with manual redirect handling, origin re-checks, content-type limits, markup stripping, and size/time caps. The **Playwright** worker is write-capable (navigate / click / type), gated at minimum L2, and re-checks the authorized origin *after every navigation and before every click/type* so a redirect cannot silently widen authority.
-
-Text entry is the notable design point. A `browser.type` intent carries **not the text** but a `payloadArtifactId` + `payloadHash`. The value to be typed is staged separately in a **content-addressed artifact store** (`src/kernel/artifacts/artifactStore.ts`, SHA-256), and the worker refuses to type unless the resolved artifact's hash equals the hash the intent declares. Consequently a compromised or malicious page **cannot inject keystrokes** — an intent can only cause a *pre-staged, hash-matched* value to be entered, and the typed value is never echoed into the observation (only its length and target selector are recorded). Verified live: the driver typed a staged value into a form field and the page reflected exactly that value.
-
----
-
-## 8. Provider layer and secret handling
-
-A normalized adapter contract (`src/providers/`) spans six providers — Gemini (SDK), OpenAI/OpenRouter/DeepSeek/GLM (shared OpenAI-compatible HTTP), and a Bedrock boundary that reports unavailable until its runtime exists. OpenRouter is a first-class configured route. Routing supports automatic/pinned/ensemble selection scored by recorded telemetry, and every provider call is budgeted and recorded in the ledger by request/result hash.
-
-Secrets are **server-side only**, held behind a non-serializable handle that renders as `[REDACTED]`, and may be loaded at boot from the OS secret vault. No credential is written to tracked files. Provider output can never modify kernel policy or grant capabilities.
-
----
-
-## 9. The in-process core model — and an honest negative result
-
-Provenance can embed OpenBMB MiniCPM5-1B directly via `node-llama-cpp` (no Ollama/LM Studio), running fully on-device for memory extraction and a chat fallback when no cloud key is present. Generation is grammar-constrained to strict JSON schemas at temperature zero.
-
-Live testing produced a candid finding worth recording: the 1B model is **not reliable for prompt-injection classification** — it flagged benign web text with every injection signal at high risk, even after few-shot prompting. Because the assessor is *tighten-only* (it may raise risk but never lower the deterministic floor), an over-flagging model would cause alarm fatigue. The system therefore **defaults the live observation assessor to the deterministic heuristics** and makes the model path opt-in. This is the design ethos applied to itself: a capability that did not hold up under real use was demoted rather than shipped as a feature.
-
----
-
-## 10. Evidence-gated memory and the skill foundry
-
-Durable memory follows a `candidate → promoted → superseded/revoked` lifecycle with provenance, confidence, scope, sensitivity, retention, and evidence references. Promotion requires an explicit human reason, contradiction/supersession checks, and — after hardening — **non-circular evidence**: a candidate cannot cite its own creation event; direct ingestion emits a separate `memory.source_attested` event, and provider-extracted candidates reference an independent `provider.call.completed` event. Provider output enters as *candidates only* and can never silently become durable memory. The ledger stores content **hashes**, not raw memory text.
-
-The skill foundry synthesizes bounded text-transform programs (a five-operation DSL), evaluates them against a baseline, runs a **sealed canary** whose oracle is kernel-generated (the operator cannot supply the expected output), then promotes or rolls back — **never executing generated JavaScript**.
-
----
-
-## 11. Verified-report and recurring-research missions
-
-The higher-level workflow turns a fixed set of operator-supplied HTTPS sources (whose origins must already be allowlisted) into reports via a five-task graph: plan → capture (read-only L0) → synthesize → critique → publish. The distinguishing control is **deterministic citation grounding**: before any claim publishes, the kernel resolves the cited source artifact, recomputes its chunk hashes, and requires each quotation to be an *exact contiguous excerpt* (≥20 characters, ≥3 words) of an authenticated source; unknown, quarantined, or high-risk sources are rejected, and a `high`-confidence claim needs corroborating distinct-origin sources.
-
-"Verified" is scoped precisely and honestly: it means *every claim is citation-grounded in exact excerpts of the authenticated captured sources and the deterministic + critic gates passed*. It does **not** assert a source is true, current, complete, or unbiased, and it performs no general search, crawling, or redirect following.
-
-The recurring layer schedules such missions on an interval with durable leases, monotonic fences, latest-once catch-up, per-occurrence deadlines that abort provider/source I/O, Stop-All cancellation, and **fail-closed restart recovery** — an interrupted run becomes *uncertain* and requires an explicit operator resume or skip; it is never silently replayed.
-
----
-
-## 12. Access control and request integrity
-
-Access has three modes (`src/auth/`): open loopback (only when nothing is configured), a shared operator token, and multi-user accounts. Accounts use scrypt-hashed passwords; sessions are signed, expiring bearer tokens carrying a **persisted per-user version** so that logout, deletion, or a role change revokes an outstanding token *before* its cryptographic expiry. The last administrator cannot be removed; if an operator token is configured, it is required to bootstrap the first admin. A loopback guard inspects `Host`, mutating `Origin`, and `Sec-Fetch-Site` and sets browser security headers to reduce cross-site request risk — explicitly a local-hardening measure, not a substitute for remote-service security.
-
----
-
-## 13. Controlled, signed releases
-
-Release activation consumes a **staged, hash-addressed executable package**, not just metadata. An Ed25519 signature binds the target version, package hash, sorted evaluation references, and rollback instructions; before installation the lifecycle verifies authorization, each evaluation reference, the artifact hash, bounded file count/size, per-file hashes, the declared `.cjs` entrypoint, and controlled relative paths. Files install only under a versioned release directory, and a supervised child process must return an IPC readiness proof and survive a stability window before commit; the previous child stays live until then. This is *supervised, signed, evaluated* release of a child process — not arbitrary self-modification, and the trusted parent remains the policy authority.
-
----
-
-## 14. Verification discipline (as of this analysis)
-
-Measured directly, not quoted from prior records:
-
-- `npm run lint` (tsc `--noEmit`): **clean**.
-- `npm test`: **410 tests across 70 files, 409 passing**. One test (`apiAutonomy.test.ts` → "exposes recovery as an explicit endpoint") is **stale**, not a code defect: the `/recovery` contract was deliberately tightened to return `409` unless the kernel is quiescent, and this single test still asserts the old `200`. It should be reconciled before the suite is called fully green.
-- `npm run build`: produces the Vite client and the esbuild CJS server bundle.
-- `npm run verify-ledger`: passes on the live ledger.
-
-The test surface covers the security-relevant paths specifically: ledger tamper cases, capability scoping and pre-dispatch grants, browser origin drift, L2 approval continuation, non-circular memory evidence, sealed canaries, authenticated snapshot recovery, signed release + supervised rollback, session revocation, and loopback request checks.
-
----
-
-## 15. Honest limitations and boundaries
-
-A credible analysis states what the system does **not** do; the runtime capability report reflects these as `unavailable`/`blocked` rather than simulating them:
-
-- **Single trusted process, single tenant.** Exactly one process may own a `.agent-kernel` directory; there is no multi-process coordination and no per-user data partitioning or SSO/OIDC.
-- **Reference kernel is TypeScript.** A compiled/Rust kernel with OS-level isolation and authenticated IPC is a migration target, not a current fact; the ledger verifier is its first concrete artifact.
-- **Sandbox depends on Docker.** Without a container runtime, verification runs on the trusted host (reported honestly). Allowlists and capability tokens bound blast radius but are not isolation.
-- **Vault is platform-native but only Windows DPAPI is verified.** The macOS Keychain and Linux Secret Service adapters are implemented and platform-gated but validated only by construction/unit tests, not on their own OSes.
-- **Sources are read-only and allowlisted.** There is deliberately no general web search, crawling, redirect following, desktop control, email, or OAuth connectors.
-- **"Verified" ≠ "true."** Citation grounding proves a quote is a faithful excerpt of a captured source, not that the source is correct.
-- **The 1B core model is advisory and weak at injection classification** (see §9); it never holds allow/deny authority.
-
----
-
-## 16. Where Provenance sits
-
-| System | Layer | Primary mechanism | Objective |
-| --- | --- | --- | --- |
-| **Provenance** | Application control plane (userspace) | Evidence-gated kernel, hash-chained ledger, single-use capability grants, deterministic citation grounding | Make an agent's actions *authorized, bounded, and provable* rather than *trusted* |
-| Model-alignment guardrails | Prompt / model | Training, system prompts, RLHF | Discourage unsafe outputs (fragile to jailbreaks/injection) |
-| Kernel LSM enforcement (e.g. eBPF-LSM) | Kernel space | Syscall-time allow/deny hooks | Real-time OS-level action prevention |
-| Provenance-graph auditing (e.g. whole-system provenance) | Kernel space | System-wide data-lineage capture | Forensic reconstruction of data flow |
-
-Provenance occupies the **application/agent** tier: it does not replace OS-level enforcement, and it does not pretend to. Its contribution is a *deterministic authority-and-evidence substrate for a single local agent* — every action gated by a typed policy and a one-use capability, and every outcome anchored to a tamper-evident ledger and, where applicable, to exact source excerpts.
-
----
-
-## 17. Conclusion
-
-The core claim Provenance can defend, and that a reader can confirm by opening the source, is narrow and strong: **an autonomous agent whose every consequential action is authorized by deterministic policy, executed under a single-use hash-bound capability, and recorded in an independently verifiable ledger — with model output confined to *proposing*, never to granting authority or defining "done."** The verified-report and recurring-research layers extend that to *evidence*: a published claim is a checkable excerpt of an authenticated source, not model prose.
-
-Its honesty about limits — reporting unavailable features rather than faking them, demoting its own local model when it proved unreliable, and marking one stale test rather than rounding the suite up to green — is not incidental. It is the same property that makes the system's stronger claims trustworthy.
+It is still a release candidate, not an externally accepted product. Completion requires all local and remote gates to pass on one immutable candidate, followed by independent security review and a bounded pilot whose evidence and sign-offs are recorded in [`Prd_Dev/external-security-audit-and-pilot-runbook.md`](./Prd_Dev/external-security-audit-and-pilot-runbook.md).

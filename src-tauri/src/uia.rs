@@ -1,14 +1,20 @@
 use crate::contracts::{ActionEnvelope, AllowedApplication, DesktopAction};
 use axum::http::StatusCode;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(8);
+const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_millis(750);
+const MUTATION_OBSERVATION_INTERVAL: Duration = Duration::from_millis(10);
+const REQUEST_QUEUE_CAPACITY: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopActionOutput {
@@ -86,21 +92,138 @@ impl DesktopExecutionError {
 
 pub trait DesktopExecutor: Send + Sync {
     fn allowed_app_ids(&self) -> Vec<String>;
+    fn is_healthy(&self) -> bool {
+        true
+    }
     fn execute(
         &self,
         envelope: ActionEnvelope,
     ) -> Result<DesktopActionOutput, DesktopExecutionError>;
 }
 
-struct WorkerRequest {
-    envelope: ActionEnvelope,
-    response: mpsc::SyncSender<Result<DesktopActionOutput, DesktopExecutionError>>,
+enum WorkerRequest {
+    Execute {
+        envelope: ActionEnvelope,
+        authority: RequestAuthority,
+        response: mpsc::SyncSender<Result<DesktopActionOutput, DesktopExecutionError>>,
+    },
+    Probe {
+        authority: RequestAuthority,
+        response: mpsc::SyncSender<Result<(), DesktopExecutionError>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestAuthority {
+    deadline: Instant,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct WorkerState {
+    healthy: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    heartbeat: Arc<AtomicU64>,
+    epoch: Instant,
+}
+
+impl WorkerState {
+    fn new() -> Self {
+        Self {
+            healthy: Arc::new(AtomicBool::new(true)),
+            generation: Arc::new(AtomicU64::new(1)),
+            heartbeat: Arc::new(AtomicU64::new(0)),
+            epoch: Instant::now(),
+        }
+    }
+
+    fn now_tick(&self) -> u64 {
+        self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn record_heartbeat(&self) {
+        self.heartbeat.store(self.now_tick(), Ordering::Release);
+    }
+
+    fn heartbeat_age(&self) -> Duration {
+        let age = self
+            .now_tick()
+            .saturating_sub(self.heartbeat.load(Ordering::Acquire));
+        Duration::from_nanos(age)
+    }
+
+    fn is_current(&self, authority: RequestAuthority) -> bool {
+        self.healthy.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire) == authority.generation
+            && Instant::now() < authority.deadline
+    }
+
+    fn check(&self, authority: RequestAuthority) -> Result<(), DesktopExecutionError> {
+        if !self.healthy.load(Ordering::Acquire)
+            || self.generation.load(Ordering::Acquire) != authority.generation
+        {
+            return Err(DesktopExecutionError::Unavailable);
+        }
+        if Instant::now() >= authority.deadline {
+            return Err(DesktopExecutionError::Timeout);
+        }
+        Ok(())
+    }
+
+    fn mark_unhealthy(&self) {
+        if self.healthy.swap(false, Ordering::AcqRel) {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+struct WorkerLifecycle {
+    state: WorkerState,
+}
+
+impl Drop for WorkerLifecycle {
+    fn drop(&mut self) {
+        self.state.mark_unhealthy();
+    }
+}
+
+#[derive(Clone)]
+struct ExecutionGuard {
+    authority: RequestAuthority,
+    state: WorkerState,
+}
+
+impl ExecutionGuard {
+    fn check(&self) -> Result<(), DesktopExecutionError> {
+        self.state.check(self.authority)
+    }
+
+    fn observation_deadline(&self) -> Instant {
+        std::cmp::min(
+            self.authority.deadline,
+            Instant::now() + MUTATION_OBSERVATION_TIMEOUT,
+        )
+    }
+}
+
+fn run_authorized<T>(
+    state: &WorkerState,
+    authority: RequestAuthority,
+    operation: impl FnOnce(&ExecutionGuard) -> Result<T, DesktopExecutionError>,
+) -> Result<T, DesktopExecutionError> {
+    let guard = ExecutionGuard {
+        authority,
+        state: state.clone(),
+    };
+    guard.check()?;
+    operation(&guard)
 }
 
 pub struct UiaBroker {
     allowed_app_ids: Vec<String>,
-    sender: mpsc::Sender<WorkerRequest>,
-    healthy: AtomicBool,
+    sender: mpsc::SyncSender<WorkerRequest>,
+    state: WorkerState,
+    heartbeat_stale_after: Duration,
 }
 
 impl UiaBroker {
@@ -111,56 +234,111 @@ impl UiaBroker {
             .iter()
             .map(|app| app.app_id.clone())
             .collect::<Vec<_>>();
-        let (sender, receiver) = mpsc::channel::<WorkerRequest>();
+        let (sender, receiver) = mpsc::sync_channel::<WorkerRequest>(REQUEST_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let state = WorkerState::new();
+        state.record_heartbeat();
+        let worker_state = state.clone();
         std::thread::Builder::new()
             .name("provenance-uia-mta".into())
-            .spawn(move || worker_main(allowed_apps, receiver, ready_sender))
+            .spawn(move || worker_main(allowed_apps, receiver, ready_sender, worker_state))
             .map_err(|_| DesktopExecutionError::Unavailable)?;
         ready_receiver
             .recv_timeout(Duration::from_secs(3))
             .map_err(|_| DesktopExecutionError::Unavailable)??;
-        Ok(Arc::new(Self {
+        let broker = Arc::new(Self {
             allowed_app_ids,
             sender,
-            healthy: AtomicBool::new(true),
-        }))
+            state,
+            heartbeat_stale_after: HEARTBEAT_STALE_AFTER,
+        });
+        if !broker.startup_probe(STARTUP_PROBE_TIMEOUT) {
+            return Err(DesktopExecutionError::Unavailable);
+        }
+        Ok(broker)
     }
 
     pub fn is_healthy(&self) -> bool {
-        self.healthy.load(Ordering::Acquire)
+        if !self.state.healthy.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.state.heartbeat_age() > self.heartbeat_stale_after {
+            self.mark_unhealthy();
+            return false;
+        }
+        true
     }
-}
 
-impl DesktopExecutor for UiaBroker {
-    fn allowed_app_ids(&self) -> Vec<String> {
-        self.allowed_app_ids.clone()
+    fn startup_probe(&self, timeout: Duration) -> bool {
+        if !self.is_healthy() {
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        let authority = RequestAuthority {
+            deadline,
+            generation: self.state.generation.load(Ordering::Acquire),
+        };
+        let (response, receiver) = mpsc::sync_channel(1);
+        if self
+            .send_request(WorkerRequest::Probe {
+                authority,
+                response,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) | Err(_) => {
+                self.mark_unhealthy();
+                false
+            }
+        }
     }
 
-    fn execute(
+    fn send_request(&self, request: WorkerRequest) -> Result<(), DesktopExecutionError> {
+        match self.sender.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(DesktopExecutionError::Timeout),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.mark_unhealthy();
+                Err(DesktopExecutionError::Unavailable)
+            }
+        }
+    }
+
+    fn mark_unhealthy(&self) {
+        self.state.mark_unhealthy();
+    }
+
+    fn execute_with_timeout(
         &self,
         envelope: ActionEnvelope,
+        timeout: Duration,
     ) -> Result<DesktopActionOutput, DesktopExecutionError> {
+        let mutation = envelope.action.is_mutation();
+        let deadline = Instant::now() + timeout;
         if !self.is_healthy() {
             return Err(DesktopExecutionError::Unavailable);
         }
-        let mutation = envelope.action.is_mutation();
-        let timeout = match &envelope.action {
-            DesktopAction::Discover { .. } => DISCOVER_TIMEOUT,
-            DesktopAction::Inspect { .. } => INSPECT_TIMEOUT,
-            DesktopAction::Click { .. } | DesktopAction::Type { .. } => WRITE_TIMEOUT,
+        let authority = RequestAuthority {
+            deadline,
+            generation: self.state.generation.load(Ordering::Acquire),
         };
         let (response, receiver) = mpsc::sync_channel(1);
-        self.sender
-            .send(WorkerRequest { envelope, response })
-            .map_err(|_| DesktopExecutionError::Unavailable)?;
-        match receiver.recv_timeout(timeout) {
+        self.send_request(WorkerRequest::Execute {
+            envelope,
+            authority,
+            response,
+        })?;
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(result) => result,
             Err(_) => {
                 // A hung provider cannot be cancelled safely in-process. This
                 // broker is permanently failed closed instead of accumulating
                 // more calls on a compromised COM apartment.
-                self.healthy.store(false, Ordering::Release);
+                self.mark_unhealthy();
                 Err(if mutation {
                     DesktopExecutionError::OutcomeUncertain
                 } else {
@@ -171,14 +349,41 @@ impl DesktopExecutor for UiaBroker {
     }
 }
 
+impl DesktopExecutor for UiaBroker {
+    fn allowed_app_ids(&self) -> Vec<String> {
+        self.allowed_app_ids.clone()
+    }
+
+    fn is_healthy(&self) -> bool {
+        UiaBroker::is_healthy(self)
+    }
+
+    fn execute(
+        &self,
+        envelope: ActionEnvelope,
+    ) -> Result<DesktopActionOutput, DesktopExecutionError> {
+        let timeout = match &envelope.action {
+            DesktopAction::Discover { .. } => DISCOVER_TIMEOUT,
+            DesktopAction::Inspect { .. } => INSPECT_TIMEOUT,
+            DesktopAction::Click { .. } | DesktopAction::Type { .. } => WRITE_TIMEOUT,
+        };
+        self.execute_with_timeout(envelope, timeout)
+    }
+}
+
 #[cfg(windows)]
 fn worker_main(
     allowed_apps: Vec<AllowedApplication>,
     receiver: mpsc::Receiver<WorkerRequest>,
     ready: mpsc::SyncSender<Result<(), DesktopExecutionError>>,
+    state: WorkerState,
 ) {
+    let _lifecycle = WorkerLifecycle {
+        state: state.clone(),
+    };
     let mut automation = match windows_worker::WindowsAutomation::new(allowed_apps) {
         Ok(value) => {
+            state.record_heartbeat();
             let _ = ready.send(Ok(()));
             value
         }
@@ -187,9 +392,36 @@ fn worker_main(
             return;
         }
     };
-    for request in receiver {
-        let result = automation.execute(request.envelope);
-        let _ = request.response.send(result);
+    loop {
+        let request = match receiver.recv_timeout(HEARTBEAT_INTERVAL) {
+            Ok(request) => request,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                state.record_heartbeat();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        state.record_heartbeat();
+        match request {
+            WorkerRequest::Execute {
+                envelope,
+                authority,
+                response,
+            } => {
+                let result = run_authorized(&state, authority, |guard| {
+                    automation.execute(envelope, guard)
+                });
+                let _ = response.send(result);
+            }
+            WorkerRequest::Probe {
+                authority,
+                response,
+            } => {
+                let result = run_authorized(&state, authority, |guard| automation.probe(guard));
+                let _ = response.send(result);
+            }
+        }
+        state.record_heartbeat();
     }
 }
 
@@ -198,7 +430,9 @@ fn worker_main(
     _allowed_apps: Vec<AllowedApplication>,
     _receiver: mpsc::Receiver<WorkerRequest>,
     ready: mpsc::SyncSender<Result<(), DesktopExecutionError>>,
+    state: WorkerState,
 ) {
+    state.mark_unhealthy();
     let _ = ready.send(Err(DesktopExecutionError::Unavailable));
 }
 
@@ -343,13 +577,15 @@ mod windows_worker {
     }
 
     pub(super) struct WindowsAutomation {
-        _com: ComApartment,
         automation: IUIAutomation,
         walker: IUIAutomationTreeWalker,
         allowed: HashMap<String, AllowedApplication>,
         windows: HashMap<String, WindowTarget>,
         trees: HashMap<String, BuiltTree>,
         node_salt: [u8; 32],
+        // Keep the apartment guard last so every cached COM interface is
+        // released before CoUninitialize runs.
+        _com: ComApartment,
     }
 
     impl WindowsAutomation {
@@ -366,7 +602,6 @@ mod windows_worker {
             let mut node_salt = [0_u8; 32];
             OsRng.fill_bytes(&mut node_salt);
             Ok(Self {
-                _com: com,
                 automation,
                 walker,
                 allowed: allowed_apps
@@ -376,15 +611,32 @@ mod windows_worker {
                 windows: HashMap::new(),
                 trees: HashMap::new(),
                 node_salt,
+                _com: com,
             })
+        }
+
+        pub(super) fn probe(&self, guard: &ExecutionGuard) -> Result<(), DesktopExecutionError> {
+            guard.check()?;
+            let root = unsafe { self.automation.GetRootElement() }
+                .map_err(|_| DesktopExecutionError::Unavailable)?;
+            guard.check()?;
+            unsafe { root.CurrentControlType() }.map_err(|_| DesktopExecutionError::Unavailable)?;
+            guard.check()?;
+            let _ = unsafe { self.walker.GetFirstChildElement(&root) }
+                .map_err(|_| DesktopExecutionError::Unavailable)?;
+            guard.check()?;
+            Ok(())
         }
 
         pub(super) fn execute(
             &mut self,
             envelope: ActionEnvelope,
+            guard: &ExecutionGuard,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
+            guard.check()?;
+            let mutation = envelope.action.is_mutation();
             let payload = envelope.payload_text;
-            match envelope.action {
+            let result = match envelope.action {
                 DesktopAction::Discover { app_id } => self.discover(&app_id),
                 DesktopAction::Inspect {
                     app_id,
@@ -396,7 +648,7 @@ mod windows_worker {
                     window_id,
                     tree_revision,
                     node_id,
-                } => self.click(&app_id, &window_id, &tree_revision, &node_id),
+                } => self.click(&app_id, &window_id, &tree_revision, &node_id, guard),
                 DesktopAction::Type {
                     app_id,
                     window_id,
@@ -411,7 +663,21 @@ mod windows_worker {
                     payload
                         .as_deref()
                         .ok_or(DesktopExecutionError::FailedClosed)?,
+                    guard,
                 ),
+            };
+            match result {
+                Ok(output) => {
+                    guard.check().map_err(|_| {
+                        if mutation {
+                            DesktopExecutionError::OutcomeUncertain
+                        } else {
+                            DesktopExecutionError::Timeout
+                        }
+                    })?;
+                    Ok(output)
+                }
+                Err(error) => Err(error),
             }
         }
 
@@ -526,6 +792,7 @@ mod windows_worker {
             window_id: &str,
             tree_revision: &str,
             node_id: &str,
+            guard: &ExecutionGuard,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let (target, element, path) =
                 self.resolve_authoritative_node(app_id, window_id, tree_revision, node_id)?;
@@ -547,17 +814,27 @@ mod windows_worker {
             }
             self.revalidate_node_identity(&element, &path, node_id)?;
             self.revalidate_target_identity(&target)?;
+            guard.check()?;
             let independently_verified = if let Some(pattern) = toggle_pattern {
                 let before = unsafe { pattern.CurrentToggleState() }
                     .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                guard.check()?;
                 unsafe { pattern.Toggle() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-                let after = unsafe { pattern.CurrentToggleState() }
-                    .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-                if after == before {
-                    return Err(DesktopExecutionError::OutcomeUncertain);
+                let deadline = guard.observation_deadline();
+                loop {
+                    let after = unsafe { pattern.CurrentToggleState() }
+                        .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                    if after != before {
+                        break;
+                    }
+                    if Instant::now() >= deadline || !guard.state.is_current(guard.authority) {
+                        return Err(DesktopExecutionError::OutcomeUncertain);
+                    }
+                    std::thread::sleep(MUTATION_OBSERVATION_INTERVAL);
                 }
                 true
             } else if let Some(pattern) = invoke_pattern {
+                guard.check()?;
                 unsafe { pattern.Invoke() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
                 false
             } else {
@@ -568,6 +845,7 @@ mod windows_worker {
                 tree_revision,
                 "desktop.click",
                 independently_verified,
+                guard,
             )
         }
 
@@ -578,6 +856,7 @@ mod windows_worker {
             tree_revision: &str,
             node_id: &str,
             payload: &str,
+            guard: &ExecutionGuard,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let (target, element, path) =
                 self.resolve_authoritative_node(app_id, window_id, tree_revision, node_id)?;
@@ -594,6 +873,7 @@ mod windows_worker {
             }
             self.revalidate_node_identity(&element, &path, node_id)?;
             self.revalidate_target_identity(&target)?;
+            guard.check()?;
             unsafe { element.SetFocus() }.map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             let element = self
                 .reacquire_node_at_path(&target, &path, node_id)
@@ -617,16 +897,32 @@ mod windows_worker {
             {
                 return Err(DesktopExecutionError::OutcomeUncertain);
             }
+            guard
+                .check()
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             let value = BSTR::from(payload);
             unsafe { pattern.SetValue(&value) }
                 .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-            let actual = unsafe { pattern.CurrentValue() }
-                .map(|value| value.to_string())
-                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
-            if !self.value_matches(payload, &actual) {
-                return Err(DesktopExecutionError::OutcomeUncertain);
+            let deadline = guard.observation_deadline();
+            loop {
+                let actual = unsafe { pattern.CurrentValue() }
+                    .map(|value| value.to_string())
+                    .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
+                if self.value_matches(payload, &actual) {
+                    break;
+                }
+                if Instant::now() >= deadline || !guard.state.is_current(guard.authority) {
+                    return Err(DesktopExecutionError::OutcomeUncertain);
+                }
+                std::thread::sleep(MUTATION_OBSERVATION_INTERVAL);
             }
-            self.verify_mutation_after_side_effect(target, tree_revision, "desktop.type", true)
+            self.verify_mutation_after_side_effect(
+                target,
+                tree_revision,
+                "desktop.type",
+                true,
+                guard,
+            )
         }
 
         fn value_matches(&self, expected: &str, actual: &str) -> bool {
@@ -646,10 +942,16 @@ mod windows_worker {
             previous_revision: &str,
             action: &'static str,
             independently_verified: bool,
+            guard: &ExecutionGuard,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
             let window_id = target.window_id.clone();
-            match self.verify_after_write(target, previous_revision, action, independently_verified)
-            {
+            match self.verify_after_write(
+                target,
+                previous_revision,
+                action,
+                independently_verified,
+                guard,
+            ) {
                 Ok(output) => Ok(output),
                 Err(_) => {
                     self.trees.remove(&window_id);
@@ -664,8 +966,15 @@ mod windows_worker {
             previous_revision: &str,
             action: &'static str,
             independently_verified: bool,
+            guard: &ExecutionGuard,
         ) -> Result<DesktopActionOutput, DesktopExecutionError> {
+            guard
+                .check()
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             let current = self.build_tree(&target)?;
+            guard
+                .check()
+                .map_err(|_| DesktopExecutionError::OutcomeUncertain)?;
             if !independently_verified && current.revision == previous_revision {
                 return Err(DesktopExecutionError::OutcomeUncertain);
             }
@@ -1128,13 +1437,275 @@ mod tests {
         }
     }
 
+    fn test_broker(heartbeat_stale_after: Duration) -> (UiaBroker, mpsc::Receiver<WorkerRequest>) {
+        let (sender, receiver) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
+        let state = WorkerState::new();
+        state.record_heartbeat();
+        (
+            UiaBroker {
+                allowed_app_ids: Vec::new(),
+                sender,
+                state,
+                heartbeat_stale_after,
+            },
+            receiver,
+        )
+    }
+
+    fn test_mutation(payload: &str) -> ActionEnvelope {
+        ActionEnvelope {
+            schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+            action: DesktopAction::Type {
+                app_id: "fixture".into(),
+                window_id: "window".into(),
+                tree_revision: "revision".into(),
+                node_id: "node".into(),
+                payload_hash: "hash".into(),
+            },
+            payload_text: Some(payload.into()),
+        }
+    }
+
+    #[test]
+    fn health_reads_do_not_enqueue_com_probes() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+
+        for _ in 0..128 {
+            assert!(broker.is_healthy());
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn stale_heartbeat_failure_is_sticky() {
+        let (broker, _receiver) = test_broker(Duration::ZERO);
+        while broker.state.heartbeat_age().is_zero() {
+            std::hint::spin_loop();
+        }
+
+        assert!(!broker.is_healthy());
+        broker.state.record_heartbeat();
+        assert!(!broker.is_healthy());
+        assert!(!broker.state.healthy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_startup_probe_is_sticky() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+        let worker = std::thread::spawn(move || {
+            let WorkerRequest::Probe { response, .. } = receiver.recv().unwrap() else {
+                panic!("expected a startup probe");
+            };
+            response
+                .send(Err(DesktopExecutionError::Unavailable))
+                .unwrap();
+        });
+
+        assert!(!broker.startup_probe(Duration::from_secs(1)));
+        worker.join().unwrap();
+        assert!(!broker.is_healthy());
+    }
+
+    #[test]
+    fn timed_out_startup_probe_fails_closed() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+        let worker = std::thread::spawn(move || {
+            let WorkerRequest::Probe { response, .. } = receiver.recv().unwrap() else {
+                panic!("expected a startup probe");
+            };
+            std::thread::sleep(Duration::from_millis(30));
+            let _ = response.send(Ok(()));
+        });
+
+        assert!(!broker.startup_probe(Duration::from_millis(1)));
+        assert!(!broker.is_healthy());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn expired_queued_mutation_is_rejected_before_its_side_effect() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+        let authority = RequestAuthority {
+            deadline: Instant::now(),
+            generation: broker.state.generation.load(Ordering::Acquire),
+        };
+        let (response, result_receiver) = mpsc::sync_channel(1);
+        broker
+            .send_request(WorkerRequest::Execute {
+                envelope: ActionEnvelope {
+                    schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                    action: DesktopAction::Type {
+                        app_id: "fixture".into(),
+                        window_id: "window".into(),
+                        tree_revision: "revision".into(),
+                        node_id: "node".into(),
+                        payload_hash: "hash".into(),
+                    },
+                    payload_text: Some("must not be typed".into()),
+                },
+                authority,
+                response,
+            })
+            .unwrap();
+        let side_effects = Arc::new(AtomicU64::new(0));
+        let observed = side_effects.clone();
+        let worker_state = broker.state.clone();
+        let worker = std::thread::spawn(move || {
+            let WorkerRequest::Execute {
+                authority,
+                response,
+                ..
+            } = receiver.recv().unwrap()
+            else {
+                panic!("expected a queued mutation");
+            };
+            let result = run_authorized(&worker_state, authority, |_| {
+                observed.fetch_add(1, Ordering::AcqRel);
+                Ok(DesktopActionOutput {
+                    summary: "unexpected".into(),
+                    content: None,
+                })
+            });
+            response.send(result).unwrap();
+        });
+
+        assert_eq!(
+            result_receiver.recv().unwrap(),
+            Err(DesktopExecutionError::Timeout)
+        );
+        worker.join().unwrap();
+        assert_eq!(side_effects.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queue_full_mutation_is_not_enqueued_or_executed() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+        let authority = RequestAuthority {
+            deadline: Instant::now() + Duration::from_secs(1),
+            generation: broker.state.generation.load(Ordering::Acquire),
+        };
+        let (first_response, _first_result) = mpsc::sync_channel(1);
+        broker
+            .send_request(WorkerRequest::Execute {
+                envelope: test_mutation("first"),
+                authority,
+                response: first_response,
+            })
+            .unwrap();
+
+        assert_eq!(
+            broker.execute_with_timeout(test_mutation("must not be typed"), Duration::from_secs(1)),
+            Err(DesktopExecutionError::Timeout)
+        );
+
+        let WorkerRequest::Execute { envelope, .. } = receiver.recv().unwrap() else {
+            panic!("expected the first queued mutation");
+        };
+        assert_eq!(envelope.payload_text.as_deref(), Some("first"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn timed_out_mutation_invalidates_a_second_queued_mutation() {
+        let (broker, receiver) = test_broker(Duration::from_secs(1));
+        let broker = Arc::new(broker);
+        let worker_state = broker.state.clone();
+        let first_side_effects = Arc::new(AtomicU64::new(0));
+        let second_side_effects = Arc::new(AtomicU64::new(0));
+        let first_observed = Arc::clone(&first_side_effects);
+        let second_observed = Arc::clone(&second_side_effects);
+        let (first_started, first_started_receiver) = mpsc::sync_channel(1);
+        let (release_first, release_first_receiver) = mpsc::sync_channel(1);
+
+        let worker = std::thread::spawn(move || {
+            let WorkerRequest::Execute {
+                authority,
+                response,
+                ..
+            } = receiver.recv().unwrap()
+            else {
+                panic!("expected the first mutation");
+            };
+            let result = run_authorized(&worker_state, authority, |_| {
+                first_observed.fetch_add(1, Ordering::AcqRel);
+                first_started.send(()).unwrap();
+                release_first_receiver.recv().unwrap();
+                Ok(DesktopActionOutput {
+                    summary: "first completed after its caller timed out".into(),
+                    content: None,
+                })
+            });
+            let _ = response.send(result);
+
+            let WorkerRequest::Execute {
+                authority,
+                response,
+                ..
+            } = receiver.recv().unwrap()
+            else {
+                panic!("expected the second queued mutation");
+            };
+            let result = run_authorized(&worker_state, authority, |_| {
+                second_observed.fetch_add(1, Ordering::AcqRel);
+                Ok(DesktopActionOutput {
+                    summary: "second mutation unexpectedly executed".into(),
+                    content: None,
+                })
+            });
+            response.send(result).unwrap();
+        });
+
+        let first_broker = Arc::clone(&broker);
+        let first = std::thread::spawn(move || {
+            first_broker.execute_with_timeout(
+                test_mutation("first may have executed"),
+                Duration::from_millis(100),
+            )
+        });
+        first_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let second_authority = RequestAuthority {
+            deadline: Instant::now() + Duration::from_secs(1),
+            generation: broker.state.generation.load(Ordering::Acquire),
+        };
+        let (second_response, second_result) = mpsc::sync_channel(1);
+        broker
+            .send_request(WorkerRequest::Execute {
+                envelope: test_mutation("must not be typed"),
+                authority: second_authority,
+                response: second_response,
+            })
+            .unwrap();
+
+        assert_eq!(
+            first.join().unwrap(),
+            Err(DesktopExecutionError::OutcomeUncertain)
+        );
+        assert!(!broker.is_healthy());
+        release_first.send(()).unwrap();
+        assert_eq!(
+            second_result.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(DesktopExecutionError::Unavailable)
+        );
+        worker.join().unwrap();
+        assert_eq!(first_side_effects.load(Ordering::Acquire), 1);
+        assert_eq!(second_side_effects.load(Ordering::Acquire), 0);
+    }
+
     #[cfg(windows)]
     mod live_windows_acceptance {
         use super::*;
         use serde_json::Value;
         use sha2::{Digest, Sha256};
         use std::ffi::c_void;
-        use std::path::PathBuf;
         use std::thread::JoinHandle;
         use windows::core::{w, PCWSTR};
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -1295,9 +1866,10 @@ mod tests {
             let executable_path = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
             let broker = UiaBroker::start(vec![AllowedApplication {
                 app_id: APP_ID.into(),
-                executable_path: PathBuf::from(executable_path),
+                executable_path,
             }])
             .expect("UI Automation broker did not start");
+            assert!(broker.is_healthy(), "UI Automation liveness probe failed");
 
             let discovered = content(
                 broker

@@ -29,9 +29,20 @@ describe('persistent capability grants', () => {
     expect(createCapabilityGrant(intent, grantInput).status).toBe('active');
     expect(() => createCapabilityGrant({ ...intent, riskLevel: 'L2' }, grantInput))
       .toThrow('approval');
-    expect(createCapabilityGrant({ ...intent, riskLevel: 'L2' }, {
+    expect(() => createCapabilityGrant({ ...intent, riskLevel: 'L2' }, {
+      ...grantInput, approvalId: 'approval_1',
+    })).toThrow('exact approval');
+    const approvedIntent = {
+      ...intent,
+      riskLevel: 'L2' as const,
+      authority: { kind: 'approval' as const, referenceId: 'approval_1' },
+    };
+    expect(createCapabilityGrant(approvedIntent, {
       ...grantInput, approvalId: 'approval_1',
     }).approvalId).toBe('approval_1');
+    expect(() => createCapabilityGrant(approvedIntent, {
+      ...grantInput, approvalId: 'approval_other',
+    })).toThrow('exact approval');
   });
 
   it('consumes once and rejects reuse, mismatch, expiry, and excessive operations', () => {
@@ -49,9 +60,31 @@ describe('persistent capability grants', () => {
       .toBe('intent_mismatch');
     expect(validateCapabilityGrant(grant, intent, browserWorker, '2026-07-12T00:13:00.000Z').reasonCode)
       .toBe('grant_expired');
+    expect(validateCapabilityGrant(grant, intent, browserWorker, '2026-07-12T00:01:59.999Z').reasonCode)
+      .toBe('grant_not_yet_valid');
     expect(consumeCapabilityGrant(grant, intent, browserWorker, {
       now: '2026-07-12T00:03:00.000Z', operationsUsed: 4,
     }).reasonCode).toBe('operation_budget_exceeded');
+  });
+
+  it('rejects a persisted L2/L3 grant that is not bound to the exact intent approval', () => {
+    const intent = browserIntent({
+      riskLevel: 'L2',
+      action: {
+        type: 'browser.navigate',
+        origin: 'https://example.com',
+        url: 'https://example.com/account',
+      },
+      authority: { kind: 'approval', referenceId: 'approval_1' },
+    });
+    const grant = createCapabilityGrant(intent, { ...grantInput, approvalId: 'approval_1' });
+
+    expect(validateCapabilityGrant(
+      { ...grant, approvalId: 'approval_other' },
+      intent,
+      browserWorker,
+      '2026-07-12T00:03:00.000Z',
+    ).reasonCode).toBe('approval_mismatch');
   });
 
   it('fails closed for revoked grants and workers no longer available', () => {

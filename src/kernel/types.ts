@@ -286,6 +286,8 @@ export interface ApprovalRecord {
   taskId: string;
   status: ApprovalStatus;
   requestedAction: string;
+  /** Privacy-safe commitment to the exact intent authority this request covers. */
+  authorityBindingHash?: string;
   riskLevel: RiskLevel;
   reason: string;
   createdAt: string;

@@ -19,12 +19,28 @@ import {
   validateUpdaterPublicKey,
   verifyUpdaterSignature,
 } from './updater-signature.mjs';
+import {
+  validateApplicationLicenseContract,
+} from './license-policy.mjs';
+import { sanitizedBuildEnvironment } from './build-environment.mjs';
+import {
+  createRuntimeResourceManifest,
+  writeRuntimeResourceManifest,
+} from './runtime-resource-manifest.mjs';
+import { assertRuntimeResourceManifestDigest } from './release-resource-contract.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tauriRoot = path.join(repositoryRoot, 'src-tauri');
 const baseConfigPath = path.join(tauriRoot, 'tauri.conf.json');
 const releaseConfigPath = path.join(tauriRoot, 'tauri.release.conf.json');
 const tauriCliPath = path.join(repositoryRoot, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
+const npmCliPath = path.join(
+  path.dirname(process.execPath),
+  'node_modules',
+  'npm',
+  'bin',
+  'npm-cli.js',
+);
 const signCommandPath = path.join(repositoryRoot, 'scripts', 'windows-sign-command.ps1');
 const payloadManifestName = 'manifest.json';
 const payloadKind = 'provenance-windows-unsigned-payload';
@@ -41,6 +57,7 @@ const maxPayloadFileBytes = 256 * 1024 * 1024;
 const maxPayloadBytes = 1024 * 1024 * 1024;
 
 const requiredResourceDestinations = new Map([
+  ['LICENSE', 'application-license'],
   ['dist/server.cjs', 'application-server'],
   ['dist/index.html', 'application-ui'],
   ['dist/THIRD_PARTY_NOTICES.txt', 'third-party-notices'],
@@ -254,14 +271,6 @@ function assertSameStringSet(actual, expected, label) {
   }
 }
 
-function sanitizedBuildEnvironment(environment) {
-  const blocked = /(?:TAURI_SIGNING_PRIVATE_KEY|WINDOWS_PFX|CERTIFICATE|PFX_PASSWORD)/i;
-  return Object.fromEntries(
-    Object.entries(environment).filter(([name]) =>
-      !blocked.test(name) && name.toUpperCase() !== 'PSMODULEPATH'),
-  );
-}
-
 function run(command, args, environment = process.env) {
   execFileSync(command, args, {
     cwd: repositoryRoot,
@@ -352,6 +361,38 @@ function releaseVersion() {
     throw new Error(`Release version mismatch: ${JSON.stringify(versions)}.`);
   }
   return configVersion;
+}
+
+function resolveApplicationLicense() {
+  const packageJson = readBoundedJson(
+    path.join(repositoryRoot, 'package.json'),
+    'package.json',
+    4 * 1024 * 1024,
+  );
+  const packageLock = readBoundedJson(
+    path.join(repositoryRoot, 'package-lock.json'),
+    'package-lock.json',
+    64 * 1024 * 1024,
+  );
+  const cargoManifest = readFileSync(path.join(tauriRoot, 'Cargo.toml'), 'utf8');
+  const cargoPackage = cargoManifest.match(
+    /^\[package\][^\S\r\n]*\r?\n([\s\S]*?)(?=^\[[^\]]+\][^\S\r\n]*$)/m,
+  )?.[1] ?? '';
+  const cargoLicense = cargoPackage.match(/^license\s*=\s*"([^"]+)"\s*$/m)?.[1];
+  const licensePath = path.join(repositoryRoot, 'LICENSE');
+  assertRegularFile(licensePath, 'Application license', 1024 * 1024);
+  const licenseText = readFileSync(licensePath, 'utf8').replaceAll('\r\n', '\n');
+  const identifier = validateApplicationLicenseContract({
+    packageLicense: packageJson.license,
+    packageLockLicense: packageLock.packages?.['']?.license,
+    cargoLicense,
+    licenseText,
+  });
+  return {
+    identifier,
+    path: realpathSync(licensePath),
+    sha256: digestFile(licensePath),
+  };
 }
 
 function resolveTauriCliContract() {
@@ -450,6 +491,7 @@ function createReleasePlan() {
   );
   const sandboxImage = validateSandboxImage(requiredEnvironment('PROVENANCE_SANDBOX_IMAGE'));
   const version = releaseVersion();
+  const applicationLicense = resolveApplicationLicense();
   const tauriCli = resolveTauriCliContract();
   const cargoLockPath = path.join(tauriRoot, 'Cargo.lock');
   assertRegularFile(cargoLockPath, 'Cargo.lock', 16 * 1024 * 1024);
@@ -457,6 +499,7 @@ function createReleasePlan() {
   const cargoAbout = declaredCargoAboutPins();
   return {
     version,
+    applicationLicense,
     node,
     cargoAbout,
     tauriCli,
@@ -502,6 +545,9 @@ function publicPlan(plan) {
     nodeResource: 'node/node.exe',
     nodeLicenseResource: 'node/LICENSE',
     nodeLicenseSha256: plan.node.licenseSha256,
+    applicationLicense: plan.applicationLicense.identifier,
+    applicationLicenseResource: 'LICENSE',
+    applicationLicenseSha256: plan.applicationLicense.sha256,
     cargoAboutSha256: plan.cargoAbout.sha256,
     cargoAboutVersion: plan.cargoAbout.version,
     tauriCliVersion: plan.tauriCli.version,
@@ -568,9 +614,16 @@ function findNsisInstaller(target, version) {
   return candidates[0];
 }
 
-function policyForPlan(plan, rustThirdPartyNoticesSha256) {
+function policyForPlan(
+  plan,
+  rustThirdPartyNoticesSha256,
+  runtimeResourceManifestSha256,
+) {
   if (!isSha256(rustThirdPartyNoticesSha256)) {
     throw new Error('Rust third-party notice inventory must have an exact SHA-256 binding.');
+  }
+  if (!isSha256(runtimeResourceManifestSha256)) {
+    throw new Error('Runtime resources must have an exact embedded manifest binding.');
   }
   return {
     updaterEndpoint: plan.updaterEndpoint,
@@ -580,12 +633,15 @@ function policyForPlan(plan, rustThirdPartyNoticesSha256) {
     nodeVersion: plan.node.version,
     nodeArchitecture: plan.node.architecture,
     nodeLicenseSha256: plan.node.licenseSha256,
+    applicationLicense: plan.applicationLicense.identifier,
+    applicationLicenseSha256: plan.applicationLicense.sha256,
     cargoAboutSha256: plan.cargoAbout.sha256,
     cargoAboutVersion: plan.cargoAbout.version,
     tauriCliVersion: plan.tauriCli.version,
     packageLockSha256: plan.tauriCli.packageLockSha256,
     cargoLockSha256: plan.cargoLockSha256,
     rustThirdPartyNoticesSha256,
+    runtimeResourceManifestSha256,
     sandboxImage: plan.sandboxImage,
   };
 }
@@ -598,6 +654,11 @@ function discoverResourceSpecifications(plan) {
     throw new Error('Production dist/assets must contain at least one built asset.');
   }
   const specifications = [
+    {
+      source: plan.applicationLicense.path,
+      destination: 'LICENSE',
+      role: 'application-license',
+    },
     {
       source: path.join(distDirectory, 'server.cjs'),
       destination: 'dist/server.cjs',
@@ -689,7 +750,12 @@ function stageBundleResources(verified, target) {
   return staged;
 }
 
-function stageUnsignedPayload(plan, nativeBinary, payload) {
+function stageUnsignedPayload(
+  plan,
+  nativeBinary,
+  payload,
+  expectedRuntimeResourceManifestSha256,
+) {
   if (existsSync(payload)) throw new Error('The unsigned payload directory already exists.');
   assertRegularFile(nativeBinary, 'Unsigned native executable');
   mkdirSync(payload, { recursive: false });
@@ -717,6 +783,12 @@ function stageUnsignedPayload(plan, nativeBinary, payload) {
   const rustNotices = resources.find(
     (resource) => resource.destination === 'dist/RUST_THIRD_PARTY_NOTICES.txt',
   );
+  const runtimeResourceManifest = createRuntimeResourceManifest(resources);
+  assertRuntimeResourceManifestDigest({
+    compiledSha256: expectedRuntimeResourceManifestSha256,
+    currentSha256: runtimeResourceManifest.sha256,
+    phase: 'after the native manifest was compiled',
+  });
   const manifest = {
     schemaVersion: 1,
     kind: payloadKind,
@@ -732,7 +804,7 @@ function stageUnsignedPayload(plan, nativeBinary, payload) {
       },
     },
     resources,
-    policy: policyForPlan(plan, rustNotices?.sha256),
+    policy: policyForPlan(plan, rustNotices?.sha256, runtimeResourceManifest.sha256),
   };
   const manifestPath = path.join(payload, payloadManifestName);
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' });
@@ -837,12 +909,15 @@ function validateUnsignedManifest(value, plan) {
       'nodeVersion',
       'nodeArchitecture',
       'nodeLicenseSha256',
+      'applicationLicense',
+      'applicationLicenseSha256',
       'cargoAboutSha256',
       'cargoAboutVersion',
       'tauriCliVersion',
       'packageLockSha256',
       'cargoLockSha256',
       'rustThirdPartyNoticesSha256',
+      'runtimeResourceManifestSha256',
       'sandboxImage',
     ],
     'Unsigned payload policy',
@@ -850,14 +925,25 @@ function validateUnsignedManifest(value, plan) {
   const rustNotices = value.resources.find(
     (resource) => resource.destination === 'dist/RUST_THIRD_PARTY_NOTICES.txt',
   );
+  const runtimeResourceManifest = createRuntimeResourceManifest(value.resources);
   if (JSON.stringify(value.policy) !==
-      JSON.stringify(policyForPlan(plan, rustNotices?.sha256))) {
+      JSON.stringify(policyForPlan(
+        plan,
+        rustNotices?.sha256,
+        runtimeResourceManifest.sha256,
+      ))) {
     throw new Error('Unsigned payload policy does not match the current production pins.');
   }
   const nodeResource = value.resources.find((resource) => resource.destination === 'node/node.exe');
   const licenseResource = value.resources.find((resource) => resource.destination === 'node/LICENSE');
+  const applicationLicenseResource = value.resources.find(
+    (resource) => resource.destination === 'LICENSE',
+  );
   if (nodeResource.sha256 !== plan.node.sha256 || licenseResource.sha256 !== plan.node.licenseSha256) {
     throw new Error('Unsigned payload runtime resources do not match the current production pins.');
+  }
+  if (applicationLicenseResource.sha256 !== plan.applicationLicense.sha256) {
+    throw new Error('Unsigned payload application license does not match the current production license.');
   }
   return value;
 }
@@ -928,9 +1014,11 @@ function buildUnsignedRelease(plan) {
   if (process.platform !== 'win32') throw new Error('Windows desktop releases must be built on Windows.');
   const target = freshReleaseTarget();
   const buildEnvironment = sanitizedBuildEnvironment(process.env);
-  run('npm.cmd', ['run', 'build'], buildEnvironment);
-  run('npm.cmd', ['run', 'desktop:licenses'], buildEnvironment);
-  run('npm.cmd', [
+  assertRegularFile(npmCliPath, 'Node installation npm CLI', 4 * 1024 * 1024);
+  run(process.execPath, [npmCliPath, 'run', 'build'], buildEnvironment);
+  run(process.execPath, [npmCliPath, 'run', 'desktop:licenses'], buildEnvironment);
+  run(process.execPath, [
+    npmCliPath,
     'run', 'desktop:resource-smoke', '--',
     '--node', plan.node.path,
     '--expected-sha256', plan.node.sha256,
@@ -949,11 +1037,17 @@ function buildUnsignedRelease(plan) {
     }
   }
   if (!existsSync(tauriCliPath)) throw new Error('Install JavaScript dependencies with npm ci before packaging.');
+  const runtimeResourceManifest = writeRuntimeResourceManifest(
+    discoverResourceSpecifications(plan),
+    path.join(target, 'runtime-resource-manifest.json'),
+  );
   const tauriEnvironment = {
     ...buildEnvironment,
     CARGO_TARGET_DIR: target,
     PROVENANCE_PACKAGED_RELEASE: '1',
     PROVENANCE_SANDBOX_IMAGE: plan.sandboxImage,
+    PROVENANCE_RESOURCE_MANIFEST_PATH: runtimeResourceManifest.path,
+    PROVENANCE_RESOURCE_MANIFEST_SHA256: runtimeResourceManifest.sha256,
   };
   run(process.execPath, [
     tauriCliPath,
@@ -969,7 +1063,12 @@ function buildUnsignedRelease(plan) {
   assertRegularFile(native, 'Tauri unsigned native executable');
   verifyUnsignedAuthenticode(native);
   const payload = path.join(target, 'unsigned-payload');
-  stageUnsignedPayload(plan, native, payload);
+  stageUnsignedPayload(
+    plan,
+    native,
+    payload,
+    runtimeResourceManifest.sha256,
+  );
   const verified = verifyUnsignedPayload(payload, plan);
   process.stdout.write(`${JSON.stringify({
     schemaVersion: 1,
@@ -984,6 +1083,10 @@ function buildUnsignedRelease(plan) {
     packageLockSha256: verified.manifest.policy.packageLockSha256,
     rustThirdPartyNoticesSha256:
       verified.manifest.policy.rustThirdPartyNoticesSha256,
+    applicationLicenseSha256:
+      verified.manifest.policy.applicationLicenseSha256,
+    runtimeResourceManifestSha256:
+      verified.manifest.policy.runtimeResourceManifestSha256,
   })}\n`);
 }
 
@@ -1252,6 +1355,15 @@ function bundleSignedNative(plan, payloadInput) {
     throw new Error('Unsigned native executable changed while entering the fresh bundle target.');
   }
   const staged = stageBundleResources(verified, target);
+  const runtimeResourceManifest = writeRuntimeResourceManifest(
+    staged.resources,
+    path.join(target, 'runtime-resource-manifest.json'),
+  );
+  assertRuntimeResourceManifestDigest({
+    compiledSha256: verified.manifest.policy.runtimeResourceManifestSha256,
+    currentSha256: runtimeResourceManifest.sha256,
+    phase: 'while entering the protected bundle target',
+  });
   if (!existsSync(tauriCliPath)) throw new Error('Install JavaScript dependencies with npm ci before packaging.');
 
   const bundleEnvironment = {
@@ -1259,6 +1371,8 @@ function bundleSignedNative(plan, payloadInput) {
     CARGO_TARGET_DIR: target,
     PROVENANCE_PACKAGED_RELEASE: '1',
     PROVENANCE_SANDBOX_IMAGE: plan.sandboxImage,
+    PROVENANCE_RESOURCE_MANIFEST_PATH: runtimeResourceManifest.path,
+    PROVENANCE_RESOURCE_MANIFEST_SHA256: runtimeResourceManifest.sha256,
     PROVENANCE_WINDOWS_CERTIFICATE_THUMBPRINT: certificateThumbprint,
     PROVENANCE_WINDOWS_TIMESTAMP_URL: timestampUrl,
     PROVENANCE_WINDOWS_SIGN_NATIVE_PATH: targetNative,
@@ -1309,6 +1423,9 @@ function bundleSignedNative(plan, payloadInput) {
       unsignedNativeSha256: verified.manifest.native.sha256,
       signedNativeSha256: nativeTransform.signedSha256,
       rustThirdPartyNoticesSha256: verified.manifest.policy.rustThirdPartyNoticesSha256,
+      applicationLicenseSha256: verified.manifest.policy.applicationLicenseSha256,
+      runtimeResourceManifestSha256:
+        verified.manifest.policy.runtimeResourceManifestSha256,
     },
     signing: {
       command: 'scripts/windows-sign-command.ps1',
@@ -1337,6 +1454,8 @@ function bundleSignedNative(plan, payloadInput) {
     record: recordPath,
     recordSha256: digestFile(recordPath),
     payloadManifestSha256: verified.manifestSha256,
+    runtimeResourceManifestSha256:
+      verified.manifest.policy.runtimeResourceManifestSha256,
     signedNativeSha256: nativeTransform.signedSha256,
     signedNativeCapture,
   })}\n`);
@@ -1450,6 +1569,8 @@ function validateBundledRecord(recordInput, verifiedInstaller, plan, payloadInpu
       'unsignedNativeSha256',
       'signedNativeSha256',
       'rustThirdPartyNoticesSha256',
+      'applicationLicenseSha256',
+      'runtimeResourceManifestSha256',
     ],
     'Bundled source payload record',
   );
@@ -1457,6 +1578,8 @@ function validateBundledRecord(recordInput, verifiedInstaller, plan, payloadInpu
       !isSha256(record.sourcePayload.unsignedNativeSha256) ||
       !isSha256(record.sourcePayload.signedNativeSha256) ||
       !isSha256(record.sourcePayload.rustThirdPartyNoticesSha256) ||
+      !isSha256(record.sourcePayload.applicationLicenseSha256) ||
+      !isSha256(record.sourcePayload.runtimeResourceManifestSha256) ||
       record.sourcePayload.unsignedNativeSha256 === record.sourcePayload.signedNativeSha256) {
     throw new Error('Bundled source payload hashes are invalid.');
   }
@@ -1508,9 +1631,14 @@ function validateBundledRecord(recordInput, verifiedInstaller, plan, payloadInpu
   }
   if (record.sourcePayload.rustThirdPartyNoticesSha256 !==
       record.policy?.rustThirdPartyNoticesSha256 ||
+      record.sourcePayload.applicationLicenseSha256 !==
+        record.policy?.applicationLicenseSha256 ||
+      record.sourcePayload.runtimeResourceManifestSha256 !==
+        record.policy?.runtimeResourceManifestSha256 ||
       JSON.stringify(record.policy) !== JSON.stringify(policyForPlan(
         plan,
         record.sourcePayload.rustThirdPartyNoticesSha256,
+        record.sourcePayload.runtimeResourceManifestSha256,
       ))) {
     throw new Error('Bundled release record does not match the current production policy.');
   }
@@ -1519,7 +1647,11 @@ function validateBundledRecord(recordInput, verifiedInstaller, plan, payloadInpu
   if (verifiedPayload.manifestSha256 !== record.sourcePayload.manifestSha256 ||
       verifiedPayload.nativeSha256 !== record.sourcePayload.unsignedNativeSha256 ||
       verifiedPayload.manifest.policy.rustThirdPartyNoticesSha256 !==
-        record.sourcePayload.rustThirdPartyNoticesSha256) {
+        record.sourcePayload.rustThirdPartyNoticesSha256 ||
+      verifiedPayload.manifest.policy.applicationLicenseSha256 !==
+        record.sourcePayload.applicationLicenseSha256 ||
+      verifiedPayload.manifest.policy.runtimeResourceManifestSha256 !==
+        record.sourcePayload.runtimeResourceManifestSha256) {
     throw new Error('Bundled release record does not match the preserved unsigned payload evidence.');
   }
   const signedNativeCandidate = path.resolve(signedNativeInput);
@@ -1591,6 +1723,10 @@ function writeUpdaterManifest(
       packageLockSha256: bundled.record.policy.packageLockSha256,
       rustThirdPartyNoticesSha256:
         bundled.record.sourcePayload.rustThirdPartyNoticesSha256,
+      applicationLicenseSha256:
+        bundled.record.sourcePayload.applicationLicenseSha256,
+      runtimeResourceManifestSha256:
+        bundled.record.sourcePayload.runtimeResourceManifestSha256,
       signedRecord: {
         signature: bundled.signature,
         canonicalBase64: bundled.canonicalBase64,
@@ -1642,6 +1778,11 @@ try {
       powerShellModulePath: Object.keys(environment).some(
         (name) => name.toUpperCase() === 'PSMODULEPATH',
       ),
+      openRouterKey: Object.hasOwn(environment, 'OPENROUTER_API_KEY'),
+      awsSecret: Object.hasOwn(environment, 'AWS_SECRET_ACCESS_KEY'),
+      githubToken: Object.hasOwn(environment, 'GITHUB_TOKEN'),
+      genericSecret: Object.hasOwn(environment, 'UNRELATED_SERVICE_SECRET'),
+      cargoAbout: environment.PROVENANCE_CARGO_ABOUT === 'cargo-about-marker',
       ordinaryMarker: environment.PROVENANCE_BUILD_MARKER === 'present',
     })}\n`);
   } else if (command === 'manifest') {
@@ -1685,6 +1826,8 @@ try {
       payload: verified.payload,
       manifestSha256: verified.manifestSha256,
       nativeSha256: verified.nativeSha256,
+      runtimeResourceManifestSha256:
+        verified.manifest.policy.runtimeResourceManifestSha256,
       resources: verified.manifest.resources.length,
     })}\n`);
   } else if (command === 'bundle-signed-native') {

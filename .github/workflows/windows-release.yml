@@ -23,8 +23,30 @@ env:
   CARGO_ABOUT_EXE_SHA256: e15e1af0b7c671bac972b21916b86726d0bf183ae121c85fb645bc618e911d3f
 
 jobs:
+  release-ref-preflight:
+    name: Require a release-eligible dispatch ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+
+    steps:
+      - name: Reject non-release refs before staging or protected signing
+        shell: bash
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          case "${DISPATCH_REF}" in
+            refs/heads/main|refs/tags/v*) ;;
+            *)
+              printf 'Release dispatches must target refs/heads/main or refs/tags/v*; got %s.\n' "${DISPATCH_REF}" >&2
+              exit 1
+              ;;
+          esac
+
   build-unsigned:
     name: Test and stage immutable unsigned Windows payload
+    needs: release-ref-preflight
     runs-on: windows-latest
     timeout-minutes: 120
     env:
@@ -34,6 +56,7 @@ jobs:
     outputs:
       manifest_sha256: ${{ steps.payload.outputs.manifest_sha256 }}
       native_sha256: ${{ steps.payload.outputs.native_sha256 }}
+      resource_manifest_sha256: ${{ steps.payload.outputs.resource_manifest_sha256 }}
       sign_command_sha256: ${{ steps.payload.outputs.sign_command_sha256 }}
 
     steps:
@@ -188,12 +211,14 @@ jobs:
           npm run lint
           npm test
           npm run desktop:release:test
+          npm run replay-ledger:gate
           npm run desktop:acceptance
           npm run desktop:release:plan
           npm run build
           cargo fetch --manifest-path src-tauri/Cargo.toml --locked
           npm run desktop:licenses
           npm run desktop:resource-smoke
+          npm audit --audit-level=high
           npm audit --omit=dev --audit-level=high
           cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
           cargo test --manifest-path src-tauri/Cargo.toml --all-targets
@@ -224,8 +249,10 @@ jobs:
           $manifest = Join-Path $payload 'manifest.json'
           $manifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $manifest).Hash.ToLowerInvariant()
           $nativeHash = [string]$verification.nativeSha256
+          $resourceManifestHash = [string]$verification.runtimeResourceManifestSha256
           if ($manifestHash -cne [string]$verification.manifestSha256 -or
-              $nativeHash -notmatch '^[a-f0-9]{64}$') {
+              $nativeHash -notmatch '^[a-f0-9]{64}$' -or
+              $resourceManifestHash -notmatch '^[a-f0-9]{64}$') {
             throw 'The unsigned payload verification output is inconsistent.'
           }
           $native = Join-Path $payload 'native\provenance-desktop.exe'
@@ -237,6 +264,7 @@ jobs:
           "PROVENANCE_UNSIGNED_PAYLOAD=$payload" | Out-File -FilePath $env:GITHUB_ENV -Append
           "manifest_sha256=$manifestHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "native_sha256=$nativeHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "resource_manifest_sha256=$resourceManifestHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "sign_command_sha256=$signCommandHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload untouched unsigned payload
@@ -251,7 +279,7 @@ jobs:
 
   sign-and-verify:
     name: Protected native signing, NSIS bundling, and acceptance
-    needs: build-unsigned
+    needs: [release-ref-preflight, build-unsigned]
     if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: windows-latest
     timeout-minutes: 60
@@ -433,7 +461,8 @@ jobs:
           }
           $manifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $payload 'manifest.json')).Hash.ToLowerInvariant()
           if ($manifestHash -cne '${{ needs.build-unsigned.outputs.manifest_sha256 }}' -or
-              [string]$verification.nativeSha256 -cne '${{ needs.build-unsigned.outputs.native_sha256 }}') {
+              [string]$verification.nativeSha256 -cne '${{ needs.build-unsigned.outputs.native_sha256 }}' -or
+              [string]$verification.runtimeResourceManifestSha256 -cne '${{ needs.build-unsigned.outputs.resource_manifest_sha256 }}') {
             throw 'The downloaded payload does not match the unsigned job hash attestation.'
           }
           $signCommandHash = (Get-FileHash -Algorithm SHA256 -LiteralPath scripts\windows-sign-command.ps1).Hash.ToLowerInvariant()
@@ -608,6 +637,9 @@ jobs:
 
       - name: Silent-install and verify installed native and uninstaller
         shell: pwsh
+        env:
+          GITHUB_ACTIONS: 'true'
+          PROVENANCE_EPHEMERAL_ACCEPTANCE: '1'
         run: |
           $ErrorActionPreference = 'Stop'
           function Assert-ExpectedSignature([string]$Path, [string]$Label) {
@@ -702,8 +734,28 @@ jobs:
               throw 'The isolated installation contains missing or extra files or directories.'
             }
 
+            $expectedResourceManifestHash = '${{ needs.build-unsigned.outputs.resource_manifest_sha256 }}'
+            $preSmokeVerification = (& node scripts/desktop-release.mjs verify-unsigned `
+              $env:PROVENANCE_WINDOWS_SIGN_PAYLOAD_ROOT | Out-String).Trim() | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or
+                $preSmokeVerification.status -cne 'verified' -or
+                [string]$preSmokeVerification.manifestSha256 -cne
+                  '${{ needs.build-unsigned.outputs.manifest_sha256 }}' -or
+                [string]$preSmokeVerification.runtimeResourceManifestSha256 -cne
+                  $expectedResourceManifestHash -or
+                [string]$payloadManifest.policy.runtimeResourceManifestSha256 -cne
+                  $expectedResourceManifestHash) {
+              throw 'The immutable unsigned resource manifest changed before installed acceptance.'
+            }
+
+            npm run desktop:startup-smoke -- --binary $native --profile production --packaged `
+              --expected-resource-manifest-sha256 $expectedResourceManifestHash
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The installed signed native executable failed the authenticated acceptance gate.'
+            }
+
             $uninstall = Start-Process -FilePath $uninstaller `
-              -ArgumentList @('/S', "_?=$installRoot") -Wait -PassThru
+              -ArgumentList @('/S') -Wait -PassThru
             if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed with exit code $($uninstall.ExitCode)." }
             for ($attempt = 0; $attempt -lt 30 -and (Test-Path -LiteralPath $installRoot); $attempt++) {
               Start-Sleep -Seconds 1

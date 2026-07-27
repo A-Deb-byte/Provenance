@@ -2,7 +2,11 @@ import express from 'express';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createLoopbackRequestGuard, securityHeaders } from './loopbackGuard';
+import {
+  createLoopbackRequestGuard,
+  createSecurityHeaders,
+  securityHeaders,
+} from './loopbackGuard';
 
 describe('loopback request guard', () => {
   let server: ReturnType<express.Express['listen']>;
@@ -58,5 +62,32 @@ describe('loopback request guard', () => {
       method: 'POST', headers: { origin: 'https://attacker.example' },
     });
     expect(denied.status).toBe(403);
+  });
+
+  it('grants CSP connect authority only to one exact native mount origin', async () => {
+    const mountOrigin = 'http://127.0.0.1:43124';
+    const headers = createSecurityHeaders({ nativeAcceptanceMountOrigin: mountOrigin });
+    const mountedApp = express();
+    mountedApp.use(headers);
+    mountedApp.get('/', (_req, res) => res.json({ ok: true }));
+    const mountedServer = await new Promise<ReturnType<express.Express['listen']>>((resolve) => {
+      const listening = mountedApp.listen(0, '127.0.0.1', () => resolve(listening));
+    });
+    try {
+      const mountedUrl = `http://127.0.0.1:${(mountedServer.address() as AddressInfo).port}`;
+      const response = await fetch(mountedUrl);
+      expect(response.headers.get('content-security-policy'))
+        .toContain(`connect-src 'self' ${mountOrigin};`);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        mountedServer.close((error) => error ? reject(error) : resolve());
+      });
+    }
+    expect(() => createSecurityHeaders({
+      nativeAcceptanceMountOrigin: 'http://127.0.0.1:43124/path',
+    })).toThrow(/exact IPv4 loopback/u);
+    expect(() => createSecurityHeaders({
+      nativeAcceptanceMountOrigin: 'http://localhost:43124',
+    })).toThrow(/exact IPv4 loopback/u);
   });
 });

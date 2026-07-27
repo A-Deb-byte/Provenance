@@ -5,7 +5,7 @@ description = "Native Windows host and bounded UI Automation bridge for Provenan
 authors = ["Provenance contributors"]
 edition = "2021"
 rust-version = "1.85"
-license = "UNLICENSED"
+license = "BUSL-1.1"
 publish = false
 
 [lib]
@@ -17,6 +17,9 @@ name = "provenance-desktop"
 path = "src/main.rs"
 
 [build-dependencies]
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.10"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -41,6 +44,7 @@ uuid = { version = "1", features = ["v4"] }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_JobObjects",
   "Win32_System_Threading",

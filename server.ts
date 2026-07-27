@@ -55,6 +55,8 @@ import { createProviderApi } from './src/providers/api';
 import { createProviderRuntime } from './src/providers/runtime';
 import { PROVIDER_IDS, type ProviderId, type ProviderRoutingPolicy } from './src/providers/types';
 import { createDesktopReadyPublisher } from './src/runtime/desktopReadiness';
+import { createDesktopShutdownControl } from './src/runtime/desktopShutdown';
+import { loadAuthenticatedStaticResources } from './src/runtime/authenticatedStatic';
 import { acquireRuntimeOwnership } from './src/runtime/ownership';
 import { createVaultApi } from './src/vault/api';
 import { createPlatformVault, injectVaultSecretsIntoEnvironment } from './src/vault/index';
@@ -63,7 +65,32 @@ const PROJECT_ROOT = path.resolve(process.env.PROVENANCE_PROJECT_ROOT?.trim() ||
 const CONFIGURED_WORKSPACE_ROOT = path.resolve(
   process.env.PROVENANCE_WORKSPACE_ROOT?.trim() || PROJECT_ROOT,
 );
-dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
+const NATIVE_ACCEPTANCE_MODE = process.env.PROVENANCE_NATIVE_ACCEPTANCE === '1';
+const NATIVE_ACCEPTANCE_MOUNT_ORIGIN =
+  process.env.PROVENANCE_NATIVE_ACCEPTANCE_MOUNT_ORIGIN || undefined;
+delete process.env.PROVENANCE_NATIVE_ACCEPTANCE_MOUNT_ORIGIN;
+if (NATIVE_ACCEPTANCE_MODE !== Boolean(NATIVE_ACCEPTANCE_MOUNT_ORIGIN)) {
+  throw new Error('Native acceptance and its pre-bound mount origin must be configured together.');
+}
+const PACKAGED_RELEASE_MARKER = process.env.DESKTOP_PACKAGED_RELEASE;
+if (PACKAGED_RELEASE_MARKER && PACKAGED_RELEASE_MARKER !== '1') {
+  throw new Error('DESKTOP_PACKAGED_RELEASE must be exactly 1 when configured.');
+}
+const IS_PACKAGED_RELEASE = PACKAGED_RELEASE_MARKER === '1';
+const AUTHENTICATED_RESOURCE_MANIFEST_PATH =
+  process.env.PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_PATH;
+const AUTHENTICATED_RESOURCE_MANIFEST_SHA256 =
+  process.env.PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_SHA256;
+delete process.env.PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_PATH;
+delete process.env.PROVENANCE_AUTHENTICATED_RESOURCE_MANIFEST_SHA256;
+if (IS_PACKAGED_RELEASE !== Boolean(
+  AUTHENTICATED_RESOURCE_MANIFEST_PATH && AUTHENTICATED_RESOURCE_MANIFEST_SHA256,
+)) {
+  throw new Error('Packaged mode and its Rust-authenticated resource manifest must be configured together.');
+}
+if (!NATIVE_ACCEPTANCE_MODE && !IS_PACKAGED_RELEASE) {
+  dotenv.config({ path: path.join(PROJECT_ROOT, '.env') });
+}
 
 const app = express();
 const configuredPort = Number.parseInt(process.env.PORT || '3000', 10);
@@ -112,7 +139,7 @@ const publishReleaseReadiness = async (
   }
 };
 const recurringResearchSchedulerSetting = process.env.RECURRING_RESEARCH_SCHEDULER_ENABLED?.trim().toLowerCase();
-const RECURRING_RESEARCH_SCHEDULER_ENABLED = !IS_RELEASE_CHILD &&
+const RECURRING_RESEARCH_SCHEDULER_ENABLED = !IS_RELEASE_CHILD && !NATIVE_ACCEPTANCE_MODE &&
   !['0', 'false', 'no', 'off'].includes(recurringResearchSchedulerSetting ?? '');
 const configuredRecurringResearchTickMs = Number.parseInt(
   process.env.RECURRING_RESEARCH_TICK_MS || '15000',
@@ -138,7 +165,10 @@ const VAULT_INJECTED_SECRETS = [
 let coreModelPromise: ReturnType<typeof createCoreModelRuntime>;
 const vault = createPlatformVault({ vaultDir: path.join(RUNTIME_DIR, 'vault') });
 
-app.use(createSecurityHeaders({ allowViteDevelopment: IS_DEVELOPMENT }));
+app.use(createSecurityHeaders({
+  allowViteDevelopment: IS_DEVELOPMENT,
+  nativeAcceptanceMountOrigin: NATIVE_ACCEPTANCE_MOUNT_ORIGIN,
+}));
 app.use(createLoopbackRequestGuard());
 app.use(express.json({ limit: '32mb' }));
 
@@ -202,7 +232,8 @@ const createServerContext = async () => {
     ? buildBrowserWriteWorkerRegistration(process.env.BROWSER_WRITE_ORIGINS)
     : undefined;
   const desktopConfiguration = resolveDesktopBridgeConfiguration(process.env);
-  const desktopAuthorityConfigured = resolveAccessMode(userStore.count(), operatorToken) !== 'open';
+  const accessMode = resolveAccessMode(userStore.count(), operatorToken);
+  const desktopAuthorityConfigured = accessMode !== 'open';
   let desktopIpcStatus: RuntimeFeatureStatus = {
     status: desktopConfiguration.status,
     reason: desktopConfiguration.reason,
@@ -214,6 +245,7 @@ const createServerContext = async () => {
     )
     : undefined;
   let desktopWorker: KernelActionWorker | undefined;
+  let desktopBridgeAuthenticated = false;
   const desktopPayloadBacking = desktopConfiguration.configuration
     ? createMemoryDesktopPayloadStore()
     : undefined;
@@ -247,6 +279,10 @@ const createServerContext = async () => {
       token: configuration.token,
     });
     const health = await bridge.health();
+    const expectedHostInstanceId = process.env.DESKTOP_HOST_INSTANCE_ID?.trim();
+    if (!expectedHostInstanceId || health.hostInstanceId !== expectedHostInstanceId) {
+      throw new Error('Native host identity does not match the authenticated bridge health response.');
+    }
     const expectedApps = configuration.applications.map((application) => application.id).sort();
     const healthyApps = [...new Set(health.allowedAppIds)].sort();
     const capabilitiesMatch = DESKTOP_V1_ACTIONS.every((action) => health.capabilities.includes(action));
@@ -264,18 +300,21 @@ const createServerContext = async () => {
       },
     };
   };
-  if (desktopConfiguration.configuration && !desktopAuthorityConfigured) {
-    desktopIpcStatus = {
-      status: 'blocked',
-      reason: 'Native desktop execution is blocked until an operator token or multi-user access control is configured.',
-    };
-  } else if (desktopConfiguration.configuration) {
+  if (desktopConfiguration.configuration) {
     try {
       const runtime = await authenticateDesktopRuntime();
-      desktopPayloadEnabled = true;
-      desktopRegistration = runtime.registration;
-      desktopWorker = runtime.worker;
-      desktopIpcStatus = runtime.status;
+      desktopBridgeAuthenticated = true;
+      if (!desktopAuthorityConfigured) {
+        desktopIpcStatus = {
+          status: 'blocked',
+          reason: 'Native desktop execution is blocked until an operator token or multi-user access control is configured.',
+        };
+      } else {
+        desktopPayloadEnabled = true;
+        desktopRegistration = runtime.registration;
+        desktopWorker = runtime.worker;
+        desktopIpcStatus = runtime.status;
+      }
     } catch {
       desktopIpcStatus = {
         status: 'configured',
@@ -407,6 +446,7 @@ const createServerContext = async () => {
 
     const pending = (async () => {
       const runtime = await authenticateDesktopRuntime();
+      desktopBridgeAuthenticated = true;
       // Values staged before the authority transition cannot cross into the
       // newly executable runtime, even if their opaque ids were retained.
       desktopPayloadBacking!.clear();
@@ -629,7 +669,17 @@ const createServerContext = async () => {
     res.json((await coreModelPromise).getStatus());
   });
 
-  return { coreModelPromise, kernel, recurringResearchScheduler, releaseLifecycle };
+  return {
+    coreModelPromise,
+    kernel,
+    recurringResearchScheduler,
+    releaseLifecycle,
+    desktopIpcStatus,
+    desktopBridgeAuthenticated,
+    hostInstanceId: process.env.DESKTOP_HOST_INSTANCE_ID?.trim() ?? '',
+    kernelReady: true,
+    accessMode,
+  };
 };
 
 async function start() {
@@ -638,10 +688,30 @@ async function start() {
     desktopOwnerNonce: process.env.DESKTOP_RUNTIME_OWNER_NONCE,
     desktopHostPid: Number.isSafeInteger(desktopHostPid) && desktopHostPid > 0 ? desktopHostPid : undefined,
   });
+  const desktopShutdown = createDesktopShutdownControl(RUNTIME_DIR, process.env);
+  delete process.env.DESKTOP_HOST_SHUTDOWN_TOKEN;
+  delete process.env.DESKTOP_HOST_SHUTDOWN_NONCE;
+  delete process.env.DESKTOP_HOST_SHUTDOWN_FILE;
   let desktopReady: ReturnType<typeof createDesktopReadyPublisher> | undefined;
   try {
     desktopReady = createDesktopReadyPublisher(RUNTIME_DIR, process.env);
-    const { recurringResearchScheduler, releaseLifecycle } = await createServerContext();
+    const authenticatedStaticResources = IS_PACKAGED_RELEASE
+      ? await loadAuthenticatedStaticResources({
+        projectRoot: PROJECT_ROOT,
+        runtimeDirectory: RUNTIME_DIR,
+        manifestPath: AUTHENTICATED_RESOURCE_MANIFEST_PATH,
+        manifestSha256: AUTHENTICATED_RESOURCE_MANIFEST_SHA256,
+      })
+      : undefined;
+    const {
+      recurringResearchScheduler,
+      releaseLifecycle,
+      desktopIpcStatus,
+      desktopBridgeAuthenticated,
+      hostInstanceId,
+      kernelReady,
+      accessMode,
+    } = await createServerContext();
 
     if (IS_DEVELOPMENT) {
       const { createServer: createViteServer } = await import('vite');
@@ -650,6 +720,29 @@ async function start() {
         appType: 'spa',
       });
       app.use(vite.middlewares);
+    } else if (authenticatedStaticResources) {
+      app.get('/assets/*', (req, res, next) => {
+        const asset = authenticatedStaticResources.assets.get(req.path);
+        if (!asset) {
+          res.status(404).end();
+          return;
+        }
+        res.sendFile(asset, (error) => {
+          if (error) next(error);
+        });
+      });
+      app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api/')
+            || req.path === '/assets'
+            || req.path.startsWith('/assets/')
+            || (req.path !== '/index.html' && path.posix.extname(req.path) !== '')) {
+          res.status(404).end();
+          return;
+        }
+        res.sendFile(authenticatedStaticResources.indexFile, (error) => {
+          if (error) next(error);
+        });
+      });
     } else {
       const distPath = path.join(PROJECT_ROOT, 'dist');
       app.use(express.static(distPath));
@@ -672,6 +765,24 @@ async function start() {
       await runtimeOwnership.release();
     };
 
+    if (desktopShutdown.enabled) {
+      app.post('/__provenance/native/shutdown', (req, res) => {
+        if (!desktopShutdown.authenticate(req.header('x-provenance-native-shutdown'))) {
+          res.status(404).end();
+          return;
+        }
+        res.status(204).end(() => {
+          void shutdown()
+            .then(() => desktopShutdown.publish())
+            .then(() => process.exit(0))
+            .catch((error) => {
+              console.error('[Desktop] Authenticated native shutdown failed:', error instanceof Error ? error.message : error);
+              process.exit(1);
+            });
+        });
+      });
+    }
+
     httpServer = app.listen(PORT, '127.0.0.1', () => {
       const address = httpServer.address();
       const listeningPort = typeof address === 'object' && address ? address.port : PORT;
@@ -684,7 +795,15 @@ async function start() {
           ? publishReleaseReadiness(nonce, targetVersion, contentHash)
           : Promise.reject(new Error('Release child readiness metadata is incomplete.'))
         : Promise.resolve();
-      void releaseReady.then(() => desktopReady!.publish(listeningPort)).catch((error) => {
+      void releaseReady.then(() => desktopReady!.publish({
+        port: listeningPort,
+        hostInstanceId,
+        kernelReady,
+        accessMode,
+        bridgeAuthenticated: desktopBridgeAuthenticated,
+        schedulerEnabled: RECURRING_RESEARCH_SCHEDULER_ENABLED,
+        desktopStatus: desktopIpcStatus.status,
+      })).catch((error) => {
         console.error('[Desktop] Failed to publish authenticated host readiness:', error instanceof Error ? error.message : error);
         void shutdown().finally(() => { process.exitCode = 1; });
       });

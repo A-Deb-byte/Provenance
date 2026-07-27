@@ -141,13 +141,18 @@ async fn health(
     if let Err(error) = authenticate(&state, &Method::GET, "/v1/health", &headers, &[], now_ms()) {
         return signed_auth_error(&state, &request_id, error);
     }
+    let desktop_healthy = state.desktop.is_healthy();
     signed_json(
         &state,
         &request_id,
-        StatusCode::OK,
+        if desktop_healthy {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
         &HealthResponse {
             schema_version: BRIDGE_SCHEMA_VERSION,
-            status: "ok",
+            status: if desktop_healthy { "ok" } else { "unavailable" },
             host_instance_id: state.host_instance_id.to_string(),
             platform: "windows",
             capabilities: vec![
@@ -494,8 +499,12 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::uia::{DesktopActionOutput, DesktopExecutor};
+    use axum::body::to_bytes;
+    use serde_json::Value;
 
-    struct UnusedExecutor;
+    struct UnusedExecutor {
+        healthy: bool,
+    }
 
     fn secret() -> BridgeSecret {
         BridgeSecret(Arc::from("s".repeat(43)))
@@ -504,6 +513,10 @@ mod tests {
     impl DesktopExecutor for UnusedExecutor {
         fn allowed_app_ids(&self) -> Vec<String> {
             Vec::new()
+        }
+
+        fn is_healthy(&self) -> bool {
+            self.healthy
         }
 
         fn execute(
@@ -518,18 +531,25 @@ mod tests {
         BridgeState {
             secret: secret(),
             host_instance_id: Arc::from("host-test"),
-            desktop: Arc::new(UnusedExecutor),
+            desktop: Arc::new(UnusedExecutor { healthy: true }),
             replay: Arc::new(Mutex::new(ReplayCache::default())),
         }
     }
 
-    fn signed_headers(state: &BridgeState, body: &[u8], now: u64, request_id: &str) -> HeaderMap {
+    fn signed_headers_for(
+        state: &BridgeState,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        now: u64,
+        request_id: &str,
+    ) -> HeaderMap {
         let issued_at = now;
         let expires_at = now + 5_000;
         let content_hash = sha256_hex(body);
         let canonical = request_canonical(
-            "POST",
-            "/v1/actions",
+            method,
+            path,
             request_id,
             issued_at,
             expires_at,
@@ -547,6 +567,10 @@ mod tests {
                 .unwrap(),
         );
         headers
+    }
+
+    fn signed_headers(state: &BridgeState, body: &[u8], now: u64, request_id: &str) -> HeaderMap {
+        signed_headers_for(state, "POST", "/v1/actions", body, now, request_id)
     }
 
     #[test]
@@ -622,5 +646,34 @@ mod tests {
                 response_canonical("request-5", 500, &body_hash).as_bytes()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn health_returns_signed_unavailable_when_executor_is_unhealthy() {
+        let mut state = state();
+        state.desktop = Arc::new(UnusedExecutor { healthy: false });
+        let headers = signed_headers_for(
+            &state,
+            "GET",
+            "/v1/health",
+            &[],
+            now_ms(),
+            "health-unavailable",
+        );
+
+        let response = health(
+            State(state),
+            ConnectInfo(SocketAddr::from((Ipv4Addr::LOCALHOST, 12345))),
+            headers,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(RESPONSE_SHA256));
+        assert!(response.headers().contains_key(RESPONSE_SIGNATURE));
+        let body = to_bytes(response.into_body(), 8 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["status"], "unavailable");
+        assert_eq!(body["hostInstanceId"], "host-test");
     }
 }

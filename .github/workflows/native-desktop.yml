@@ -22,7 +22,7 @@ jobs:
   windows-native:
     name: Windows TypeScript and Rust gates
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -102,6 +102,19 @@ jobs:
       - name: Clean packaged server readiness smoke
         run: npm run desktop:resource-smoke
 
+      # The replayer re-derives kernel decisions with an independent
+      # implementation of the policy rules. If a change to src/capabilities
+      # alters decision semantics without a matching CAPABILITY_POLICY_VERSION
+      # bump and replayer update, these tests fail — which is the intent.
+      - name: Ledger decision replay tests
+        run: npx vitest run scripts/replay-ledger.test.ts src/capabilities/decisionRecord.test.ts
+
+      - name: Replay kernel-persisted decision evidence
+        run: npm run replay-ledger:gate
+
+      - name: Full build dependency audit
+        run: npm audit --audit-level=high
+
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
 
@@ -116,3 +129,11 @@ jobs:
 
       - name: Rust clippy
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      # Exercise the development identity through the nonce-bound authenticated
+      # readiness gate, including the Node kernel, desktop bridge, and UIA worker.
+      - name: Build native host
+        run: cargo build --manifest-path src-tauri/Cargo.toml
+
+      - name: Native host startup smoke
+        run: npm run desktop:startup-smoke -- --binary src-tauri/target/debug/provenance-desktop.exe --profile development

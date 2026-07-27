@@ -7,11 +7,15 @@ export default defineConfig({
     globals: false,
     setupFiles: ['src/test/setup.ts'],
     css: true,
-    // Several Windows integration tests exercise DPAPI subprocesses and
-    // hash-chained filesystem commits. Keep their timeout above scheduler
-    // jitter while preserving a finite failure bound.
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
+    // Process-tree, DPAPI, and filesystem integration suites own real Windows
+    // resources. Serial execution prevents one suite from delaying another's
+    // fail-closed cleanup beyond its fixed timeout.
+    maxWorkers: 1,
+    // Keep individual operations bounded while allowing authenticated
+    // filesystem commits and Windows cleanup to complete on shared runners.
+    // The CI shard timeout remains the outer fail-closed bound.
+    testTimeout: 90_000,
+    hookTimeout: 60_000,
   },
   resolve: {
     alias: {

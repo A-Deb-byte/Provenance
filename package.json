@@ -7,13 +7,16 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --external:vite --sourcemap --metafile=dist/server.meta.json --outfile=dist/server.cjs && node scripts/generate-third-party-notices.mjs",
+    "build": "vite build && node scripts/build-server.mjs && node scripts/generate-third-party-notices.mjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "verify-ledger": "node scripts/verify-ledger.mjs",
+    "replay-ledger": "node scripts/replay-ledger.mjs",
+    "replay-ledger:gate": "tsx scripts/replay-ledger-gate.mts",
+    "verify-ledger:strict": "node scripts/verify-ledger.mjs --require-events",
     "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "desktop:test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "desktop:acceptance": "tsx scripts/desktop-acceptance.mts",
@@ -26,9 +29,11 @@
     "desktop:release:bundle-signed-native": "node scripts/desktop-release.mjs bundle-signed-native",
     "desktop:release:manifest": "node scripts/desktop-release.mjs manifest",
     "desktop:release:verify": "node scripts/desktop-release.mjs verify",
-    "desktop:release:test": "vitest run scripts/desktop-release.test.ts scripts/updater-signature.test.ts scripts/generate-rust-third-party-notices.test.ts scripts/license-policy.test.ts",
+    "desktop:release:test": "vitest run scripts/desktop-release.test.ts scripts/updater-signature.test.ts scripts/generate-rust-third-party-notices.test.ts scripts/license-policy.test.ts scripts/native-host-smoke.test.ts scripts/desktop-pilot-installer.test.ts scripts/runtime-resource-manifest.test.ts scripts/release-resource-contract.test.ts scripts/server-bundle-contract.test.ts scripts/verify-ledger.test.ts src/runtime/authenticatedStatic.test.ts",
     "desktop:licenses": "node scripts/generate-rust-third-party-notices.mjs",
-    "desktop:resource-smoke": "node scripts/packaged-server-smoke.mjs"
+    "desktop:resource-smoke": "node scripts/packaged-server-smoke.mjs",
+    "desktop:startup-smoke": "node scripts/native-host-smoke.mjs",
+    "desktop:pilot-installer": "node scripts/desktop-pilot-installer.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
