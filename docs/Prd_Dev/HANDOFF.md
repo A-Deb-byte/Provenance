@@ -2,7 +2,7 @@
 
 - Branch: `codex/production-desktop-release-v1`
 - Baseline commit at the start of this milestone: `c319180`
-- Status: The July 27 working tree passed the 635-test TypeScript matrix, 68 Rust tests, the 83-test release contract, full and production JavaScript dependency audits, replay and strict-ledger gates, development-native acceptance, and fresh license-complete installed unsigned-pilot acceptance. Same-SHA remote CI, protected production signing, independent audit, and external pilot sign-off remain pending.
+- Status: The July 27 working tree passed the 635-test TypeScript matrix, 68 Rust tests, the 83-test release contract, full and production JavaScript dependency audits, replay and strict-ledger gates, development-native acceptance, and fresh license-complete installed unsigned-pilot acceptance. The first ordinary CI attempt then exposed a Windows test assertion and full-runtime test-budget issue; the locally rechecked repair is documented in `2026-07-29-ordinary-ci-repair.md` and still requires same-SHA remote CI. Protected production signing, independent audit, and external pilot sign-off remain pending.
 
 ## Read this first
 

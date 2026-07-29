@@ -14,6 +14,7 @@ const script = path.join(process.cwd(), 'scripts', 'desktop-release.mjs');
 const privateKeyMarker = 'DO-NOT-PRINT-PRIVATE-KEY';
 const bundleTypeUnknown = Buffer.from('__TAURI_BUNDLE_TYPE_VAR_UNK', 'ascii');
 const bundleTypeNsis = Buffer.from('__TAURI_BUNDLE_TYPE_VAR_NSS', 'ascii');
+const fullRuntimeVerificationTimeout = 90_000;
 let cargoAboutFixture: { executable: string; sha256: string; version: string };
 let nodeSignerThumbprint: string;
 
@@ -424,7 +425,8 @@ describe('desktop release planner', () => {
     const { payload, manifest } = await createUnsignedPayload(env);
     const result = await execFileAsync(process.execPath, [script, 'verify-unsigned', payload], {
       env,
-      timeout: 30_000,
+      // This deliberately hashes and Authenticode-validates the full pinned Node runtime.
+      timeout: fullRuntimeVerificationTimeout,
     });
 
     expect(JSON.parse(result.stdout)).toMatchObject({
@@ -435,7 +437,7 @@ describe('desktop release planner', () => {
       nativeSha256: manifest.native.sha256,
       resources: manifest.resources.length,
     });
-  }, 30_000);
+  }, fullRuntimeVerificationTimeout);
 
   it('rejects any resource mutation before worker dispatch', async () => {
     const env = await fixtureEnvironment();

@@ -60,9 +60,19 @@ has no protected release attestation, and deliberately disables sandboxed comman
 execution with an unresolvable pinned image. The disposable pilot keypair was
 deleted after a second isolated install/smoke/uninstall cleanup check.
 
+## Ordinary CI Attempt
+
+The initial post-hardening commit `ed035bc23536513f1e2cadcb24c4f537f938e152`
+did not pass ordinary Windows CI: a Windows path-spelling assertion and a
+30-second full-runtime test budget failed in the TypeScript step. The narrow
+repair and its local recheck are recorded in
+[`2026-07-29-ordinary-ci-repair.md`](./2026-07-29-ordinary-ci-repair.md).
+This document therefore remains local evidence until the repair commit passes
+ordinary remote CI for its exact SHA.
+
 ## Remaining Release Gates
 
-- Commit this candidate and require ordinary remote CI for its exact SHA.
+- Push the repair candidate and require ordinary remote CI for its exact SHA.
 - Run the protected release workflow with protected production Node, Docker,
   certificate, timestamp, updater-key, environment-approval, and publication
   authority.

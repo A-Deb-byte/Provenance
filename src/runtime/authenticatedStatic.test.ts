@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -60,7 +60,7 @@ describe('authenticated packaged static resources', () => {
       manifestPath: created.manifestPath,
       manifestSha256: created.manifestSha256,
     });
-    expect(resources.indexFile).toBe(path.join(created.root, 'dist', 'index.html'));
+    expect(resources.indexFile).toBe(await realpath(path.join(created.root, 'dist', 'index.html')));
     expect([...resources.assets.keys()]).toEqual(['/assets/app.js']);
     expect(resources.assets.has('/server.cjs')).toBe(false);
   });
