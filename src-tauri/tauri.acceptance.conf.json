@@ -1,0 +1,8 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Provenance Native Acceptance",
+  "identifier": "dev.provenance.desktop.acceptance",
+  "bundle": {
+    "active": false
+  }
+}

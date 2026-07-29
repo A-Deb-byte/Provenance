@@ -35,9 +35,8 @@ const isSha256 = (value: unknown): value is string => (
 const riskLevels = new Set<RiskLevel>(['L0', 'L1', 'L2', 'L3', 'L4']);
 
 /**
- * No browser, desktop, or connector worker runtime ships with this repository.
- * These registrations exist so availability is reported honestly instead of
- * the families being silently absent from the capability report.
+ * Placeholder registrations report capability families honestly until a
+ * deployment replaces them with a live runtime registration.
  */
 export const defaultWorkerRegistrations = (registeredAt = new Date().toISOString()): WorkerRegistration[] => [
   {
@@ -162,10 +161,9 @@ export const buildBrowserWriteWorkerRegistration = (
 };
 
 /**
- * Builds the runtime worker registrations. The read-only web-inspect worker
- * becomes available only when the operator allowlists origins through
- * WEB_INSPECT_ORIGINS; desktop and connector runtimes do not ship here and
- * always register as unavailable.
+ * Builds the server's initial worker registrations. Runtime-specific
+ * registrations, including the authenticated native desktop worker, are
+ * installed by the composition root after their authority is verified.
  */
 export const buildWorkerRegistrations = (
   env: Readonly<Record<string, string | undefined>> = process.env,
@@ -496,6 +494,8 @@ export type FeatureAvailability = 'available' | 'configured' | 'unavailable' | '
 export interface RuntimeFeatureStatus {
   status: FeatureAvailability;
   reason: string;
+  reasonCode?: string;
+  remediation?: string;
 }
 
 export interface RuntimeCapabilityReport {
@@ -573,6 +573,14 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
               }${recurringScheduler.lastOutcome ? `; last outcome: ${recurringScheduler.lastOutcome}` : ''}.`,
             };
 
+  const desktopIpc = input.desktopIpc ?? {
+    status: 'unavailable' as const,
+    reason: 'No authenticated native desktop host is connected to this server process.',
+    reasonCode: 'native_host_absent',
+    remediation: 'Launch the native desktop application and complete its application allowlist and workspace setup.',
+  };
+  const desktopAutomationReady = desktopIpc.status === 'available' && hasDesktopWorker;
+  const desktopWorkerMissing = desktopIpc.status === 'available' && !hasDesktopWorker;
   const features: Record<string, RuntimeFeatureStatus> = {
     verificationCommands: {
       status: input.stopAll ? 'blocked' : commandExecution.status,
@@ -636,19 +644,36 @@ export const buildRuntimeCapabilityReport = (input: RuntimeReportInput): Runtime
       status: 'unavailable',
       reason: 'No supervised core-release process runtime is installed.',
     },
-    desktopIpc: input.desktopIpc ?? {
-      status: 'unavailable',
-      reason: 'No Rust/Tauri desktop shell or authenticated IPC channel is installed.',
-    },
+    desktopIpc,
     desktopAutomation: {
       status: input.stopAll
         ? 'blocked'
-        : hasDesktopWorker ? 'available' : input.desktopIpc?.status ?? 'unavailable',
+        : desktopAutomationReady
+          ? 'available'
+          : desktopWorkerMissing ? 'unavailable' : desktopIpc.status,
       reason: input.stopAll
         ? 'Stop All is active; desktop inspection and actions are halted.'
-        : hasDesktopWorker
+        : desktopAutomationReady
           ? 'Windows UI Automation is available through exact-snapshot capability grants; desktop writes require explicit L2 approval.'
-          : input.desktopIpc?.reason ?? 'No authenticated Windows UI Automation worker is available.',
+          : desktopWorkerMissing
+            ? 'The authenticated native bridge is healthy, but no executable Windows UI Automation worker is registered.'
+            : desktopIpc.reason,
+      ...(input.stopAll
+        ? {
+          reasonCode: 'stop_all_active',
+          remediation: 'Resume runtime execution only after reviewing why Stop All was activated.',
+        }
+        : desktopAutomationReady
+          ? { reasonCode: 'windows_uia_ready' }
+          : desktopWorkerMissing
+            ? {
+              reasonCode: 'windows_uia_worker_missing',
+              remediation: 'Restart the native desktop application and review its coded recovery state and support diagnostics.',
+            }
+            : {
+              ...(desktopIpc.reasonCode ? { reasonCode: desktopIpc.reasonCode } : {}),
+              ...(desktopIpc.remediation ? { remediation: desktopIpc.remediation } : {}),
+            }),
     },
   };
 

@@ -22,7 +22,8 @@ const MOUNT_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTESTATION_TYPE: &str = "native.acceptance.ready";
 const PUBLISH_ATTEMPTS: usize = 40;
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(250);
-const SUPPORTED_IDENTIFIERS: [&str; 3] = [
+const SUPPORTED_IDENTIFIERS: [&str; 4] = [
+    "dev.provenance.desktop.acceptance",
     "dev.provenance.desktop.development",
     "dev.provenance.desktop",
     "dev.provenance.desktop.pilot",
@@ -850,6 +851,7 @@ mod tests {
 
     #[test]
     fn only_isolated_application_identifiers_are_accepted() {
+        assert!(is_supported_identifier("dev.provenance.desktop.acceptance"));
         assert!(is_supported_identifier(
             "dev.provenance.desktop.development"
         ));

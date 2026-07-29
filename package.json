@@ -20,6 +20,7 @@
     "desktop:check": "cargo check --manifest-path src-tauri/Cargo.toml --all-targets",
     "desktop:test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "desktop:acceptance": "tsx scripts/desktop-acceptance.mts",
+    "desktop:acceptance-host": "node scripts/native-acceptance-host.mjs",
     "desktop:dev": "npm run build && node -r dotenv/config ./node_modules/@tauri-apps/cli/tauri.js dev --config src-tauri/tauri.conf.json",
     "desktop:build": "npm run build && tauri build --config src-tauri/tauri.conf.json",
     "desktop:release:plan": "node scripts/desktop-release.mjs plan",

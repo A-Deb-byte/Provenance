@@ -73,6 +73,7 @@ interface FixtureState {
   events: Array<Record<string, unknown>>;
   bodies: Array<{ url: string; body: Record<string, unknown> }>;
   runCounts: Record<string, number>;
+  failProjectionRefresh: boolean;
 }
 
 const automationRecord = (
@@ -111,9 +112,18 @@ const approvalRecord = (automationId: string, status: 'pending' | 'approved' | '
 const createFixture = (options: {
   delayedAuthority?: boolean;
   invalidDiscovery?: boolean;
+  runtimeConfigured?: boolean;
+  uncertainMutation?: boolean;
   unauthorizedRun?: boolean;
 } = {}) => {
-  const state: FixtureState = { automations: [], approvals: [], events: [], bodies: [], runCounts: {} };
+  const state: FixtureState = {
+    automations: [],
+    approvals: [],
+    events: [],
+    bodies: [],
+    runCounts: {},
+    failProjectionRefresh: false,
+  };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
@@ -132,7 +142,21 @@ const createFixture = (options: {
     if (method === 'GET' && url === '/api/kernel/automations') return response({ automations: state.automations });
     if (method === 'GET' && url === '/api/kernel/approvals') return response({ approvals: state.approvals });
     if (method === 'GET' && url === '/api/kernel/events') return response({ events: state.events });
-    if (method === 'GET' && url === '/api/kernel/runtime-report') return response(runtime);
+    if (method === 'GET' && url === '/api/kernel/runtime-report') {
+      if (state.failProjectionRefresh) {
+        return response({ error: 'Projection refresh failed.' }, 503);
+      }
+      return response(options.runtimeConfigured
+        ? {
+          ...runtime,
+          features: {
+            ...runtime.features,
+            desktopIpc: { status: 'configured', reason: 'Native bridge health check failed.' },
+            desktopAutomation: { status: 'configured', reason: 'Native bridge health check failed.' },
+          },
+        }
+        : runtime);
+    }
 
     if (method === 'POST' && url === '/api/kernel/desktop/typed-payloads') {
       return response({ id: 'artifact_type-1', contentHash: HASH, byteLength: 12, createdAt: '2026-07-15T00:02:00.000Z' }, 201);
@@ -182,7 +206,17 @@ const createFixture = (options: {
       }
       if (approval.status === 'approved') {
         approval.status = 'consumed';
-        return response({ decision: { kind: 'allow' }, approvalId: approval.id, dispatch: { status: 'succeeded', summary: 'Desktop action completed.' } });
+        return response({
+          decision: { kind: 'allow' },
+          approvalId: approval.id,
+          dispatch: options.uncertainMutation
+            ? {
+              status: 'uncertain',
+              summary: 'The native result was lost after dispatch.',
+              errorCode: 'desktop_outcome_uncertain',
+            }
+            : { status: 'succeeded', summary: 'Desktop action completed.' },
+        });
       }
       return response({ decision: { kind: 'approval_required' }, approvalId: approval.id });
     }
@@ -290,6 +324,51 @@ describe('DesktopPanel', () => {
     expect(await screen.findByText(/Desktop action completed/i)).toBeInTheDocument();
     expect(state.runCounts[String(clickAutomation.id)]).toBe(2);
     expect(state.approvals[0].status).toBe('consumed');
+    expect(screen.queryByTestId('desktop-window-window_1')).not.toBeInTheDocument();
+    expect(screen.getByText('No window discovery result in this authenticated view.')).toBeInTheDocument();
+  });
+
+  it('treats an uncertain native mutation as non-retryable and discards stale observations', async () => {
+    setAuthSession({ token: 'operator-secret', kind: 'operator', role: 'operator' });
+    const { state, fetchMock } = createFixture({ uncertainMutation: true });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<DesktopPanel />);
+    await discoverAndInspect(user);
+
+    await user.click(screen.getByRole('button', { name: 'Request click approval' }));
+    await user.type(
+      await screen.findByLabelText('Approval decision reason'),
+      'The exact control and revision are correct.',
+    );
+    await user.click(screen.getByRole('button', { name: 'Approve action' }));
+    await user.click(await screen.findByRole('button', { name: 'Execute approved action' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/may have executed/i);
+    expect(screen.getByRole('alert')).toHaveTextContent(/do not retry/i);
+    expect(screen.queryByTestId('desktop-window-window_1')).not.toBeInTheDocument();
+    expect(screen.getByText('No window discovery result in this authenticated view.')).toBeInTheDocument();
+    expect(state.approvals[0].status).toBe('consumed');
+  });
+
+  it('discards stale observations and disables mutations when projection refresh fails', async () => {
+    setAuthSession({ token: 'operator-secret', kind: 'operator', role: 'operator' });
+    const { state, fetchMock } = createFixture();
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<DesktopPanel />);
+    await discoverAndInspect(user);
+
+    state.failProjectionRefresh = true;
+    await user.click(screen.getByRole('button', { name: 'Request click approval' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Projection refresh failed.');
+    expect(screen.queryByTestId('desktop-window-window_1')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('desktop-node-node_editor')).not.toBeInTheDocument();
+    expect(screen.getByText('No window discovery result in this authenticated view.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discover windows' })).toBeDisabled();
+    expect(screen.getByLabelText('Desktop action reason')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Request click approval' })).not.toBeInTheDocument();
   });
 
   it('stages typing in the desktop-only payload endpoint and never embeds raw text in the automation', async () => {
@@ -341,6 +420,17 @@ describe('DesktopPanel', () => {
     expect(screen.getByLabelText('Allowed desktop application')).toHaveValue('');
     expect(screen.getByLabelText('Desktop goal')).toHaveValue('');
     expect(screen.getByText('No window discovery result in this authenticated view.')).toBeInTheDocument();
+  });
+
+  it('keeps actions disabled when a stale worker projection conflicts with configured runtime health', async () => {
+    setAuthSession({ token: 'operator-secret', kind: 'operator', role: 'operator' });
+    const { fetchMock } = createFixture({ runtimeConfigured: true });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<DesktopPanel />);
+
+    expect(await screen.findByText('Native bridge health check failed.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Discover windows' })).toBeDisabled();
+    expect(screen.getByLabelText('Desktop action reason')).toBeDisabled();
   });
 
   it('rejects malformed worker content and clears every draft when an action returns 401', async () => {

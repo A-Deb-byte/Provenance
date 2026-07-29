@@ -181,6 +181,10 @@ The JSON must contain 1-32 unique objects with only `appId` and `executablePath`
 
 A packaged host ignores `DESKTOP_APP_ALLOWLIST` and `PROVENANCE_WORKSPACE_ROOT`. Its first-run native dialogs create per-user persisted selections only after confirmation. On a fresh per-user runtime, bootstrap the first administrator from that native launch. The dashboard consumes the one-time fragment authority, automatically logs in, and the server activates the health-checked, fixed-authority desktop worker in the same process; no restart is required. Native runtime state is placed under Tauri's per-user local application-data directory, outside both the packaged resource root and selected command workspace; standalone Node retains the repository-local `.agent-kernel` default. The native host generates the bootstrap secret, bridge secret, a private runtime-owner proof, its expected host PID, runtime path, and readiness values for the supervised child. Only the owner's SHA-256 proof hash is written to disk. Do not place per-launch values in `.env`.
 
+For the packaged first-run walkthrough, desktop approval flow, operating
+limits, and recovery steps, see the
+[`Native Desktop Operator Guide`](docs/native-desktop-operator-guide.md).
+
 Run the development server:
 
 ```bash
@@ -232,6 +236,7 @@ npm run replay-ledger:gate
 npm run desktop:release:test
 npm run desktop:resource-smoke
 npm run desktop:acceptance
+npm run desktop:acceptance-host
 npm audit --audit-level=high
 npm audit --omit=dev --audit-level=high
 cargo +1.97.0 fmt --manifest-path src-tauri/Cargo.toml -- --check
@@ -248,7 +253,7 @@ The 2026-07-22 working tree subsequently passed 570 TypeScript tests across 90 f
 
 The July 27 working tree passed **635 TypeScript tests across 96 files**, **68 Rust tests**, an **83-test release contract**, full and production JavaScript dependency audits, replay and strict-ledger gates, authenticated development-native acceptance, and a fresh license-complete silently installed/uninstalled unsigned pilot. See [`docs/Prd_Dev/2026-07-27-final-local-evidence.md`](docs/Prd_Dev/2026-07-27-final-local-evidence.md). The repair commit passed ordinary same-SHA Windows CI; protected signing, credential rotation, independent audit, and external pilot acceptance are still required.
 
-The July 29 operator-cockpit working tree passed **668 TypeScript tests across 99 files**, TypeScript lint, the production build, and an authenticated browser pass against the built `dist/server.cjs` at desktop and mobile breakpoints. See [`docs/Prd_Dev/2026-07-29-operator-cockpit-evidence.md`](docs/Prd_Dev/2026-07-29-operator-cockpit-evidence.md). This updates the current TypeScript/UI evidence only; it does not rerun or replace the July 27 Rust, release-contract, installed-pilot, audit, or remote CI evidence.
+The July 29 operator-cockpit working tree passed **668 TypeScript tests across 99 files**, TypeScript lint, the production build, and an authenticated browser pass against the built `dist/server.cjs` at desktop and mobile breakpoints. See [`docs/Prd_Dev/2026-07-29-operator-cockpit-evidence.md`](docs/Prd_Dev/2026-07-29-operator-cockpit-evidence.md). The subsequent native-desktop activation tree passed **678 TypeScript tests across 99 files**, **69 Rust tests**, the production build, and repeatable authenticated Tauri acceptance that matched its exact randomized controlled UIA window and cleaned up gracefully. The acceptance identity builds in its own Cargo target directory and does not replace the ordinary development executable. See [`docs/Prd_Dev/2026-07-29-native-desktop-activation-evidence.md`](docs/Prd_Dev/2026-07-29-native-desktop-activation-evidence.md). These are local development-native results; they do not replace protected signing, installed signed-binary acceptance, representative application pilots, audit, or remote CI evidence.
 
 `desktop:acceptance` is deterministic TypeScript evidence: it uses the real kernel and desktop worker but replaces the native bridge with a fixed fixture to cover health, discovery, inspection, approval continuation, click, hash-bound typing, payload consumption, and uncertain-outcome retry blocking. The ordinary Windows Rust test job now also creates a real temporary Win32 window and drives its checkbox and edit controls through UI Automation. That live fixture proves the broker against controlled Windows controls; it is not equivalent to product acceptance across arbitrary third-party applications or an external interactive security evaluation.
 

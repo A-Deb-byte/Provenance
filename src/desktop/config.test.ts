@@ -40,19 +40,33 @@ describe('desktop bridge configuration', () => {
   });
 
   it('fails closed for absent, partial, remote, or weak launch credentials', () => {
-    expect(resolveDesktopBridgeConfiguration({}).status).toBe('unavailable');
-    expect(resolveDesktopBridgeConfiguration({ DESKTOP_BRIDGE_URL: 'http://127.0.0.1:42/' }).reason)
-      .toMatch(/incomplete/);
+    expect(resolveDesktopBridgeConfiguration({})).toMatchObject({
+      status: 'unavailable',
+      reasonCode: 'native_host_absent',
+      remediation: expect.stringContaining('native desktop application'),
+    });
+    expect(resolveDesktopBridgeConfiguration({
+      DESKTOP_BRIDGE_URL: 'http://127.0.0.1:42/',
+    })).toMatchObject({
+      status: 'unavailable',
+      reasonCode: 'native_host_configuration_incomplete',
+    });
     expect(resolveDesktopBridgeConfiguration({
       DESKTOP_BRIDGE_URL: 'http://example.com:42/',
       DESKTOP_BRIDGE_TOKEN: 'x'.repeat(64),
       DESKTOP_APP_ALLOWLIST: JSON.stringify([{ appId: 'a', executablePath: 'C:\\x.exe' }]),
-    }).reason).toMatch(/loopback/);
+    })).toMatchObject({
+      status: 'unavailable',
+      reasonCode: 'native_bridge_origin_invalid',
+    });
     expect(resolveDesktopBridgeConfiguration({
       DESKTOP_BRIDGE_URL: 'http://127.0.0.1:42/',
       DESKTOP_BRIDGE_TOKEN: 'short',
       DESKTOP_APP_ALLOWLIST: JSON.stringify([{ appId: 'a', executablePath: 'C:\\x.exe' }]),
-    }).reason).toMatch(/32/);
+    })).toMatchObject({
+      status: 'unavailable',
+      reasonCode: 'native_bridge_credential_invalid',
+    });
   });
 
   it('returns sanitized configuration state without altering the token', () => {
@@ -64,6 +78,25 @@ describe('desktop bridge configuration', () => {
       }]),
     });
     expect(result.status).toBe('configured');
+    expect(result.reasonCode).toBe('native_bridge_configured');
     expect(result.configuration?.applications.map(({ id }) => id)).toEqual(['notepad']);
+  });
+
+  it('returns sanitized diagnostics when the allowlist is invalid', () => {
+    const result = resolveDesktopBridgeConfiguration({
+      DESKTOP_BRIDGE_URL: 'http://127.0.0.1:43123/',
+      DESKTOP_BRIDGE_TOKEN: 'private-bridge-token'.repeat(4),
+      DESKTOP_APP_ALLOWLIST: JSON.stringify([{
+        appId: 'private-app',
+        executablePath: 'C:\\private\\not-an-executable.txt',
+      }]),
+    });
+
+    expect(result).toMatchObject({
+      status: 'unavailable',
+      reason: 'The native desktop application allowlist failed validation.',
+      reasonCode: 'desktop_allowlist_invalid',
+    });
+    expect(`${result.reason} ${result.remediation}`).not.toMatch(/43123|private-bridge-token|C:\\private/u);
   });
 });

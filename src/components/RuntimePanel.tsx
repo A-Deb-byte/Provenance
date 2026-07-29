@@ -24,8 +24,23 @@ const featureLabels: Record<string, string> = {
   osSandbox: 'OS sandbox',
   releaseSigning: 'Release signing',
   releaseDeployment: 'Supervised core releases',
-  desktopIpc: 'Desktop shell IPC',
+  desktopIpc: 'Native host bridge',
   desktopAutomation: 'Windows UI Automation',
+};
+
+const nativeReadinessTitle = (feature: RuntimeFeatureStatus): string => {
+  switch (feature.reasonCode) {
+    case 'native_host_absent':
+      return 'Native desktop host required';
+    case 'native_bridge_health_failed':
+      return 'Native bridge needs attention';
+    case 'access_control_required':
+      return 'Protected access setup required';
+    case 'windows_uia_worker_missing':
+      return 'Windows UI Automation worker unavailable';
+    default:
+      return 'Windows desktop automation is not ready';
+  }
 };
 
 export const RuntimePanel: React.FC = () => {
@@ -35,10 +50,19 @@ export const RuntimePanel: React.FC = () => {
 
   useEffect(() => {
     let isDisposed = false;
+    let isInFlight = false;
+    let activeController: AbortController | null = null;
 
     const loadReport = async () => {
+      if (isDisposed || isInFlight) return;
+      isInFlight = true;
+      const controller = new AbortController();
+      activeController = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 10_000);
       try {
-        const response = await authenticatedFetch('/api/kernel/runtime-report');
+        const response = await authenticatedFetch('/api/kernel/runtime-report', {
+          signal: controller.signal,
+        });
         if (!response.ok) throw new Error(`Runtime report request failed with status ${response.status}.`);
         const payload: unknown = await response.json();
         if (!isRecord(payload) || !isRecord(payload.features) || !isRecord(payload.workers)) {
@@ -53,19 +77,33 @@ export const RuntimePanel: React.FC = () => {
           setError(loadError instanceof Error ? loadError.message : 'Runtime report request failed.');
         }
       } finally {
+        window.clearTimeout(timeout);
+        if (activeController === controller) activeController = null;
+        isInFlight = false;
         if (!isDisposed) setIsLoading(false);
       }
     };
 
     void loadReport();
-    const interval = setInterval(() => {
+    const interval = window.setInterval(() => {
       void loadReport();
-    }, 5000);
+    }, 5_000);
     return () => {
       isDisposed = true;
-      clearInterval(interval);
+      window.clearInterval(interval);
+      activeController?.abort();
     };
   }, []);
+
+  const desktopBridge = report?.features.desktopIpc;
+  const desktopAutomation = report?.features.desktopAutomation;
+  const nativeReadiness = desktopAutomation
+    && desktopAutomation.status !== 'available'
+    && desktopAutomation.reasonCode !== 'stop_all_active'
+    ? desktopAutomation
+    : desktopBridge?.status !== 'available'
+      ? desktopBridge
+      : null;
 
   return (
     <section
@@ -100,6 +138,38 @@ export const RuntimePanel: React.FC = () => {
 
       {!isLoading && !error && report && (
         <>
+          {nativeReadiness && (
+            <aside
+              aria-labelledby="native-readiness-title"
+              className="mt-4 rounded-2xl border border-amber-800/60 bg-amber-950/20 p-4"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-[10px] font-mono font-bold uppercase tracking-[0.24em] text-amber-400">
+                    Native readiness
+                  </p>
+                  <h3 id="native-readiness-title" className="mt-1 text-sm font-bold text-amber-100">
+                    {nativeReadinessTitle(nativeReadiness)}
+                  </h3>
+                </div>
+                {nativeReadiness.reasonCode && (
+                  <span className="rounded-full border border-amber-800 px-2 py-1 text-[9px] font-mono uppercase tracking-wider text-amber-300">
+                    {nativeReadiness.reasonCode}
+                  </span>
+                )}
+              </div>
+              <p className="mt-2 text-xs leading-relaxed text-slate-300">
+                {nativeReadiness.reasonCode === 'native_host_absent'
+                  ? 'This browser dashboard cannot establish Windows UI Automation authority by itself.'
+                  : nativeReadiness.reason}
+              </p>
+              <p className="mt-2 text-xs font-semibold leading-relaxed text-amber-200">
+                Next step: {nativeReadiness.remediation
+                  ?? 'Launch or restart the native desktop application and review its readiness report.'}
+              </p>
+            </aside>
+          )}
+
           <ul className="mt-4 space-y-1.5">
             {Object.entries(report.features).map(([key, feature]: [string, RuntimeFeatureStatus]) => (
               <li

@@ -244,9 +244,10 @@ describe('AgentObservatory', () => {
     await user.type(screen.getByLabelText('Stop All audit reason'), 'Old principal control reason.');
     await user.type(screen.getByLabelText('Audit reason'), 'Old principal approval reason.');
 
-    await act(async () => notifyAuthChange?.());
+    const requestCountBeforeAuthChange = vi.mocked(authenticatedFetch).mock.calls.length;
+    act(() => notifyAuthChange?.());
 
-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+    expect(authenticatedFetch).toHaveBeenCalledTimes(requestCountBeforeAuthChange + 1);
     expect(await screen.findByLabelText('Stop All audit reason')).toHaveValue('');
     expect(screen.getByLabelText('Audit reason')).toHaveValue('');
   });

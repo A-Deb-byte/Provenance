@@ -73,7 +73,11 @@ const validationContext = {
 
 describe('native host acceptance profiles', () => {
   it('uses distinct fixed identities and restricts production to ephemeral Actions', () => {
-    expect(new Set(Object.values(PROFILE_DEFINITIONS).map(({ identity }) => identity)).size).toBe(3);
+    expect(new Set(Object.values(PROFILE_DEFINITIONS).map(({ identity }) => identity)).size).toBe(4);
+    expect(PROFILE_DEFINITIONS.acceptance).toEqual({
+      identity: 'dev.provenance.desktop.acceptance',
+      packagedRelease: false,
+    });
     expect(PROFILE_DEFINITIONS.development).toEqual({
       identity: 'dev.provenance.desktop.development',
       packagedRelease: false,
@@ -85,20 +89,47 @@ describe('native host acceptance profiles', () => {
     })).toBe(PROFILE_DEFINITIONS.production);
   });
 
-  it('matches the compiled development and release configuration identities', () => {
+  it('matches the compiled acceptance, development, and release configuration identities', () => {
+    const acceptance = JSON.parse(readFileSync('src-tauri/tauri.acceptance.conf.json', 'utf8')) as {
+      identifier?: unknown;
+    };
     const development = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8')) as {
       identifier?: unknown;
     };
     const production = JSON.parse(readFileSync('src-tauri/tauri.release.conf.json', 'utf8')) as {
       identifier?: unknown;
     };
+    expect(acceptance.identifier).toBe(PROFILE_DEFINITIONS.acceptance.identity);
     expect(development.identifier).toBe(PROFILE_DEFINITIONS.development.identity);
     expect(production.identifier).toBe(PROFILE_DEFINITIONS.production.identity);
+  });
+
+  it('builds the acceptance identity outside the ordinary desktop target directory', () => {
+    const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as {
+      scripts?: Record<string, string>;
+    };
+    const launcher = readFileSync('scripts/native-acceptance-host.mjs', 'utf8');
+    expect(packageJson.scripts?.['desktop:acceptance-host']).toBe(
+      'node scripts/native-acceptance-host.mjs',
+    );
+    expect(launcher).toContain("path.join(root, 'src-tauri', 'target', 'acceptance')");
+    expect(launcher).toContain('CARGO_TARGET_DIR: targetDirectory');
+    expect(launcher).toContain("'node_modules', 'npm', 'bin', 'npm-cli.js'");
+    expect(launcher).not.toContain('npm.cmd');
+    expect(launcher).not.toContain("src-tauri', 'target', 'debug'");
   });
 
   it('requires the packaged flag exactly for production and pilot profiles', () => {
     expect(parseSmokeArguments(['--binary', 'host.exe'], {})).toMatchObject({
       profile: 'development',
+      packagedRelease: false,
+      expectedResourceManifestSha256: 'unverified-development',
+    });
+    expect(parseSmokeArguments([
+      '--binary', 'host.exe', '--profile', 'acceptance',
+    ], {})).toMatchObject({
+      profile: 'acceptance',
+      identity: 'dev.provenance.desktop.acceptance',
       packagedRelease: false,
       expectedResourceManifestSha256: 'unverified-development',
     });
@@ -121,6 +152,7 @@ describe('native host acceptance profiles', () => {
   });
 
   it('derives the compiled pilot version without carrying unrelated metadata', () => {
+    expect(expectedProfileBuildVersion('1.2.3', 'acceptance')).toBe('1.2.3');
     expect(expectedProfileBuildVersion('1.2.3', 'development')).toBe('1.2.3');
     expect(expectedProfileBuildVersion('1.2.3-rc.4+build.7', 'pilot')).toBe('1.2.3-pilot.1');
   });
@@ -309,7 +341,11 @@ describe('native host authentication boundary', () => {
           schemaVersion: 1,
           kind: 'desktop.windows',
           appId: 'windows.notepad',
-          windows: [],
+          windows: [{
+            windowId: 'window_acceptance',
+            title: 'Provenance native UIA acceptance',
+            treeRevision: 'revision_acceptance',
+          }],
         }),
       }),
     ];
@@ -328,11 +364,12 @@ describe('native host authentication boundary', () => {
       `Bearer ${'t'.repeat(64)}`,
       path.resolve('acceptance-workspace'),
       fetchImplementation,
+      { expectedWindowTitle: 'Provenance native UIA acceptance' },
     )).resolves.toEqual({
       goalId: 'goal_acceptance',
       automationId: 'automation_acceptance',
       workerId: 'worker.desktop.windows_uia',
-      discoveredWindows: 0,
+      discoveredWindows: 1,
     });
     expect(requests.map(({ input }) => input)).toEqual([
       'http://127.0.0.1:43123/api/kernel/goals',
@@ -353,6 +390,49 @@ describe('native host authentication boundary', () => {
         appId: 'windows.notepad',
       },
     });
+  });
+
+  it('rejects discovery evidence that contains only an unrelated allowlisted process window', async () => {
+    const responses = [
+      Response.json({ id: 'goal_acceptance' }, { status: 201 }),
+      Response.json({
+        id: 'automation_acceptance',
+        workerId: 'worker.desktop.windows_uia',
+        action: { type: 'desktop.discover', appId: 'windows.notepad' },
+      }, { status: 201 }),
+      Response.json({ id: 'automation_acceptance', enabled: true }),
+      Response.json({
+        decision: { kind: 'allow' },
+        dispatch: {
+          status: 'succeeded',
+          sourceRef: 'desktop:windows.notepad:windows',
+          summary: 'Recorded a different allowlisted PowerShell window.',
+        },
+        content: JSON.stringify({
+          schemaVersion: 1,
+          kind: 'desktop.windows',
+          appId: 'windows.notepad',
+          windows: [{
+            windowId: 'window_unrelated',
+            title: 'Unrelated PowerShell window',
+            treeRevision: 'revision_unrelated',
+          }],
+        }),
+      }),
+    ];
+    const fetchImplementation = async (): Promise<Response> => {
+      const response = responses.shift();
+      if (!response) throw new Error('Unexpected acceptance request.');
+      return response;
+    };
+
+    await expect(proveAuthenticatedDesktopDiscover(
+      { nodePort: 43123 },
+      `Bearer ${'t'.repeat(64)}`,
+      path.resolve('acceptance-workspace'),
+      fetchImplementation,
+      { expectedWindowTitle: 'Provenance native UIA acceptance' },
+    )).rejects.toThrow(/did not find its controlled fixture window/);
   });
 });
 

@@ -56,7 +56,15 @@ cargo +1.97.0 build --manifest-path src-tauri/Cargo.toml
 npm run desktop:startup-smoke -- --binary src-tauri/target/debug/provenance-desktop.exe --profile development
 ```
 
-The development build uses `dev.provenance.desktop.development`. The smoke command reserves fresh local and roaming profiles, creates isolated multi-user/auth/workspace/Notepad authority, passes a random acceptance nonce, and suppresses updater network activity. It logs in, verifies the session, performs a protected kernel read, requires the monitor-start handshake, completes exact-origin native navigation plus the one-use Rust-owned mount challenge, and validates the HMAC-authenticated full-readiness record. The proof binds the compiled identifier, Tauri application version, resource-manifest identity, and launch/process identities.
+The development build uses `dev.provenance.desktop.development`. The smoke command reserves fresh local and roaming profiles, creates isolated multi-user/auth/workspace authority plus a controlled visible WinForms UIA fixture, passes a random acceptance nonce, and suppresses updater network activity. It logs in, verifies the session, performs a protected kernel read, requires the monitor-start handshake, completes exact-origin native navigation plus the one-use Rust-owned mount challenge, validates the HMAC-authenticated full-readiness record, and requires native discovery to return the controlled fixture window. The proof binds the compiled identifier, Tauri application version, resource-manifest identity, and launch/process identities.
+
+On a workstation whose ordinary development identity already has user state,
+run `npm run desktop:acceptance-host` instead. It compiles the same host under
+the fixed `dev.provenance.desktop.acceptance` test identity in the separate
+`src-tauri/target/acceptance` Cargo target, exercises a fresh self-cleaning
+profile, and leaves the ordinary development executable plus development,
+pilot, and production profiles untouched. A fresh isolated Cargo target can
+take substantially longer than later incremental acceptance runs.
 
 The gate fails when:
 
@@ -66,6 +74,7 @@ The gate fails when:
 - Scheduling is enabled, updater network activity begins, native navigation leaves the exact origin, or the frontend cannot complete the fresh Rust-owned mount challenge.
 - The proof does not match the nonce, compiled identifier, Tauri application version, resource-manifest digest, pids, host instance, or packaged/development mode.
 - Login, session verification, protected kernel read, or the monitor-start handshake fails.
+- Discovery does not contain the exact randomized controlled fixture title, even if another window from the same executable exists.
 - Authenticated Node graceful shutdown fails, forced containment is needed, the attested Node pid survives, or owner/proof files survive shutdown.
 - An existing profile would be reused.
 

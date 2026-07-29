@@ -306,11 +306,57 @@ describe('runtime capability report', () => {
       providerStatuses,
       workerReport: { available: [], configured: [], unavailable: [] },
       stopAll: false,
-      desktopIpc: { status: 'configured', reason: 'Health check failed.' },
+      desktopIpc: {
+        status: 'configured',
+        reason: 'Health check failed.',
+        reasonCode: 'native_bridge_health_failed',
+        remediation: 'Restart the native desktop application.',
+      },
     });
     expect(available.features.desktopIpc.status).toBe('available');
     expect(available.features.desktopAutomation.status).toBe('available');
-    expect(configured.features.desktopAutomation).toEqual({ status: 'configured', reason: 'Health check failed.' });
+    expect(configured.features.desktopAutomation).toEqual({
+      status: 'configured',
+      reason: 'Health check failed.',
+      reasonCode: 'native_bridge_health_failed',
+      remediation: 'Restart the native desktop application.',
+    });
+  });
+
+  it('fails closed in both desktop bridge and worker disagreement directions', () => {
+    const bridgeOnly = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [], configured: [], unavailable: [] },
+      stopAll: false,
+      desktopIpc: {
+        status: 'available',
+        reason: 'Authenticated native host is healthy.',
+        reasonCode: 'native_bridge_ready',
+      },
+    });
+    const workerOnly = buildRuntimeCapabilityReport({
+      providerStatuses,
+      workerReport: { available: [DESKTOP_WORKER_ID], configured: [], unavailable: [] },
+      stopAll: false,
+      desktopIpc: {
+        status: 'configured',
+        reason: 'Native bridge health check failed.',
+        reasonCode: 'native_bridge_health_failed',
+        remediation: 'Restart the native desktop application.',
+      },
+    });
+
+    expect(bridgeOnly.features.desktopAutomation).toMatchObject({
+      status: 'unavailable',
+      reasonCode: 'windows_uia_worker_missing',
+      reason: expect.stringContaining('no executable Windows UI Automation worker'),
+    });
+    expect(workerOnly.features.desktopAutomation).toEqual({
+      status: 'configured',
+      reason: 'Native bridge health check failed.',
+      reasonCode: 'native_bridge_health_failed',
+      remediation: 'Restart the native desktop application.',
+    });
   });
 
   it('reports the durable scheduler clock separately from generic automations', () => {

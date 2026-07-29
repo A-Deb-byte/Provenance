@@ -445,11 +445,20 @@ export const DesktopPanel: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionWarning, setActionWarning] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<string | null>(null);
   const [activeAction, setActiveAction] = useState<ActiveAction>(null);
   const [authRevision, setAuthRevision] = useState(0);
   const [session, setSession] = useState(() => getAuthSession());
   const authEpoch = useRef(0);
+  const observationAuthority = useRef('');
+
+  const clearObservedState = useCallback(() => {
+    setWindows([]);
+    setSelectedWindowId('');
+    setTree(null);
+    setSelectedNodeId('');
+  }, []);
 
   const clearProtectedState = useCallback(() => {
     setWorkers([]);
@@ -460,10 +469,7 @@ export const DesktopPanel: React.FC = () => {
     setRuntime(null);
     setSelectedAppKey('');
     setSelectedGoalId('');
-    setWindows([]);
-    setSelectedWindowId('');
-    setTree(null);
-    setSelectedNodeId('');
+    clearObservedState();
     setSelectedActionAutomationId('');
     setAuditReason('');
     setApprovalReason('');
@@ -472,9 +478,10 @@ export const DesktopPanel: React.FC = () => {
     setIsLoading(false);
     setLoadError(null);
     setActionError(null);
+    setActionWarning(null);
     setActionStatus(null);
     setActiveAction(null);
-  }, []);
+  }, [clearObservedState]);
 
   const clearForUnauthorized = useCallback((error: unknown): boolean => {
     if (!isUnauthorized(error)) return false;
@@ -490,14 +497,15 @@ export const DesktopPanel: React.FC = () => {
     setAuthRevision((revision) => revision + 1);
   }), [clearProtectedState]);
 
-  const loadProjection = useCallback(async (epoch: number): Promise<void> => {
+  const loadProjection = useCallback(async (epoch: number, signal?: AbortSignal): Promise<void> => {
+    const requestOptions = signal ? { signal } : undefined;
     const [workerPayload, goalPayload, automationPayload, approvalPayload, eventPayload, runtimePayload] = await Promise.all([
-      requestJson('/api/kernel/workers'),
-      requestJson('/api/kernel/goals'),
-      requestJson('/api/kernel/automations'),
-      requestJson('/api/kernel/approvals'),
-      requestJson('/api/kernel/events'),
-      requestJson('/api/kernel/runtime-report'),
+      requestJson('/api/kernel/workers', requestOptions),
+      requestJson('/api/kernel/goals', requestOptions),
+      requestJson('/api/kernel/automations', requestOptions),
+      requestJson('/api/kernel/approvals', requestOptions),
+      requestJson('/api/kernel/events', requestOptions),
+      requestJson('/api/kernel/runtime-report', requestOptions),
     ]);
     const nextWorkers = parseWorkers(workerPayload);
     const nextGoals = parseGoals(goalPayload);
@@ -517,16 +525,28 @@ export const DesktopPanel: React.FC = () => {
 
   useEffect(() => {
     let disposed = false;
+    let inFlight = false;
+    let activeController: AbortController | null = null;
     const epoch = authEpoch.current;
     const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      if (!disposed && epoch === authEpoch.current) setIsLoading(true);
+      const controller = new AbortController();
+      activeController = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 10_000);
       try {
-        await loadProjection(epoch);
+        await loadProjection(epoch, controller.signal);
       } catch (error) {
         const unauthorized = clearForUnauthorized(error);
         if (!disposed && !unauthorized && epoch === authEpoch.current) {
+          clearObservedState();
           setLoadError(error instanceof Error ? error.message : 'Desktop cockpit state is unavailable.');
         }
       } finally {
+        window.clearTimeout(timeout);
+        if (activeController === controller) activeController = null;
+        inFlight = false;
         if (!disposed && epoch === authEpoch.current) setIsLoading(false);
       }
     };
@@ -536,8 +556,9 @@ export const DesktopPanel: React.FC = () => {
     return () => {
       disposed = true;
       window.clearInterval(interval);
+      activeController?.abort();
     };
-  }, [authRevision, clearForUnauthorized, loadProjection]);
+  }, [authRevision, clearForUnauthorized, clearObservedState, loadProjection]);
 
   const appOptions = useMemo(() => {
     const merged = new Map<string, AppOption>();
@@ -601,17 +622,35 @@ export const DesktopPanel: React.FC = () => {
   const isViewer = session?.role === 'viewer';
   const desktopRuntime = runtime?.features.desktopAutomation ?? runtime?.features.desktopIpc;
   const runtimeBlocked = desktopRuntime?.status === 'blocked';
-  const desktopAvailable = appOptions.length > 0 && desktopRuntime?.status !== 'unavailable';
-  const canMutate = desktopAvailable && !runtimeBlocked && !isViewer && activeAction === null;
+  const desktopAvailable = appOptions.length > 0 && desktopRuntime?.status === 'available';
+  const canMutate = desktopAvailable && !runtimeBlocked && !isViewer && !isLoading &&
+    loadError === null && activeAction === null;
+  const observationAuthorityKey = selectedApp && desktopRuntime?.status === 'available'
+    ? `${selectedApp.key}\u0000${[...selectedApp.operations].sort().join(',')}`
+    : '';
+
+  useEffect(() => {
+    const previous = observationAuthority.current;
+    observationAuthority.current = observationAuthorityKey;
+    if (!previous || previous === observationAuthorityKey) return;
+    clearObservedState();
+    if (session) {
+      setActionWarning('Desktop authority changed. Previous windows and controls were discarded; discover them again.');
+    }
+  }, [clearObservedState, observationAuthorityKey, session]);
 
   const refreshProjection = async (epoch: number): Promise<void> => {
+    if (epoch === authEpoch.current) setIsLoading(true);
     try {
       await loadProjection(epoch);
     } catch (error) {
-      clearForUnauthorized(error);
-      if (epoch === authEpoch.current) {
+      const unauthorized = clearForUnauthorized(error);
+      if (!unauthorized && epoch === authEpoch.current) {
+        clearObservedState();
         setLoadError(error instanceof Error ? error.message : 'Desktop cockpit refresh failed.');
       }
+    } finally {
+      if (epoch === authEpoch.current) setIsLoading(false);
     }
   };
 
@@ -652,6 +691,7 @@ export const DesktopPanel: React.FC = () => {
 
   const requireActionContext = (operation: DesktopActionType): { reason: string; epoch: number } | undefined => {
     setActionError(null);
+    setActionWarning(null);
     setActionStatus(null);
     const reason = auditReason.trim();
     if (!selectedApp || !selectedGoal) {
@@ -830,6 +870,7 @@ export const DesktopPanel: React.FC = () => {
     const epoch = authEpoch.current;
     setActiveAction(status === 'approved' ? 'approve' : 'deny');
     setActionError(null);
+    setActionWarning(null);
     setActionStatus(null);
     try {
       const decided = parseApproval(await requestJson(`/api/kernel/approvals/${encodeURIComponent(selectedApproval.id)}/decision`, {
@@ -857,6 +898,7 @@ export const DesktopPanel: React.FC = () => {
     const epoch = authEpoch.current;
     setActiveAction('execute');
     setActionError(null);
+    setActionWarning(null);
     setActionStatus(null);
     try {
       const outcome = parseRunOutcome(await requestJson(`/api/kernel/automations/${encodeURIComponent(selectedActionAutomation.id)}/run`, {
@@ -864,13 +906,21 @@ export const DesktopPanel: React.FC = () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({}),
       }));
+      if (outcome.decision.kind === 'allow' && outcome.dispatch?.status === 'uncertain') {
+        if (epoch !== authEpoch.current) return;
+        setActionWarning(
+          `Outcome uncertain: ${outcome.dispatch.summary} The action may have executed. Do not retry it; discover the window and inspect a fresh control tree.`,
+        );
+        clearObservedState();
+        await refreshProjection(epoch);
+        return;
+      }
       if (outcome.decision.kind !== 'allow' || outcome.dispatch?.status !== 'succeeded') {
         throw new Error(outcome.dispatch?.summary ?? outcome.decision.reason ?? 'Approved desktop action did not execute.');
       }
       if (epoch !== authEpoch.current) return;
       setActionStatus(`Desktop action completed: ${outcome.dispatch.summary}`);
-      setTree(null);
-      setSelectedNodeId('');
+      clearObservedState();
       await refreshProjection(epoch);
     } catch (error) {
       clearForUnauthorized(error);
@@ -916,6 +966,7 @@ export const DesktopPanel: React.FC = () => {
       {isLoading && <p role="status" className="mt-4 rounded-lg border border-sky-900/50 bg-sky-950/20 px-3 py-2 text-xs text-sky-300">Loading desktop authority...</p>}
       {loadError && <p role="alert" className="mt-4 rounded-lg border border-rose-900/60 bg-rose-950/20 px-3 py-2 text-xs text-rose-300">Desktop cockpit unavailable: {loadError}</p>}
       {actionError && <p role="alert" className="mt-4 rounded-lg border border-rose-900/60 bg-rose-950/20 px-3 py-2 text-xs text-rose-300">{actionError}</p>}
+      {actionWarning && <p role="alert" className="mt-4 rounded-lg border border-amber-800/70 bg-amber-950/25 px-3 py-2 text-xs text-amber-200">{actionWarning}</p>}
       {actionStatus && <p role="status" className="mt-4 rounded-lg border border-emerald-900/60 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-300">{actionStatus}</p>}
       {!isLoading && availabilityReason && <p className="mt-4 rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs text-slate-400">{availabilityReason}</p>}
       {isViewer && <p className="mt-4 rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2 text-xs text-slate-300">Viewer sessions can inspect recorded desktop state but cannot discover, inspect live controls, approve, or execute actions.</p>}

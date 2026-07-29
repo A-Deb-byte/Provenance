@@ -234,9 +234,17 @@ const createServerContext = async () => {
   const desktopConfiguration = resolveDesktopBridgeConfiguration(process.env);
   const accessMode = resolveAccessMode(userStore.count(), operatorToken);
   const desktopAuthorityConfigured = accessMode !== 'open';
+  const desktopBridgeHealthFailureStatus = (): RuntimeFeatureStatus => ({
+    status: 'configured',
+    reason: 'Native desktop bridge settings are present, but the authenticated health check failed.',
+    reasonCode: 'native_bridge_health_failed',
+    remediation: 'Restart the native desktop application. If the issue persists, review its coded recovery state and support diagnostics.',
+  });
   let desktopIpcStatus: RuntimeFeatureStatus = {
     status: desktopConfiguration.status,
     reason: desktopConfiguration.reason,
+    reasonCode: desktopConfiguration.reasonCode,
+    remediation: desktopConfiguration.remediation,
   };
   let desktopRegistration = desktopConfiguration.configuration
     ? buildDesktopWorkerRegistration(
@@ -297,6 +305,7 @@ const createServerContext = async () => {
       status: {
         status: 'available',
         reason: `An authenticated Windows desktop host is available for ${expectedApps.length} allowlisted application(s).`,
+        reasonCode: 'native_bridge_ready',
       },
     };
   };
@@ -308,6 +317,8 @@ const createServerContext = async () => {
         desktopIpcStatus = {
           status: 'blocked',
           reason: 'Native desktop execution is blocked until an operator token or multi-user access control is configured.',
+          reasonCode: 'access_control_required',
+          remediation: 'Complete first-administrator setup in the native desktop application or configure protected operator access.',
         };
       } else {
         desktopPayloadEnabled = true;
@@ -316,10 +327,7 @@ const createServerContext = async () => {
         desktopIpcStatus = runtime.status;
       }
     } catch {
-      desktopIpcStatus = {
-        status: 'configured',
-        reason: 'Native desktop bridge settings are present, but its authenticated health check failed.',
-      };
+      desktopIpcStatus = desktopBridgeHealthFailureStatus();
     }
   }
   const baseRegistrations = buildWorkerRegistrations(process.env);
@@ -467,10 +475,7 @@ const createServerContext = async () => {
     } catch (error) {
       desktopPayloadEnabled = false;
       desktopPayloadBacking?.clear();
-      desktopIpcStatus = {
-        status: 'configured',
-        reason: 'Native desktop bridge settings are present, but its authenticated health check failed.',
-      };
+      desktopIpcStatus = desktopBridgeHealthFailureStatus();
       throw error;
     } finally {
       if (desktopActivationPromise === pending) desktopActivationPromise = undefined;
@@ -594,12 +599,12 @@ const createServerContext = async () => {
         const accessMode = resolveAccessMode(userStore.count(), operatorToken);
         const schedulerStatus = recurringResearchScheduler?.status();
         const desktopHealth = desktopIpcStatus.status === 'available'
-          ? { status: 'ok' as const, reasonCode: 'available' }
+          ? { status: 'ok' as const, reasonCode: desktopIpcStatus.reasonCode ?? 'available' }
           : desktopIpcStatus.status === 'blocked'
-            ? { status: 'blocked' as const, reasonCode: 'blocked' }
+            ? { status: 'blocked' as const, reasonCode: desktopIpcStatus.reasonCode ?? 'blocked' }
             : desktopIpcStatus.status === 'configured'
-              ? { status: 'degraded' as const, reasonCode: 'configured' }
-              : { status: 'unavailable' as const, reasonCode: 'unavailable' };
+              ? { status: 'degraded' as const, reasonCode: desktopIpcStatus.reasonCode ?? 'configured' }
+              : { status: 'unavailable' as const, reasonCode: desktopIpcStatus.reasonCode ?? 'unavailable' };
         return [
           {
             component: 'access.control',

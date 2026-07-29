@@ -37,6 +37,10 @@ const noncePattern = /^[A-Za-z0-9_-]{43}$/u;
 const developmentResourceManifestSentinel = 'unverified-development';
 
 export const PROFILE_DEFINITIONS = Object.freeze({
+  acceptance: Object.freeze({
+    identity: 'dev.provenance.desktop.acceptance',
+    packagedRelease: false,
+  }),
   development: Object.freeze({
     identity: 'dev.provenance.desktop.development',
     packagedRelease: false,
@@ -92,6 +96,7 @@ const isPlainRecord = (value) => {
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 };
+const errorText = (error) => error instanceof Error ? error.message : String(error);
 const samePath = (left, right) => (
   process.platform === 'win32'
     ? path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase()
@@ -117,7 +122,7 @@ const validateNonce = (nonce) => {
 
 export const assertProfileMayRun = (profile, environment = process.env) => {
   if (!Object.hasOwn(PROFILE_DEFINITIONS, profile)) {
-    throw new Error('--profile must be development, production, or pilot.');
+    throw new Error('--profile must be acceptance, development, production, or pilot.');
   }
   if (profile === 'production' && !(
     environment.GITHUB_ACTIONS === 'true'
@@ -350,6 +355,171 @@ const fileExists = async (target) => {
     return true;
   } catch (error) {
     if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+};
+
+const startWindowsDesktopFixture = async (scratchRoot, maximumLifetimeMs) => {
+  if (process.platform !== 'win32') {
+    throw new Error('The native Windows acceptance fixture requires Windows.');
+  }
+  if (!Number.isSafeInteger(maximumLifetimeMs)
+      || maximumLifetimeMs < 30_000
+      || maximumLifetimeMs > 360_000) {
+    throw new Error('The Windows UIA fixture requires a bounded absolute lifetime.');
+  }
+  const executablePath = await realpath(path.join(
+    process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows',
+    'System32',
+    'WindowsPowerShell',
+    'v1.0',
+    'powershell.exe',
+  ));
+  const readyPath = path.join(scratchRoot, '.desktop-fixture-ready');
+  const stopPath = path.join(scratchRoot, '.desktop-fixture-stop');
+  const title = `Provenance native UIA acceptance ${crypto.randomUUID()}`;
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms',
+    'Add-Type -AssemblyName System.Drawing',
+    '$form = New-Object System.Windows.Forms.Form',
+    '$form.Text = $env:PROVENANCE_UIA_FIXTURE_TITLE',
+    '$form.Width = 420',
+    '$form.Height = 220',
+    '$form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual',
+    '$form.Location = New-Object System.Drawing.Point(40, 40)',
+    '$form.ShowInTaskbar = $false',
+    '$toggle = New-Object System.Windows.Forms.CheckBox',
+    '$toggle.Name = "AcceptanceToggle"',
+    '$toggle.Text = "Acceptance toggle"',
+    '$toggle.Location = New-Object System.Drawing.Point(24, 28)',
+    '$input = New-Object System.Windows.Forms.TextBox',
+    '$input.Name = "AcceptanceInput"',
+    '$input.AccessibleName = "Acceptance input"',
+    '$input.Location = New-Object System.Drawing.Point(24, 74)',
+    '$input.Width = 340',
+    '$form.Controls.Add($toggle)',
+    '$form.Controls.Add($input)',
+    '$timer = New-Object System.Windows.Forms.Timer',
+    '$timer.Interval = 200',
+    '$timer.Add_Tick({',
+    '  $owner = Get-Process -Id ([int]$env:PROVENANCE_UIA_FIXTURE_OWNER_PID) -ErrorAction SilentlyContinue',
+    '  $expired = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge ([long]$env:PROVENANCE_UIA_FIXTURE_DEADLINE_MS)',
+    '  if (-not $owner -or $expired -or (Test-Path -LiteralPath $env:PROVENANCE_UIA_FIXTURE_STOP)) {',
+    '    $timer.Stop()',
+    '    $form.Close()',
+    '  }',
+    '})',
+    '$form.Add_Shown({',
+    '  [System.IO.File]::WriteAllText($env:PROVENANCE_UIA_FIXTURE_READY, "ready")',
+    '  $timer.Start()',
+    '})',
+    '[void]$form.ShowDialog()',
+  ].join('\r\n');
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  const logs = { stdout: '', stderr: '' };
+  const child = spawn(executablePath, [
+    '-NoLogo',
+    '-NoProfile',
+    '-NonInteractive',
+    '-ExecutionPolicy',
+    'Bypass',
+    '-STA',
+    '-EncodedCommand',
+    encoded,
+  ], {
+    cwd: scratchRoot,
+    env: {
+      ...inheritedEnvironment(),
+      PROVENANCE_UIA_FIXTURE_READY: readyPath,
+      PROVENANCE_UIA_FIXTURE_STOP: stopPath,
+      PROVENANCE_UIA_FIXTURE_TITLE: title,
+      PROVENANCE_UIA_FIXTURE_OWNER_PID: String(process.pid),
+      PROVENANCE_UIA_FIXTURE_DEADLINE_MS: String(Date.now() + maximumLifetimeMs),
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  child.stdout.on('data', (chunk) => {
+    logs.stdout = appendBounded(logs.stdout, chunk);
+  });
+  child.stderr.on('data', (chunk) => {
+    logs.stderr = appendBounded(logs.stderr, chunk);
+  });
+  await new Promise((resolve, reject) => {
+    const spawned = () => {
+      child.off('error', failed);
+      resolve();
+    };
+    const failed = (error) => {
+      child.off('spawn', spawned);
+      reject(new Error(`The Windows UIA fixture could not be spawned: ${error.message}`));
+    };
+    child.once('spawn', spawned);
+    child.once('error', failed);
+  });
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (isProcessComplete(child)) {
+      throw new Error(
+        `The Windows UIA fixture exited before readiness (code ${child.exitCode}). `
+        + `stdout=${tail(logs.stdout)} stderr=${tail(logs.stderr)}`,
+      );
+    }
+    if (await fileExists(readyPath)) {
+      return {
+        appId: 'windows.acceptance_fixture',
+        executablePath,
+        child,
+        logs,
+        stopPath,
+        title,
+      };
+    }
+    await delay(pollIntervalMs);
+  }
+  const terminated = child.kill('SIGKILL');
+  if (!terminated) {
+    throw new Error(
+      `The Windows UIA fixture did not become visible and could not be terminated. `
+      + `stdout=${tail(logs.stdout)} stderr=${tail(logs.stderr)}`,
+    );
+  }
+  try {
+    await waitForExit(child, 5_000);
+  } catch {
+    throw new Error(
+      `The Windows UIA fixture did not become visible and survived forced termination. `
+      + `stdout=${tail(logs.stdout)} stderr=${tail(logs.stderr)}`,
+    );
+  }
+  throw new Error(
+    `The Windows UIA fixture did not become visible. stdout=${tail(logs.stdout)} stderr=${tail(logs.stderr)}`,
+  );
+};
+
+const stopWindowsDesktopFixture = async (fixture) => {
+  if (!fixture || isProcessComplete(fixture.child)) return;
+  try {
+    await writeFile(fixture.stopPath, 'stop', { encoding: 'utf8', flag: 'wx' });
+    const exit = await waitForExit(fixture.child, 10_000);
+    if (exit.code !== 0 || exit.signal !== null) {
+      throw new Error(
+        `The Windows UIA fixture did not exit cleanly (code ${exit.code}, signal ${exit.signal}).`,
+      );
+    }
+  } catch (error) {
+    if (!isProcessComplete(fixture.child)) {
+      const terminated = fixture.child.kill('SIGKILL');
+      if (!terminated) {
+        throw new Error(`The Windows UIA fixture cleanup failed and could not terminate its process: ${errorText(error)}`);
+      }
+      try {
+        await waitForExit(fixture.child, 5_000);
+      } catch {
+        throw new Error(`The Windows UIA fixture survived forced cleanup after: ${errorText(error)}`);
+      }
+    }
     throw error;
   }
 };
@@ -591,11 +761,15 @@ export const proveAuthenticatedDesktopDiscover = async (
   authorization,
   workspaceRoot,
   fetchImplementation = fetch,
+  options = {},
 ) => {
   if (typeof authorization !== 'string' || !authorization.startsWith('Bearer ')
       || typeof workspaceRoot !== 'string' || !path.isAbsolute(workspaceRoot)) {
     throw new Error('Native acceptance desktop proof requires its authenticated session and scratch workspace.');
   }
+  const appId = typeof options.appId === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/u.test(options.appId)
+    ? options.appId
+    : 'windows.notepad';
   const origin = `http://127.0.0.1:${record.nodePort}`;
   const postJson = async (pathname, body, expectedStatus) => {
     const response = await fetchImplementation(`${origin}/api/kernel${pathname}`, {
@@ -623,7 +797,7 @@ export const proveAuthenticatedDesktopDiscover = async (
     objective: 'Prove authenticated native desktop discovery',
     successCriteria: ['The Windows UI Automation worker returns a succeeded discovery result.'],
     constraints: [
-      'Use only the configured windows.notepad application scope.',
+      `Use only the configured ${appId} application scope.`,
       'Do not mutate any desktop application.',
     ],
     autonomyLevel: 'supervised',
@@ -641,15 +815,15 @@ export const proveAuthenticatedDesktopDiscover = async (
   }
 
   const automation = await postJson('/automations', {
-    name: 'Native acceptance Notepad discovery',
+    name: 'Native acceptance UIA fixture discovery',
     goalId: goal.id,
     workerId: 'worker.desktop.windows_uia',
     riskLevel: 'L0',
-    action: { type: 'desktop.discover', appId: 'windows.notepad' },
+    action: { type: 'desktop.discover', appId },
     scope: {
       family: 'desktop',
       operations: ['desktop.discover'],
-      appId: 'windows.notepad',
+      appId,
     },
     trigger: { type: 'manual' },
     approvalMode: 'per_run',
@@ -659,7 +833,7 @@ export const proveAuthenticatedDesktopDiscover = async (
       || automation.workerId !== 'worker.desktop.windows_uia'
       || !isPlainRecord(automation.action)
       || automation.action.type !== 'desktop.discover'
-      || automation.action.appId !== 'windows.notepad') {
+      || automation.action.appId !== appId) {
     throw new Error('Native acceptance automation was not bound to the exact desktop discovery scope.');
   }
 
@@ -677,7 +851,7 @@ export const proveAuthenticatedDesktopDiscover = async (
   );
   if (!isPlainRecord(outcome.decision) || outcome.decision.kind !== 'allow'
       || !isPlainRecord(outcome.dispatch) || outcome.dispatch.status !== 'succeeded'
-      || outcome.dispatch.sourceRef !== 'desktop:windows.notepad:windows'
+      || outcome.dispatch.sourceRef !== `desktop:${appId}:windows`
       || typeof outcome.content !== 'string') {
     const dispatch = isPlainRecord(outcome.dispatch) ? outcome.dispatch : {};
     const detail = [
@@ -700,9 +874,24 @@ export const proveAuthenticatedDesktopDiscover = async (
   if (!isPlainRecord(discovery)
       || discovery.schemaVersion !== 1
       || discovery.kind !== 'desktop.windows'
-      || discovery.appId !== 'windows.notepad'
+      || discovery.appId !== appId
       || !Array.isArray(discovery.windows)) {
     throw new Error('Native acceptance desktop discovery returned an invalid UIA observation.');
+  }
+  if (discovery.windows.length === 0) {
+    throw new Error('Native acceptance desktop discovery found no controlled fixture window.');
+  }
+  for (const window of discovery.windows) {
+    if (!isPlainRecord(window)
+        || typeof window.windowId !== 'string' || !window.windowId
+        || typeof window.title !== 'string'
+        || typeof window.treeRevision !== 'string' || !window.treeRevision) {
+      throw new Error('Native acceptance desktop discovery returned an invalid window record.');
+    }
+  }
+  if (typeof options.expectedWindowTitle === 'string'
+      && !discovery.windows.some((window) => window.title === options.expectedWindowTitle)) {
+    throw new Error('Native acceptance desktop discovery did not find its controlled fixture window.');
   }
   return {
     goalId: goal.id,
@@ -853,6 +1042,7 @@ export const runNativeHostAcceptance = async (options) => {
   let primaryError;
   const logs = { stdout: '', stderr: '' };
   let adminCredentials;
+  let desktopFixture;
 
   try {
     const configReservation = await reserveProfile(appData, options.identity, runId);
@@ -888,12 +1078,14 @@ export const runNativeHostAcceptance = async (options) => {
       ), { encoding: 'utf8', mode: 0o600, flag: 'wx' }),
     ]);
 
-    const notepad = await realpath(path.join(
-      process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows',
-      'System32',
-      'notepad.exe',
-    ));
-    const allowlist = [{ appId: 'windows.notepad', executablePath: notepad }];
+    desktopFixture = await startWindowsDesktopFixture(
+      scratchRoot,
+      Math.min(360_000, options.timeoutMs + 60_000),
+    );
+    const allowlist = [{
+      appId: desktopFixture.appId,
+      executablePath: desktopFixture.executablePath,
+    }];
     if (options.packagedRelease) {
       await Promise.all([
         writeFile(
@@ -994,7 +1186,13 @@ export const runNativeHostAcceptance = async (options) => {
       record,
       authenticationEvidence.authorization,
       workspaceRoot,
+      fetch,
+      {
+        appId: desktopFixture.appId,
+        expectedWindowTitle: desktopFixture.title,
+      },
     );
+    await stopWindowsDesktopFixture(desktopFixture);
     await delay(livenessSoakMs);
     if (isProcessComplete(child)) {
       throw new Error('The native host exited during the authenticated liveness soak.');
@@ -1042,6 +1240,13 @@ export const runNativeHostAcceptance = async (options) => {
     primaryError = error instanceof Error ? error : new Error(String(error));
   } finally {
     const cleanupErrors = [];
+    if (desktopFixture && !isProcessComplete(desktopFixture.child)) {
+      try {
+        await stopWindowsDesktopFixture(desktopFixture);
+      } catch (error) {
+        cleanupErrors.push(error instanceof Error ? error : new Error(String(error)));
+      }
+    }
     if (child && !isProcessComplete(child)) {
       forcedTermination = true;
       try {

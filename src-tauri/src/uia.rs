@@ -693,8 +693,7 @@ mod windows_worker {
                 if summaries.len() >= MAX_WINDOWS_PER_APP {
                     break;
                 }
-                let pid = window_pid(hwnd).ok_or(DesktopExecutionError::FailedClosed)?;
-                let Ok(path) = process_path(pid) else {
+                let Some((pid, path)) = window_process_identity(hwnd) else {
                     continue;
                 };
                 if !paths_equal(&path, &allowed.executable_path) {
@@ -1323,6 +1322,12 @@ mod windows_worker {
         (pid > 0).then_some(pid)
     }
 
+    fn window_process_identity(hwnd: HWND) -> Option<(u32, PathBuf)> {
+        let pid = window_pid(hwnd)?;
+        let path = process_path(pid).ok()?;
+        Some((pid, path))
+    }
+
     fn process_path(pid: u32) -> Result<PathBuf, DesktopExecutionError> {
         unsafe {
             let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
@@ -1371,6 +1376,16 @@ mod windows_worker {
             hasher.update(value);
         }
         hex::encode(hasher.finalize())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn invalid_window_is_not_a_process_identity_candidate() {
+            assert!(window_process_identity(HWND::default()).is_none());
+        }
     }
 }
 

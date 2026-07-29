@@ -15,6 +15,8 @@ export interface DesktopBridgeConfiguration {
 export interface DesktopBridgeConfigurationResult {
   status: 'unavailable' | 'configured';
   reason: string;
+  reasonCode: string;
+  remediation: string;
   configuration?: DesktopBridgeConfiguration;
 }
 
@@ -69,32 +71,50 @@ export const resolveDesktopBridgeConfiguration = (
   if (!baseUrl && !token && !allowlist) {
     return {
       status: 'unavailable',
-      reason: 'No native desktop host launch credentials or application allowlist are configured.',
+      reason: 'This server was not launched by an authenticated native desktop host.',
+      reasonCode: 'native_host_absent',
+      remediation: 'Launch the native desktop application and complete its application allowlist and workspace setup.',
     };
   }
   if (!baseUrl || !token || !allowlist) {
     return {
       status: 'unavailable',
-      reason: 'Desktop bridge configuration is incomplete; URL, token, and application allowlist are all required.',
+      reason: 'The native desktop host supplied an incomplete per-launch bridge configuration.',
+      reasonCode: 'native_host_configuration_incomplete',
+      remediation: 'Close this server and restart it from the native desktop application.',
     };
   }
   if (!isLoopbackDesktopBridgeUrl(baseUrl)) {
-    return { status: 'unavailable', reason: 'Desktop bridge URL is not an explicit loopback HTTP origin.' };
+    return {
+      status: 'unavailable',
+      reason: 'The native desktop bridge origin failed its loopback-only validation.',
+      reasonCode: 'native_bridge_origin_invalid',
+      remediation: 'Close this server and restart it from a trusted native desktop installation.',
+    };
   }
   if (token.length < 32) {
-    return { status: 'unavailable', reason: 'Desktop bridge token is shorter than 32 characters.' };
+    return {
+      status: 'unavailable',
+      reason: 'The native desktop bridge credential failed validation.',
+      reasonCode: 'native_bridge_credential_invalid',
+      remediation: 'Close this server and restart it from the native desktop application to create new per-launch credentials.',
+    };
   }
   try {
     const applications = parseDesktopApplicationAllowlist(allowlist);
     return {
       status: 'configured',
       reason: 'Native desktop bridge credentials and an executable allowlist are configured.',
+      reasonCode: 'native_bridge_configured',
+      remediation: 'Wait for the authenticated native bridge health check to complete.',
       configuration: { baseUrl, token, applications },
     };
-  } catch (error) {
+  } catch {
     return {
       status: 'unavailable',
-      reason: error instanceof Error ? error.message : 'Desktop application allowlist is invalid.',
+      reason: 'The native desktop application allowlist failed validation.',
+      reasonCode: 'desktop_allowlist_invalid',
+      remediation: 'Reconfigure the application allowlist from the native desktop application.',
     };
   }
 };
