@@ -3,8 +3,10 @@
 ## Scope
 
 This is local, mutable evidence for `codex/production-desktop-release-v1` after
-the July 27 hardening changes. It is not same-SHA remote CI evidence, a signed
-production release, an independent security audit, or external pilot acceptance.
+the July 27 hardening changes. The separate ordinary same-SHA CI evidence for
+the repair commit is recorded in `2026-07-29-ordinary-ci-repair.md`; neither
+document proves a signed production release, an independent security audit, or
+external pilot acceptance.
 
 ## Current Source Gates
 
@@ -67,12 +69,13 @@ did not pass ordinary Windows CI: a Windows path-spelling assertion and a
 30-second full-runtime test budget failed in the TypeScript step. The narrow
 repair and its local recheck are recorded in
 [`2026-07-29-ordinary-ci-repair.md`](./2026-07-29-ordinary-ci-repair.md).
-This document therefore remains local evidence until the repair commit passes
-ordinary remote CI for its exact SHA.
+The repair commit then passed ordinary remote CI for its exact SHA. The installed
+pilot and other source evidence here remain local and mutable observations.
 
 ## Remaining Release Gates
 
-- Push the repair candidate and require ordinary remote CI for its exact SHA.
+- Ordinary CI is green for repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6`;
+  require a new ordinary CI pass for any later source-changing commit.
 - Run the protected release workflow with protected production Node, Docker,
   certificate, timestamp, updater-key, environment-approval, and publication
   authority.

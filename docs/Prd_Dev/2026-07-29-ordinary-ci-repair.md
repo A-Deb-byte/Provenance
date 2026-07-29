@@ -2,10 +2,9 @@
 
 ## Scope
 
-This note records a failed ordinary Windows CI attempt and the narrow source-test
-repair that followed. It is not evidence that the repaired commit has passed
-remote CI, a protected production release, an independent audit, or an external
-pilot.
+This note records a failed ordinary Windows CI attempt, the narrow source-test
+repair that followed, and its ordinary remote CI result. It is not evidence of a
+protected production release, an independent audit, or an external pilot.
 
 ## Observed Failure
 
@@ -42,6 +41,14 @@ The repair working tree passed:
 | TypeScript | `npm test` passed 635 tests across 96 files. |
 | TypeScript compile | `npm run lint` (`tsc --noEmit`) passed. |
 
-The next ordinary CI workflow for the repair commit is required evidence. The
-protected signing workflow, credential rotation, independent review, and
-external pilot remain separate release gates.
+## Same-SHA Ordinary CI Result
+
+Repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6` passed ordinary
+[Native desktop verification run 15](https://github.com/A-Deb-byte/Provenance/actions/runs/30418134217).
+The Windows job passed TypeScript lint and tests, release-policy tests,
+deterministic acceptance, the packaged-server smoke, dependency audits, Rust
+format/test/check/Clippy gates, native build, and native-host startup smoke.
+
+This establishes ordinary CI evidence for the repair commit. The protected
+signing workflow, credential rotation, independent review, and external pilot
+remain separate release gates.

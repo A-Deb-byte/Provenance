@@ -3,7 +3,7 @@
 Date: 2026-07-27
 Purpose: the authoritative concise answer to "what does this product do, and what is still missing?"
 
-Verification note: the July 27 working tree passed a **635-test TypeScript matrix across 96 files**, **68 Rust tests**, an **83-test release contract**, full and production JavaScript dependency audits, replay and strict-ledger gates, authenticated development-native acceptance, and an exact installed/uninstalled unsigned pilot with Node and Rust license/notice inventory hash-bound in its sidecar. See [`../Prd_Dev/2026-07-27-final-local-evidence.md`](../Prd_Dev/2026-07-27-final-local-evidence.md). These are local mutable results; same-SHA CI must still pass. No local code or self-test proves that a signed production installer has been produced, published, independently audited, or accepted against representative third-party applications.
+Verification note: the July 27 working tree passed a **635-test TypeScript matrix across 96 files**, **68 Rust tests**, an **83-test release contract**, full and production JavaScript dependency audits, replay and strict-ledger gates, authenticated development-native acceptance, and an exact installed/uninstalled unsigned pilot with Node and Rust license/notice inventory hash-bound in its sidecar. See [`../Prd_Dev/2026-07-27-final-local-evidence.md`](../Prd_Dev/2026-07-27-final-local-evidence.md). Repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6` passed ordinary same-SHA CI. No local code or self-test proves that a signed production installer has been produced, published, independently audited, or accepted against representative third-party applications.
 
 ## What This Product Is
 

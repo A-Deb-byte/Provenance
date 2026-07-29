@@ -2,7 +2,7 @@
 
 - Target: `x86_64-pc-windows-msvc`
 - Pinned CI toolchain: Rust 1.97.0 and Node.js 22.23.1
-- Status: local instructions; remote CI, protected release execution, independent audit, and external pilot remain pending
+- Status: ordinary Windows CI passed for repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6`; protected release execution, independent audit, and external pilot remain pending
 
 ## Prerequisites
 
