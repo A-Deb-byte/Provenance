@@ -108,7 +108,11 @@ const approvalRecord = (automationId: string, status: 'pending' | 'approved' | '
   updatedAt: '2026-07-15T00:01:00.000Z',
 });
 
-const createFixture = (options: { invalidDiscovery?: boolean; unauthorizedRun?: boolean } = {}) => {
+const createFixture = (options: {
+  delayedAuthority?: boolean;
+  invalidDiscovery?: boolean;
+  unauthorizedRun?: boolean;
+} = {}) => {
   const state: FixtureState = { automations: [], approvals: [], events: [], bodies: [], runCounts: {} };
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -120,7 +124,10 @@ const createFixture = (options: { invalidDiscovery?: boolean; unauthorizedRun?: 
     }
     if (method !== 'GET') state.bodies.push({ url, body });
 
-    if (method === 'GET' && url === '/api/kernel/workers') return response({ workers: [worker], report: { available: [worker.id], configured: [], unavailable: [] } });
+    if (method === 'GET' && url === '/api/kernel/workers') {
+      if (options.delayedAuthority) await new Promise((resolve) => setTimeout(resolve, 25));
+      return response({ workers: [worker], report: { available: [worker.id], configured: [], unavailable: [] } });
+    }
     if (method === 'GET' && url === '/api/kernel/goals') return response({ goals: [goal] });
     if (method === 'GET' && url === '/api/kernel/automations') return response({ automations: state.automations });
     if (method === 'GET' && url === '/api/kernel/approvals') return response({ approvals: state.approvals });
@@ -193,12 +200,28 @@ const createFixture = (options: { invalidDiscovery?: boolean; unauthorizedRun?: 
   return { state, fetchMock };
 };
 
+const enterDesktopActionReason = async (
+  user: ReturnType<typeof userEvent.setup>,
+  reason: string,
+): Promise<HTMLElement> => {
+  const input = await screen.findByLabelText('Desktop action reason');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, reason);
+  expect(input).toHaveValue(reason);
+  return input;
+};
+
 const discoverAndInspect = async (user: ReturnType<typeof userEvent.setup>) => {
-  await user.type(await screen.findByLabelText('Desktop action reason'), 'Inspect the operator-selected Notepad window.');
+  const reason = 'Inspect the operator-selected Notepad window.';
+  const reasonInput = await enterDesktopActionReason(user, reason);
   await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
   await user.click(screen.getByRole('button', { name: 'Discover windows' }));
   expect(await screen.findByTestId('desktop-window-window_1')).toHaveTextContent('Untitled - Notepad');
-  await user.click(screen.getByRole('button', { name: 'Inspect controls' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
+  expect(reasonInput).toHaveValue(reason);
+  const inspectButton = screen.getByRole('button', { name: 'Inspect controls' });
+  await waitFor(() => expect(inspectButton).toBeEnabled());
+  await user.click(inspectButton);
   expect(await screen.findByTestId('desktop-node-node_editor')).toHaveTextContent('Text editor');
 };
 
@@ -322,11 +345,11 @@ describe('DesktopPanel', () => {
 
   it('rejects malformed worker content and clears every draft when an action returns 401', async () => {
     setAuthSession({ token: 'operator-secret', kind: 'operator', role: 'operator' });
-    const invalid = createFixture({ invalidDiscovery: true });
+    const invalid = createFixture({ delayedAuthority: true, invalidDiscovery: true });
     vi.stubGlobal('fetch', invalid.fetchMock);
     const user = userEvent.setup();
     const view = render(<DesktopPanel />);
-    await user.type(await screen.findByLabelText('Desktop action reason'), 'Parse only trusted worker schemas.');
+    await enterDesktopActionReason(user, 'Parse only trusted worker schemas.');
     await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: 'Discover windows' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('invalid JSON');
@@ -335,10 +358,10 @@ describe('DesktopPanel', () => {
     view.unmount();
     cleanup();
     setAuthSession({ token: 'operator-secret', kind: 'operator', role: 'operator' });
-    const unauthorized = createFixture({ unauthorizedRun: true });
+    const unauthorized = createFixture({ delayedAuthority: true, unauthorizedRun: true });
     vi.stubGlobal('fetch', unauthorized.fetchMock);
     render(<DesktopPanel />);
-    await user.type(await screen.findByLabelText('Desktop action reason'), 'This draft must be purged.');
+    await enterDesktopActionReason(user, 'This draft must be purged.');
     await waitFor(() => expect(screen.getByRole('button', { name: 'Discover windows' })).toBeEnabled());
     await user.click(screen.getByRole('button', { name: 'Discover windows' }));
 

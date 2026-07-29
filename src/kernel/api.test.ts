@@ -7,6 +7,8 @@ import express from 'express';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createApprovalRecord } from './approvals';
 import { createKernelRouter } from './api';
+import { MAX_KERNEL_AUDIT_REASON_CHARS, MAX_PROVIDER_REQUEST_ID_CHARS } from './kernel';
+import type { ObservatorySnapshot } from './observatory';
 import { createSkillEvaluationSource } from './skills/evaluationSuite';
 import { createEmptyKernelState, writeKernelState } from './store';
 import {
@@ -168,6 +170,51 @@ describe('kernel API', () => {
     ]);
   });
 
+  it('returns one bounded server-authoritative observatory projection', async () => {
+    const created = await postJson<GoalContract>('/goals', goalInput());
+    expect(created.response.status).toBe(201);
+
+    const observatory = await requestJson<ObservatorySnapshot>('/observatory');
+    expect(observatory.response.status).toBe(200);
+    expect(observatory.body).toMatchObject({
+      schemaVersion: 1,
+      counts: {
+        goals: 1,
+        activeGoals: 1,
+        tasks: 1,
+      },
+      controls: { stopAll: false },
+    });
+    expect(observatory.body.goals[0]).toMatchObject({
+      id: created.body.id,
+      objective: 'Verify the API fixture',
+      status: 'active',
+    });
+    expect(observatory.body.activities.map((activity) => activity.type)).toContain('goal.created');
+    expect(observatory.body).not.toHaveProperty('state');
+    expect(observatory.body.activities[0]).not.toHaveProperty('payload');
+  });
+
+  it('rejects oversized observatory identifiers and audit reasons at the API boundary', async () => {
+    const providerCall = await postJson<{ error: string }>('/goals/goal_1/provider-calls', {
+      request: {
+        id: 'r'.repeat(MAX_PROVIDER_REQUEST_ID_CHARS + 1),
+        messages: [{ role: 'user', content: 'Fixture' }],
+        requiredCapabilities: ['text'],
+        responseFormat: { type: 'text' },
+      },
+      policy: { mode: 'pinned', provider: 'openrouter' },
+    });
+    expect(providerCall.response.status).toBe(400);
+    expect(providerCall.body.error).toContain(`at most ${MAX_PROVIDER_REQUEST_ID_CHARS}`);
+
+    const stop = await postJson<{ error: string }>('/controls/stop-all', {
+      reason: 'r'.repeat(MAX_KERNEL_AUDIT_REASON_CHARS + 1),
+    });
+    expect(stop.response.status).toBe(400);
+    expect(stop.body.error).toContain(`at most ${MAX_KERNEL_AUDIT_REASON_CHARS}`);
+  });
+
   it('rejects malformed goal input', async () => {
     const result = await postJson<{ error: string }>('/goals', { objective: '' });
     expect(result.response.status).toBe(400);
@@ -207,6 +254,13 @@ describe('kernel API', () => {
     });
     expect(missingReason.response.status).toBe(400);
     expect(missingReason.body.error).toBe('Approval decision reason is required.');
+
+    const oversizedReason = await postJson<{ error: string }>('/approvals/approval_1/decision', {
+      status: 'approved',
+      reason: 'r'.repeat(MAX_KERNEL_AUDIT_REASON_CHARS + 1),
+    });
+    expect(oversizedReason.response.status).toBe(400);
+    expect(oversizedReason.body.error).toContain(`at most ${MAX_KERNEL_AUDIT_REASON_CHARS}`);
 
     const approval = createApprovalRecord({
       goalId: 'goal_1',

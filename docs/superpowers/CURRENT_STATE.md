@@ -1,9 +1,9 @@
 # Current State - Capability Matrix
 
-Date: 2026-07-27
+Date: 2026-07-29
 Purpose: the authoritative concise answer to "what does this product do, and what is still missing?"
 
-Verification note: the July 27 working tree passed a **635-test TypeScript matrix across 96 files**, **68 Rust tests**, an **83-test release contract**, full and production JavaScript dependency audits, replay and strict-ledger gates, authenticated development-native acceptance, and an exact installed/uninstalled unsigned pilot with Node and Rust license/notice inventory hash-bound in its sidecar. See [`../Prd_Dev/2026-07-27-final-local-evidence.md`](../Prd_Dev/2026-07-27-final-local-evidence.md). Repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6` passed ordinary same-SHA CI. No local code or self-test proves that a signed production installer has been produced, published, independently audited, or accepted against representative third-party applications.
+Verification note: the July 29 operator-cockpit working tree passed a **668-test TypeScript matrix across 99 files**, TypeScript lint, the production build, and an authenticated packaged-browser pass at desktop and mobile breakpoints. See [`../Prd_Dev/2026-07-29-operator-cockpit-evidence.md`](../Prd_Dev/2026-07-29-operator-cockpit-evidence.md). The broader July 27 evidence remains the latest local result for **68 Rust tests**, the **83-test release contract**, dependency audits, replay and strict-ledger gates, development-native acceptance, and the exact installed/uninstalled unsigned pilot; repair commit `ca482a47edbf9653e9bee85be2b83dc1e42414a6` passed ordinary same-SHA CI. No local code or self-test proves that a signed production installer has been produced, published, independently audited, or accepted against representative third-party applications.
 
 ## What This Product Is
 
@@ -26,6 +26,7 @@ Legend: **Implemented** = present with focused tests; **Live** = also verified a
 | Durable memory lifecycle | Implemented | Promotion requires explicit reason plus independent source-backed ledger evidence; candidate creation cannot attest itself. |
 | Bounded skill foundry | Partial | Executes only `pure-transform-v1`; held-out outputs come from a hash-sealed, kernel-attested evaluator source, not the caller. Same-author evaluation and training overlap are rejected. Production has no default evaluator resolver, so suite creation fails unavailable until one is allowlisted. |
 | Authenticated dashboard | Implemented | Supports status, operator token, first-admin bootstrap, login, logout, and revoked-session handling. A native first run supplies a one-time in-memory launch secret only for first-admin creation, then dynamically activates the fixed-authority desktop worker without restart. Authoritative kernel reads require a bearer outside open mode; viewers are read-only. |
+| Live Operations cockpit | Implemented | Responsive authenticated observatory for active task/provider/schedule/recovery work, budgets, Stop All, approvals, worker/provider health, browser/desktop/connector evidence, and a bounded canonical activity timeline. It is recorded operational evidence, not a live screen or private model reasoning. |
 | Loopback request protection | Implemented | Host/origin and `Sec-Fetch-Site` checks protect mutations; security headers are applied. This is not remote-service hardening. |
 | Browser inspect worker | Partial | L0, origin-allowlisted, bounded read-only fetch. |
 | Playwright browser worker | Live | Navigate/click/type are minimum L2 and approval-gated. Off-origin document requests are blocked before dispatch; origins are rechecked after actions; unexpected pages and click-triggered downloads are closed and rejected. Explicit downloads remain unavailable. |
@@ -45,7 +46,7 @@ Legend: **Implemented** = present with focused tests; **Live** = also verified a
 | Controlled staged releases | Implemented | Canonical authorization, evaluation/artifact verification, controlled install, supervised readiness, atomic switch, failure rollback, and startup restoration. Windows candidates start suspended inside a nested kill-on-close Job; activation fails closed without the native helper. |
 | OS secret vault | Partial | Windows DPAPI is live-verified; macOS Keychain and Linux Secret Service are implemented but need target-OS live validation. Values are never returned. |
 | Multi-user access control | Implemented | Scrypt password records, signed expiring/revocable sessions, admin/operator/viewer roles; no per-user data partitioning. |
-| Kernel-backed dashboard state | Implemented | Authoritative memory/skill/provider state comes from APIs. `localStorage` retains presentation-only chat state and lens selection; `sessionStorage` may hold the transient active bearer, whose validity remains server-authoritative. |
+| Kernel-backed dashboard state | Implemented | Authoritative memory/skill/provider/observatory state comes from authenticated APIs. Presentation-only chat metadata is not treated as evidence and is cleared or withheld from persistence for authenticated principals; `sessionStorage` may hold the transient active bearer, whose validity remains server-authoritative. |
 | Optional on-device core model | Partial | Advisory tighten-only injection assessment; it cannot bypass provider routing or kernel authority. |
 
 ## Security-Critical Flows

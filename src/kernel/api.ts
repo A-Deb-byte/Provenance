@@ -11,6 +11,7 @@ import {
 import type { ProviderRouter } from '../providers/router';
 import type { ProviderPublicStatus, ProviderRoutingPolicy } from '../providers/types';
 import { buildRuntimeCapabilityReport } from './autonomy';
+import { buildObservatorySnapshot } from './observatory';
 import { sandboxStatus, SandboxRunner } from './sandbox/sandbox';
 import { getSkillEvaluationLedgerMetadata } from './skills/evaluation';
 import {
@@ -22,6 +23,8 @@ import {
   createKernelService,
   KernelActionWorker,
   KernelObservationAssessor,
+  MAX_KERNEL_AUDIT_REASON_CHARS,
+  MAX_PROVIDER_REQUEST_ID_CHARS,
 } from './kernel';
 
 export interface KernelRouterOptions {
@@ -74,7 +77,11 @@ const isApprovalDecisionStatus = (value: unknown): value is ApprovalDecisionStat
 
 const requiredAuditReason = (value: unknown, label: string): string => {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${label} is required.`);
-  return value.trim();
+  const reason = value.trim();
+  if (reason.length > MAX_KERNEL_AUDIT_REASON_CHARS) {
+    throw new Error(`${label} must be at most ${MAX_KERNEL_AUDIT_REASON_CHARS} characters.`);
+  }
+  return reason;
 };
 
 export const createKernelRouter = (options: KernelRouterOptions) => {
@@ -411,6 +418,18 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
         res.status(400).json({ error: 'Provider request and routing policy are required.' });
         return;
       }
+      const requestId = (request as { id?: unknown }).id;
+      if (
+        typeof requestId !== 'string' ||
+        !requestId.trim() ||
+        requestId !== requestId.trim() ||
+        requestId.length > MAX_PROVIDER_REQUEST_ID_CHARS
+      ) {
+        res.status(400).json({
+          error: `Provider request id must be a trimmed non-empty string of at most ${MAX_PROVIDER_REQUEST_ID_CHARS} characters.`,
+        });
+        return;
+      }
       res.json(await kernel.executeProviderRequest(req.params.goalId, request, policy));
     } catch (error) {
       const message = errorMessage(error);
@@ -429,6 +448,23 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
   });
 
+  router.get('/observatory', async (_req, res) => {
+    try {
+      const observatory = await kernel.getObservatoryData(200);
+      res.setHeader('cache-control', 'no-store');
+      res.json(buildObservatorySnapshot({
+        state: observatory.state,
+        events: observatory.events,
+        eventsTruncated: observatory.eventsTruncated,
+        activeRuntime: observatory.activeRuntime,
+        workers: kernel.getWorkers().workers,
+        providers: options.providerStatuses ?? [],
+      }));
+    } catch {
+      res.status(500).json({ error: 'Kernel observatory projection is unavailable.' });
+    }
+  });
+
   router.get('/approvals', async (_req, res) => {
     try {
       const state = await kernel.getState();
@@ -440,18 +476,20 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
 
   router.post('/approvals/:approvalId/decision', async (req, res) => {
     const status = req.body?.status as unknown;
-    const reason = req.body?.reason as unknown;
     if (!isApprovalDecisionStatus(status)) {
       res.status(400).json({ error: 'Approval status must be approved or denied.' });
       return;
     }
-    if (typeof reason !== 'string' || !reason.trim()) {
-      res.status(400).json({ error: 'Approval decision reason is required.' });
+    let reason: string;
+    try {
+      reason = requiredAuditReason(req.body?.reason, 'Approval decision reason');
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
       return;
     }
 
     try {
-      res.json(await kernel.decideApproval(req.params.approvalId, status, reason.trim()));
+      res.json(await kernel.decideApproval(req.params.approvalId, status, reason));
     } catch (error) {
       const message = errorMessage(error);
       const responseStatus = message === 'Approval not found.'
@@ -763,17 +801,19 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
 
   router.post('/automations/:automationId/enabled', async (req, res) => {
     const enabled = req.body?.enabled as unknown;
-    const reason = req.body?.reason as unknown;
     if (typeof enabled !== 'boolean') {
       res.status(400).json({ error: 'Automation enabled must be a boolean.' });
       return;
     }
-    if (typeof reason !== 'string' || !reason.trim()) {
-      res.status(400).json({ error: 'Automation state change reason is required.' });
+    let reason: string;
+    try {
+      reason = requiredAuditReason(req.body?.reason, 'Automation state change reason');
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
       return;
     }
     try {
-      res.json(await kernel.setAutomationEnabled(req.params.automationId, enabled, reason.trim()));
+      res.json(await kernel.setAutomationEnabled(req.params.automationId, enabled, reason));
     } catch (error) {
       const message = errorMessage(error);
       res.status(message === 'Automation not found.' ? 404 : 409).json({ error: message });
@@ -813,26 +853,30 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
   });
 
   router.post('/controls/stop-all', async (req, res) => {
-    const reason = req.body?.reason as unknown;
-    if (typeof reason !== 'string' || !reason.trim()) {
-      res.status(400).json({ error: 'Stop All reason is required.' });
+    let reason: string;
+    try {
+      reason = requiredAuditReason(req.body?.reason, 'Stop All reason');
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
       return;
     }
     try {
-      res.json({ controls: await kernel.setStopAll(true, reason.trim()) });
+      res.json({ controls: await kernel.setStopAll(true, reason) });
     } catch (error) {
       res.status(409).json({ error: errorMessage(error) });
     }
   });
 
   router.post('/controls/resume', async (req, res) => {
-    const reason = req.body?.reason as unknown;
-    if (typeof reason !== 'string' || !reason.trim()) {
-      res.status(400).json({ error: 'Resume reason is required.' });
+    let reason: string;
+    try {
+      reason = requiredAuditReason(req.body?.reason, 'Resume reason');
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
       return;
     }
     try {
-      res.json({ controls: await kernel.setStopAll(false, reason.trim()) });
+      res.json({ controls: await kernel.setStopAll(false, reason) });
     } catch (error) {
       res.status(409).json({ error: errorMessage(error) });
     }

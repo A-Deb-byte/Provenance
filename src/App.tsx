@@ -21,7 +21,13 @@ import {
   purgeLegacyAuthoritativeStorage,
   writeJsonToStorage,
 } from './lib/persistence';
-import { authenticatedFetch } from './lib/auth';
+import {
+  authenticatedFetch,
+  clearAuthSession,
+  fetchAuthStatus,
+  getAuthSession,
+  subscribeAuth,
+} from './lib/auth';
 import MemoryDashboard from './components/MemoryDashboard';
 import { AuthPanel } from './components/AuthPanel';
 import { KernelPanel } from './components/KernelPanel';
@@ -31,12 +37,90 @@ import { RecurringResearchPanel } from './components/RecurringResearchPanel';
 import { ResearchMissionPanel } from './components/ResearchMissionPanel';
 import { RuntimePanel } from './components/RuntimePanel';
 import { DesktopPanel } from './components/DesktopPanel';
+import { AgentObservatory } from './components/AgentObservatory';
 import { 
   Plus, MessageSquare, Trash2, Database, Brain, Sparkles, 
   ArrowRight, ShieldCheck, HelpCircle, HardDrive, RefreshCw, Send,
   Cpu, AlertCircle, FileText, CheckCircle, GitBranch, GitCommit, GitMerge,
-  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen, CalendarClock, MonitorCog
+  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen, CalendarClock, MonitorCog,
+  Activity, LayoutDashboard, Menu, X
 } from 'lucide-react';
+
+type PanelTab = 'overview' | 'chat' | 'missions' | 'schedules' | 'desktop' | 'knowledge' | 'tree' | 'mutator';
+type PresentationScope = 'unresolved' | 'open' | 'protected';
+type RequestFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+interface AuthWorkflow {
+  controller: AbortController;
+  epoch: number;
+  token?: string;
+}
+
+const DEFAULT_MUTATION_SOURCE =
+  'Explore the convergence profile of non-Lipschitz neural operators mapping infinite-dimensional Hilbert states.';
+
+const createDefaultSessions = (): ChatSession[] => INITIAL_SESSIONS.map((session) => {
+  const activeLeaf = session.messages[session.messages.length - 1]?.id || '';
+  return {
+    ...session,
+    messages: session.messages.map((message, index) => ({
+      ...message,
+      parentId: index > 0 ? session.messages[index - 1].id : null,
+      childrenIds: index < session.messages.length - 1 ? [session.messages[index + 1].id] : [],
+    })),
+    activeLeafId: activeLeaf,
+  };
+});
+
+const isAbortError = (error: unknown): boolean => (
+  error instanceof Error && error.name === 'AbortError'
+);
+
+const workflowAbortError = (): DOMException => new DOMException(
+  'The authenticated workflow was cancelled.',
+  'AbortError',
+);
+
+const KernelAccessNotice: React.FC = () => (
+  <section
+    className="rounded-xl border border-amber-500/25 bg-amber-500/[0.06] p-4"
+    aria-label="Kernel access required"
+  >
+    <div className="flex items-start gap-3">
+      <AlertCircle size={17} className="mt-0.5 shrink-0 text-amber-300" />
+      <div>
+        <p className="text-xs font-semibold text-amber-200">Sign in to load protected runtime data</p>
+        <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+          Authentication is handled above. Kernel state, mutations, and execution controls stay unmounted until access is
+          available.
+        </p>
+      </div>
+    </div>
+  </section>
+);
+
+const trapDrawerFocus = (event: React.KeyboardEvent<HTMLElement>): void => {
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )) as HTMLElement[];
+  const visibleFocusable = focusable.filter(
+    (element) => !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true',
+  );
+  if (visibleFocusable.length === 0) {
+    event.preventDefault();
+    return;
+  }
+  const first = visibleFocusable[0];
+  const last = visibleFocusable[visibleFocusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+};
 
 const memoryKindToCategory = (kind: MemoryKind): MemoryItem['category'] => {
   if (kind === 'intent') return 'preferences';
@@ -57,8 +141,10 @@ const sha256Text = async (value: string): Promise<string> => {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 };
 
-const fetchPromotedKernelMemories = async (): Promise<MemoryItem[]> => {
-  const response = await authenticatedFetch('/api/kernel/memories?status=promoted');
+const fetchPromotedKernelMemories = async (
+  fetcher: RequestFetcher = authenticatedFetch,
+): Promise<MemoryItem[]> => {
+  const response = await fetcher('/api/kernel/memories?status=promoted');
   if (!response.ok) throw new Error('Promoted kernel memory is unavailable.');
   const payload: unknown = await response.json();
   if (typeof payload !== 'object' || payload === null || !Array.isArray((payload as { memories?: unknown }).memories)) {
@@ -75,57 +161,50 @@ const fetchPromotedKernelMemories = async (): Promise<MemoryItem[]> => {
 };
 
 export default function App() {
-  // Conversation sessions are presentation state. Kernel memory is always read from the server.
-  const defaultSessions = () => {
-    return INITIAL_SESSIONS.map(s => {
-      const activeLeaf = s.messages[s.messages.length - 1]?.id || '';
-      const mappedMsgs = s.messages.map((m, idx) => ({
-        ...m,
-        parentId: idx > 0 ? s.messages[idx - 1].id : null,
-        childrenIds: idx < s.messages.length - 1 ? [s.messages[idx + 1].id] : []
-      }));
-      return {
-        ...s,
-        messages: mappedMsgs,
-        activeLeafId: activeLeaf
-      };
-    });
-  };
-
-  const [sessions, setSessions] = useState<ChatSession[]>(() =>
-    readJsonFromStorage(STORAGE_KEYS.sessions, defaultSessions(), isChatSessionArray)
-  );
+  // Protected-session conversations stay process-local and are reset on principal changes.
+  const [sessions, setSessions] = useState<ChatSession[]>(createDefaultSessions);
 
   const [memories, setMemories] = useState<MemoryItem[]>([]);
   const profile = INITIAL_PROFILE;
 
-  const [activeSessionId, setActiveSessionId] = useState<string>(() =>
-    readStringFromStorage(STORAGE_KEYS.activeSessionId, sessions[0]?.id || '')
-  );
+  const [activeSessionId, setActiveSessionId] = useState<string>(() => INITIAL_SESSIONS[0]?.id || '');
 
   // UI state variables
   const [inputText, setInputText] = useState('');
   const [isCochatting, setIsCochatting] = useState(false);
   const [isConsolidating, setIsConsolidating] = useState(false);
+  const [chatStage, setChatStage] = useState<'idle' | 'routing' | 'recording' | 'extracting'>('idle');
   const [searchQuery, setSearchQuery] = useState('');
   const [systemAlert, setSystemAlert] = useState<{message: string; type: 'success' | 'warning' | 'error'} | null>(null);
 
   // Active agentic framework state
-  const [agentFramework, setAgentFramework] = useState<AgentFramework>(() =>
-    readJsonFromStorage(STORAGE_KEYS.framework, 'cartographer', isAgentFramework)
-  );
+  const [agentFramework, setAgentFramework] = useState<AgentFramework>('cartographer');
 
   // Active branching / creation state
   const [targetBranchParentId, setTargetBranchParentId] = useState<string | null>(null);
 
   // Tree vs List toggle view
-  const [activePanelTab, setActivePanelTab] = useState<'chat' | 'missions' | 'schedules' | 'desktop' | 'tree' | 'mutator'>('chat');
+  const [activePanelTab, setActivePanelTab] = useState<PanelTab>('overview');
   const [missionFocusId, setMissionFocusId] = useState<string | null>(null);
+  const [isNavigationOpen, setIsNavigationOpen] = useState(false);
+  const [isActivityOpen, setIsActivityOpen] = useState(false);
+  const [kernelAccessReady, setKernelAccessReady] = useState(false);
+  const [presentationScope, setPresentationScope] = useState<PresentationScope>('unresolved');
+  const navigationTriggerRef = useRef<HTMLButtonElement>(null);
+  const navigationCloseRef = useRef<HTMLButtonElement>(null);
+  const activityTriggerRef = useRef<HTMLButtonElement>(null);
+  const activityCloseRef = useRef<HTMLButtonElement>(null);
+  const authEpochRef = useRef(0);
+  const authGenerationRef = useRef(0);
+  const workflowControllersRef = useRef(new Set<AbortController>());
+  const alertTimeoutRef = useRef<number | null>(null);
+  const isSubmittingMutationRef = useRef(false);
 
   // Mathematical Mutation Workspace States
   const [mutationOperator, setMutationOperator] = useState<'heuristic_leap' | 'axiomatic_friction' | 'combinatorial' | 'priority_shock'>('heuristic_leap');
-  const [mutationSourceText, setMutationSourceText] = useState('Explore the convergence profile of non-Lipschitz neural operators mapping infinite-dimensional Hilbert states.');
+  const [mutationSourceText, setMutationSourceText] = useState(DEFAULT_MUTATION_SOURCE);
   const [isMutating, setIsMutating] = useState(false);
+  const [isSubmittingMutation, setIsSubmittingMutation] = useState(false);
   const [activeMutation, setActiveMutation] = useState<ResearchMutation | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -134,8 +213,166 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
+  const abortAuthenticatedWorkflows = () => {
+    for (const controller of workflowControllersRef.current) controller.abort();
+    workflowControllersRef.current.clear();
+  };
+
+  const resetPrincipalPresentation = () => {
+    const defaults = createDefaultSessions();
+    setSessions(defaults);
+    setActiveSessionId(defaults[0]?.id ?? '');
+    setMemories([]);
+    setInputText('');
+    setSearchQuery('');
+    setAgentFramework('cartographer');
+    setTargetBranchParentId(null);
+    setActivePanelTab('overview');
+    setMissionFocusId(null);
+    setIsNavigationOpen(false);
+    setIsActivityOpen(false);
+    setIsCochatting(false);
+    setIsConsolidating(false);
+    setChatStage('idle');
+    setMutationOperator('heuristic_leap');
+    setMutationSourceText(DEFAULT_MUTATION_SOURCE);
+    setIsMutating(false);
+    isSubmittingMutationRef.current = false;
+    setIsSubmittingMutation(false);
+    setActiveMutation(null);
+    setSystemAlert(null);
+    if (alertTimeoutRef.current !== null) {
+      window.clearTimeout(alertTimeoutRef.current);
+      alertTimeoutRef.current = null;
+    }
+  };
+
+  const beginAuthWorkflow = (): AuthWorkflow => {
+    const controller = new AbortController();
+    workflowControllersRef.current.add(controller);
+    return {
+      controller,
+      epoch: authEpochRef.current,
+      token: getAuthSession()?.token,
+    };
+  };
+
+  const isCurrentAuthWorkflow = (workflow: AuthWorkflow): boolean => (
+    !workflow.controller.signal.aborted && workflow.epoch === authEpochRef.current
+  );
+
+  const assertCurrentAuthWorkflow = (workflow: AuthWorkflow): void => {
+    if (!isCurrentAuthWorkflow(workflow)) throw workflowAbortError();
+  };
+
+  const finishAuthWorkflow = (workflow: AuthWorkflow): void => {
+    workflowControllersRef.current.delete(workflow.controller);
+  };
+
+  const fetchForAuthWorkflow = async (
+    workflow: AuthWorkflow,
+    input: RequestInfo | URL,
+    init: RequestInit = {},
+  ): Promise<Response> => {
+    assertCurrentAuthWorkflow(workflow);
+    const headers = new Headers(init.headers);
+    if (workflow.token) headers.set('authorization', `Bearer ${workflow.token}`);
+    else headers.delete('authorization');
+    const response = await fetch(input, {
+      credentials: 'same-origin',
+      ...init,
+      headers,
+      signal: workflow.controller.signal,
+    });
+    if (
+      response.status === 401 &&
+      isCurrentAuthWorkflow(workflow) &&
+      getAuthSession()?.token === workflow.token
+    ) {
+      clearAuthSession();
+    }
+    assertCurrentAuthWorkflow(workflow);
+    return response;
+  };
+
   useEffect(() => {
     purgeLegacyAuthoritativeStorage();
+    // These former presentation keys could contain a previous principal's local
+    // conversation state. The app never reads them after this migration.
+    for (const key of ['agent_kb_sessions_v2', 'agent_kb_active_sid_v2', 'agent_kb_framework']) {
+      localStorage.removeItem(key);
+    }
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const applyAccess = async (generation: number) => {
+      const session = getAuthSession();
+      if (session) {
+        if (!disposed && generation === authGenerationRef.current) {
+          setPresentationScope('protected');
+          setKernelAccessReady(true);
+        }
+        return;
+      }
+      try {
+        const status = await fetchAuthStatus();
+        if (disposed || generation !== authGenerationRef.current) return;
+        if (status.mode === 'open') {
+          const defaults = createDefaultSessions();
+          const openSessions = readJsonFromStorage(STORAGE_KEYS.sessions, defaults, isChatSessionArray);
+          const requestedActiveId = readStringFromStorage(
+            STORAGE_KEYS.activeSessionId,
+            openSessions[0]?.id ?? '',
+          );
+          setSessions(openSessions);
+          setActiveSessionId(
+            openSessions.some((sessionCandidate) => sessionCandidate.id === requestedActiveId)
+              ? requestedActiveId
+              : openSessions[0]?.id ?? '',
+          );
+          setAgentFramework(readJsonFromStorage(
+            STORAGE_KEYS.framework,
+            'cartographer',
+            isAgentFramework,
+          ));
+          setPresentationScope('open');
+          setKernelAccessReady(true);
+        } else {
+          setPresentationScope('protected');
+          setKernelAccessReady(false);
+        }
+      } catch {
+        if (!disposed && generation === authGenerationRef.current) {
+          setPresentationScope('protected');
+          setKernelAccessReady(false);
+        }
+      }
+    };
+
+    const refreshAccess = (principalChanged: boolean) => {
+      const generation = authGenerationRef.current + 1;
+      authGenerationRef.current = generation;
+      setKernelAccessReady(false);
+      setPresentationScope('unresolved');
+      if (principalChanged) {
+        authEpochRef.current += 1;
+        abortAuthenticatedWorkflows();
+        resetPrincipalPresentation();
+      }
+      void applyAccess(generation);
+    };
+
+    refreshAccess(false);
+    const unsubscribe = subscribeAuth(() => refreshAccess(true));
+    return () => {
+      disposed = true;
+      authGenerationRef.current += 1;
+      authEpochRef.current += 1;
+      abortAuthenticatedWorkflows();
+      if (alertTimeoutRef.current !== null) window.clearTimeout(alertTimeoutRef.current);
+      unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -144,20 +381,67 @@ export default function App() {
     }
   }, [sessions, activeSessionId, activePanelTab]);
 
-  // Persist only local conversation presentation preferences.
   useEffect(() => {
-    writeJsonToStorage(STORAGE_KEYS.sessions, sessions);
-  }, [sessions]);
+    if (!isNavigationOpen && !isActivityOpen) return;
+    const navigationIsActive = isNavigationOpen;
+    const closeButton = navigationIsActive ? navigationCloseRef : activityCloseRef;
+    const triggerButton = navigationIsActive ? navigationTriggerRef : activityTriggerRef;
+    const focusTimer = window.setTimeout(() => closeButton.current?.focus(), 0);
+    const closeDrawer = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      if (navigationIsActive) setIsNavigationOpen(false);
+      else setIsActivityOpen(false);
+    };
+    window.addEventListener('keydown', closeDrawer);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener('keydown', closeDrawer);
+      triggerButton.current?.focus();
+    };
+  }, [isActivityOpen, isNavigationOpen]);
 
   useEffect(() => {
-    writeJsonToStorage(STORAGE_KEYS.framework, agentFramework);
-  }, [agentFramework]);
+    if (typeof window.matchMedia !== 'function') return undefined;
+    const navigationWide = window.matchMedia('(min-width: 1024px)');
+    const activityWide = window.matchMedia('(min-width: 1536px)');
+    const closeNavigationAtWideBreakpoint = () => {
+      if (navigationWide.matches) setIsNavigationOpen(false);
+    };
+    const closeActivityAtWideBreakpoint = () => {
+      if (activityWide.matches) setIsActivityOpen(false);
+    };
+    closeNavigationAtWideBreakpoint();
+    closeActivityAtWideBreakpoint();
+    navigationWide.addEventListener('change', closeNavigationAtWideBreakpoint);
+    activityWide.addEventListener('change', closeActivityAtWideBreakpoint);
+    return () => {
+      navigationWide.removeEventListener('change', closeNavigationAtWideBreakpoint);
+      activityWide.removeEventListener('change', closeActivityAtWideBreakpoint);
+    };
+  }, []);
+
+  // Only anonymous open mode persists local presentation state. Protected
+  // principals receive a fresh in-memory workspace for each auth epoch.
+  useEffect(() => {
+    if (presentationScope === 'open') writeJsonToStorage(STORAGE_KEYS.sessions, sessions);
+  }, [presentationScope, sessions]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.activeSessionId, activeSessionId);
-  }, [activeSessionId]);
+    if (presentationScope === 'open') writeJsonToStorage(STORAGE_KEYS.framework, agentFramework);
+  }, [agentFramework, presentationScope]);
 
   useEffect(() => {
+    if (presentationScope === 'open') {
+      localStorage.setItem(STORAGE_KEYS.activeSessionId, activeSessionId);
+    }
+  }, [activeSessionId, presentationScope]);
+
+  useEffect(() => {
+    if (!kernelAccessReady) {
+      setMemories([]);
+      return;
+    }
     let disposed = false;
     const loadPromotedMemory = async () => {
       try {
@@ -173,7 +457,7 @@ export default function App() {
       disposed = true;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [kernelAccessReady]);
 
   // Retrieve current active session
   const activeSessionIndex = Math.max(0, sessions.findIndex(s => s.id === activeSessionId));
@@ -181,9 +465,11 @@ export default function App() {
 
   // Utility alerts
   const showAlert = (message: string, type: 'success' | 'warning' | 'error' = 'success') => {
+    if (alertTimeoutRef.current !== null) window.clearTimeout(alertTimeoutRef.current);
     setSystemAlert({ message, type });
-    setTimeout(() => {
+    alertTimeoutRef.current = window.setTimeout(() => {
       setSystemAlert(null);
+      alertTimeoutRef.current = null;
     }, 4500);
   };
 
@@ -303,7 +589,7 @@ export default function App() {
     const firstMsgId = `msg_init_${Date.now()}`;
     const newSess: ChatSession = {
       id: sId,
-      title: `🧠 Theoretical Stream ${sessions.length + 1}`,
+      title: `Research Stream ${sessions.length + 1}`,
       activeLeafId: firstMsgId,
       messages: [
         {
@@ -321,22 +607,18 @@ export default function App() {
     setSessions([newSess, ...sessions]);
     setActiveSessionId(sId);
     setTargetBranchParentId(null);
-    showAlert("New independent theoretical stream provisioned", "success");
+    setActivePanelTab('chat');
+    setIsNavigationOpen(false);
+    showAlert("New local conversation created", "success");
   };
 
   const handleDeleteSession = (sid: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const remains = sessions.filter(s => s.id !== sid);
     if (remains.length === 0) {
-      // Factory state clear reset
-      setSessions(INITIAL_SESSIONS.map(s => {
-        let activeLeaf = s.messages[s.messages.length - 1]?.id || '';
-        return {
-          ...s,
-          messages: s.messages.map((m, i) => ({ ...m, parentId: i > 0 ? s.messages[i-1].id : null })),
-          activeLeafId: activeLeaf
-        };
-      }));
+      const defaults = createDefaultSessions();
+      setSessions(defaults);
+      setActiveSessionId(defaults[0]?.id ?? '');
     } else {
       setSessions(remains);
       if (activeSessionId === sid) {
@@ -350,6 +632,16 @@ export default function App() {
   const handleSendMessage = async (customText?: string) => {
     const query = customText ? customText.trim() : inputText.trim();
     if (!query || isCochatting || !activeSession) return;
+    if (!kernelAccessReady) {
+      showAlert('Sign in from Overview before sending a protected agent request.', 'warning');
+      return;
+    }
+    const workflow = beginAuthWorkflow();
+    const workflowFetcher: RequestFetcher = (input, init) => fetchForAuthWorkflow(
+      workflow,
+      input,
+      init,
+    );
 
     if (!customText) {
       setInputText('');
@@ -402,10 +694,12 @@ export default function App() {
     );
     setTargetBranchParentId(null); // wipe active branch target
     setIsCochatting(true);
+    setChatStage('routing');
 
     try {
-      const chatMemories = await fetchPromotedKernelMemories();
-      const response = await authenticatedFetch('/api/chat', {
+      const chatMemories = await fetchPromotedKernelMemories(workflowFetcher);
+      assertCurrentAuthWorkflow(workflow);
+      const response = await workflowFetcher('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -417,10 +711,14 @@ export default function App() {
       });
 
       if (!response.ok) {
-        throw new Error(await response.text() || "Agent service failure");
+        const message = await response.text();
+        assertCurrentAuthWorkflow(workflow);
+        throw new Error(message || 'Agent service failure');
       }
 
       const payload = await response.json();
+      assertCurrentAuthWorkflow(workflow);
+      setChatStage('recording');
       const matchedMems = chatMemories.filter(m => payload.retrievedMemoryIds?.includes(m.id));
 
       const assistantMsg: Message = {
@@ -430,7 +728,16 @@ export default function App() {
         timestamp: new Date().toISOString(),
         parentId: userMsgId,
         childrenIds: [],
-        retrievedMemories: matchedMems
+        retrievedMemories: matchedMems,
+        provenance: (
+          typeof payload.servedBy === 'string' &&
+          typeof payload.model === 'string' &&
+          typeof payload.evidenceEventId === 'string'
+        ) ? {
+          provider: payload.servedBy,
+          model: payload.model,
+          evidenceEventId: payload.evidenceEventId,
+        } : undefined,
       };
 
       const assistantUpdatedAt = new Date().toISOString();
@@ -447,7 +754,8 @@ export default function App() {
 
       // Perform background fact/priority extraction log
       setIsConsolidating(true);
-      const extractRes = await authenticatedFetch('/api/extract', {
+      setChatStage('extracting');
+      const extractRes = await workflowFetcher('/api/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -459,6 +767,7 @@ export default function App() {
 
       if (extractRes.ok) {
         const extraction = await extractRes.json();
+        assertCurrentAuthWorkflow(workflow);
         let createdCandidates = 0;
         if (
           extraction.newMemories &&
@@ -479,7 +788,7 @@ export default function App() {
           const candidateResponses = await Promise.all(groundedMemories.map(async (raw: any) => {
             const importance = Number.isFinite(raw.importance) ? Number(raw.importance) : 3;
             const sourceSnippet = raw.sourceSnippet.trim();
-            return authenticatedFetch('/api/kernel/memories/candidates', {
+            return workflowFetcher('/api/kernel/memories/candidates', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -502,6 +811,7 @@ export default function App() {
               }),
             });
           }));
+          assertCurrentAuthWorkflow(workflow);
           createdCandidates = candidateResponses.filter((candidateResponse) => candidateResponse.ok).length;
         }
         if (createdCandidates > 0) {
@@ -509,12 +819,21 @@ export default function App() {
         }
       }
 
-    } catch (err: any) {
-      console.error(err);
-      showAlert(`Memory network error: ${err.message}`, 'error');
+    } catch (error: unknown) {
+      if (!isCurrentAuthWorkflow(workflow) || isAbortError(error)) return;
+      console.error(error);
+      showAlert(
+        `Memory network error: ${error instanceof Error ? error.message : 'unknown error'}`,
+        'error',
+      );
     } finally {
-      setIsCochatting(false);
-      setIsConsolidating(false);
+      const current = isCurrentAuthWorkflow(workflow);
+      finishAuthWorkflow(workflow);
+      if (current) {
+        setIsCochatting(false);
+        setIsConsolidating(false);
+        setChatStage('idle');
+      }
     }
   };
 
@@ -523,12 +842,23 @@ export default function App() {
    */
   const handlePerformMutation = async () => {
     if (!mutationSourceText.trim() || isMutating) return;
+    if (!kernelAccessReady) {
+      showAlert('Sign in from Overview before requesting a provider research draft.', 'warning');
+      return;
+    }
+    const workflow = beginAuthWorkflow();
+    const workflowFetcher: RequestFetcher = (input, init) => fetchForAuthWorkflow(
+      workflow,
+      input,
+      init,
+    );
     setIsMutating(true);
-    showAlert("Starting cognitive mutation cycle...", "success");
+    showAlert('Requesting a provider-generated research draft...', 'success');
 
     try {
-      const contextMemories = await fetchPromotedKernelMemories();
-      const res = await authenticatedFetch('/api/mutate', {
+      const contextMemories = await fetchPromotedKernelMemories(workflowFetcher);
+      assertCurrentAuthWorkflow(workflow);
+      const res = await workflowFetcher('/api/mutate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -539,43 +869,60 @@ export default function App() {
       });
 
       if (!res.ok) {
-        throw new Error(await res.text() || 'Mutation failed');
+        const message = await res.text();
+        assertCurrentAuthWorkflow(workflow);
+        throw new Error(message || 'Research draft request failed');
       }
 
       const data = await res.json();
+      assertCurrentAuthWorkflow(workflow);
       
       const novelMutation: ResearchMutation = {
         id: `mutation_${Date.now()}`,
-        title: data.title || "Mutated Thesis Index",
-        parentIdeaId: "Aether Brain Map",
+        title: data.title || 'Provider Research Draft',
+        parentIdeaId: 'Research Lab',
         operator: mutationOperator,
-        novelInsight: data.novelInsight || "Insight calculation error",
-        mathematicalBounds: data.mathematicalBounds || "O(1) Bounds undefined",
+        novelInsight: data.novelInsight || 'No conjecture was returned.',
+        mathematicalBounds: data.mathematicalBounds || 'No proposed bounds were returned.',
         suggestedActionItems: data.suggestedActionItems || [],
         evidenceEventId: typeof data.evidenceEventId === 'string' ? data.evidenceEventId : '',
         createdAt: new Date().toISOString()
       };
 
       setActiveMutation(novelMutation);
-      showAlert("Novel research priority card generated!", "success");
-    } catch (err: any) {
-      console.error(err);
-      showAlert(`Cognitive block offline: ${err.message}`, 'error');
+      showAlert('Provider research draft recorded for operator review.', 'success');
+    } catch (error: unknown) {
+      if (!isCurrentAuthWorkflow(workflow) || isAbortError(error)) return;
+      console.error(error);
+      showAlert(
+        `Research lab request failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+        'error',
+      );
     } finally {
-      setIsMutating(false);
+      const current = isCurrentAuthWorkflow(workflow);
+      finishAuthWorkflow(workflow);
+      if (current) setIsMutating(false);
     }
   };
 
   const commitMutationToMemory = async () => {
-    if (!activeMutation) return;
+    if (!activeMutation || isSubmittingMutationRef.current) return;
+    if (!kernelAccessReady) {
+      showAlert('Sign in from Overview before submitting a memory candidate.', 'warning');
+      return;
+    }
     if (!activeMutation.evidenceEventId) {
-      showAlert('Mutation has no provider ledger evidence and cannot be submitted.', 'error');
+      showAlert('Provider draft has no returned ledger reference and cannot be submitted.', 'error');
       return;
     }
 
-    const content = `[Math Mutation - ${activeMutation.title}]: ${activeMutation.novelInsight}. Bounds: ${activeMutation.mathematicalBounds}`;
+    const workflow = beginAuthWorkflow();
+    const mutation = activeMutation;
+    const content = `[Provider Research Draft - ${mutation.title}]: ${mutation.novelInsight}. Proposed bounds: ${mutation.mathematicalBounds}`;
+    isSubmittingMutationRef.current = true;
+    setIsSubmittingMutation(true);
     try {
-      const response = await authenticatedFetch('/api/kernel/memories/candidates', {
+      const response = await fetchForAuthWorkflow(workflow, '/api/kernel/memories/candidates', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -587,48 +934,85 @@ export default function App() {
           retention: { kind: 'durable' },
           provenance: {
             sourceType: 'provider_candidate',
-            sourceId: activeMutation.evidenceEventId,
+            sourceId: mutation.evidenceEventId,
             actor: 'provider',
             observedAt: new Date().toISOString(),
           },
-          evidenceRefs: [{ eventId: activeMutation.evidenceEventId }],
+          evidenceRefs: [{ eventId: mutation.evidenceEventId }],
           contradictionIds: [],
           supersedesIds: [],
         }),
       });
-      if (!response.ok) throw new Error(await response.text() || 'Candidate submission failed.');
-      showAlert('Mutation submitted as a kernel memory candidate for evidence review.', 'success');
+      if (!response.ok) {
+        const message = await response.text();
+        assertCurrentAuthWorkflow(workflow);
+        throw new Error(message || 'Candidate submission failed.');
+      }
+      assertCurrentAuthWorkflow(workflow);
+      showAlert('Provider draft submitted as a memory candidate for evidence review.', 'success');
     } catch (error) {
+      if (!isCurrentAuthWorkflow(workflow) || isAbortError(error)) return;
       showAlert(`Candidate submission failed: ${error instanceof Error ? error.message : 'unknown error'}`, 'error');
+    } finally {
+      const current = isCurrentAuthWorkflow(workflow);
+      finishAuthWorkflow(workflow);
+      if (current) {
+        isSubmittingMutationRef.current = false;
+        setIsSubmittingMutation(false);
+      }
     }
   };
 
   const handleRestoreDefaults = () => {
     if (window.confirm("Reset the local conversation workspace? Kernel state and authentication are preserved.")) {
+      authEpochRef.current += 1;
+      abortAuthenticatedWorkflows();
       localStorage.removeItem(STORAGE_KEYS.sessions);
       localStorage.removeItem(STORAGE_KEYS.activeSessionId);
       localStorage.removeItem(STORAGE_KEYS.framework);
-      setSessions(INITIAL_SESSIONS.map(s => {
-        let activeLeaf = s.messages[s.messages.length - 1]?.id || '';
-        return {
-          ...s,
-          messages: s.messages.map((m, i) => ({ ...m, parentId: i > 0 ? s.messages[i-1].id : null })),
-          activeLeafId: activeLeaf
-        };
-      }));
-      setActiveSessionId(INITIAL_SESSIONS[0].id);
+      const defaults = createDefaultSessions();
+      setSessions(defaults);
+      setActiveSessionId(defaults[0]?.id ?? '');
+      setAgentFramework('cartographer');
       setTargetBranchParentId(null);
+      setMutationSourceText(DEFAULT_MUTATION_SOURCE);
+      setIsMutating(false);
+      isSubmittingMutationRef.current = false;
+      setIsSubmittingMutation(false);
       setActiveMutation(null);
       showAlert("Local conversation workspace reset. Kernel state was not changed.", "success");
     }
   };
 
+  const navigationItems: Array<{
+    id: PanelTab;
+    label: string;
+    icon: React.ReactNode;
+  }> = [
+    { id: 'overview', label: 'Overview', icon: <LayoutDashboard size={14} /> },
+    { id: 'chat', label: 'Agent Chat', icon: <MessageSquare size={14} /> },
+    { id: 'missions', label: 'Missions', icon: <Compass size={14} /> },
+    { id: 'schedules', label: 'Schedules', icon: <CalendarClock size={14} /> },
+    { id: 'desktop', label: 'Desktop', icon: <MonitorCog size={14} /> },
+    { id: 'knowledge', label: 'Knowledge', icon: <BookOpen size={14} /> },
+    { id: 'tree', label: 'Dialogue Map', icon: <Network size={14} /> },
+    { id: 'mutator', label: 'Research Lab', icon: <Zap size={14} /> },
+  ];
+  const activeNavigationItem = navigationItems.find((item) => item.id === activePanelTab);
+
   return (
-    <div className="bg-[#0B0C0E] w-full h-[768px] flex overflow-hidden font-sans text-slate-300 select-none max-w-[1400px] mx-auto rounded-none md:rounded-2xl border border-slate-800 shadow-2xl relative" id="elegant_dark_app_frame">
+    <div
+      className="relative flex h-dvh min-h-[640px] w-full overflow-hidden bg-[#080b10] font-sans text-slate-300"
+      id="provenance_operator_cockpit"
+    >
       
       {/* Alert Overlay Popup */}
       {systemAlert && (
-        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-55 flex items-center gap-2 px-3.5 py-2.5 rounded-lg border shadow-2xl text-xs font-mono font-bold animate-fade-in bg-[#16181D]" style={{
+        <div
+          role={systemAlert.type === 'success' ? 'status' : 'alert'}
+          aria-live={systemAlert.type === 'success' ? 'polite' : 'assertive'}
+          className="absolute top-4 left-1/2 -translate-x-1/2 z-[70] flex items-center gap-2 px-3.5 py-2.5 rounded-lg border shadow-2xl text-xs font-mono font-bold animate-fade-in bg-[#16181D]"
+          style={{
           borderColor: systemAlert.type === 'success' ? '#0D9488' : systemAlert.type === 'warning' ? '#F59E0B' : '#EF4444',
           color: systemAlert.type === 'success' ? '#2DD4BF' : systemAlert.type === 'warning' ? '#FBBF24' : '#FCA5A5'
         }}>
@@ -637,18 +1021,51 @@ export default function App() {
         </div>
       )}
 
+      {isNavigationOpen && (
+        <div
+          aria-hidden="true"
+          className="fixed inset-0 z-30 bg-black/65 backdrop-blur-sm lg:hidden"
+          onClick={() => setIsNavigationOpen(false)}
+        />
+      )}
+      {isActivityOpen && (
+        <div
+          aria-hidden="true"
+          className="fixed inset-0 z-40 bg-black/65 backdrop-blur-sm 2xl:hidden"
+          onClick={() => setIsActivityOpen(false)}
+        />
+      )}
+
       {/* LEFT SIDEBAR (Stream list, storage diagnostics) */}
-      <aside className="w-64 bg-[#0F1115] border-r border-slate-800 flex flex-col justify-between shrink-0 h-full">
+      <aside
+        id="primary-navigation"
+        aria-label="Conversation navigation"
+        role={isNavigationOpen ? 'dialog' : undefined}
+        aria-modal={isNavigationOpen || undefined}
+        aria-hidden={isActivityOpen || undefined}
+        inert={isActivityOpen || undefined}
+        onKeyDown={isNavigationOpen ? trapDrawerFocus : undefined}
+        className={`${isNavigationOpen ? 'flex' : 'hidden'} fixed inset-y-0 left-0 z-40 w-[min(18rem,88vw)] flex-col justify-between border-r border-slate-800 bg-[#0d1117] shadow-2xl lg:static lg:flex lg:w-64 lg:shrink-0 lg:shadow-none`}
+      >
         <div className="flex flex-col flex-1 overflow-hidden">
           {/* Logo Branding */}
-          <div className="p-5 flex items-center space-x-2.5 border-b border-slate-800">
-            <div className="w-8 h-8 rounded bg-teal-600 flex items-center justify-center border border-teal-500/20 shadow-lg shadow-teal-500/10">
-              <Network className="w-4.5 h-4.5 text-white animate-pulse" />
+          <div className="flex items-center gap-3 border-b border-slate-800 p-4">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-cyan-400/25 bg-gradient-to-br from-cyan-500 to-blue-700 shadow-lg shadow-cyan-500/10">
+              <Network className="h-[18px] w-[18px] text-white" />
             </div>
-            <div>
-              <span className="font-bold text-slate-100 text-sm tracking-tight block">LocalContext</span>
-              <span className="text-[10px] font-mono tracking-wider text-[#0D9488] uppercase font-bold">Research Vault</span>
+            <div className="min-w-0 flex-1">
+              <span className="block text-sm font-bold tracking-tight text-white">Provenance</span>
+              <span className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-400">Operator Cockpit</span>
             </div>
+            <button
+              ref={navigationCloseRef}
+              type="button"
+              onClick={() => setIsNavigationOpen(false)}
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white lg:hidden"
+              aria-label="Close conversation navigation"
+            >
+              <X size={16} />
+            </button>
           </div>
 
           <div className="p-3">
@@ -683,29 +1100,38 @@ export default function App() {
               return (
                 <div
                   key={session.id}
-                  onClick={() => { setActiveSessionId(session.id); setTargetBranchParentId(null); }}
-                  className={`group flex items-center justify-between px-2.5 py-2.5 rounded-lg border transition-all cursor-pointer ${
+                  className={`group flex items-center justify-between rounded-lg border transition-all ${
                     isActive 
                       ? 'bg-[#16181D] border-slate-800 text-teal-400' 
                       : 'border-transparent text-slate-400 hover:bg-slate-800/20 hover:text-slate-200'
                   }`}
                 >
-                  <div className="flex items-start gap-1.5 overflow-hidden flex-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActiveSessionId(session.id);
+                      setTargetBranchParentId(null);
+                      setActivePanelTab('chat');
+                      setIsNavigationOpen(false);
+                    }}
+                    className="flex min-w-0 flex-1 items-start gap-1.5 px-2.5 py-2.5 text-left"
+                    aria-current={isActive ? 'page' : undefined}
+                  >
                     <GitBranch size={13} className={`mt-0.5 shrink-0 ${isActive ? 'text-teal-400' : 'text-slate-500'}`} />
-                    <div className="overflow-hidden">
-                      <span className="text-xs font-semibold block truncate leading-tight font-sans">
+                    <div className="min-w-0 overflow-hidden">
+                      <span className="block truncate font-sans text-xs font-semibold leading-tight">
                         {session.title}
                       </span>
-                      <span className="text-[9.5px] font-mono text-slate-500 flex items-center gap-1 mt-0.5">
-                        {nodeCount} Nodes
+                      <span className="mt-0.5 flex items-center gap-1 font-mono text-[9.5px] text-slate-500">
+                        {nodeCount} nodes
                       </span>
                     </div>
-                  </div>
+                  </button>
                   
                   <button
                     onClick={(e) => handleDeleteSession(session.id, e)}
-                    className="opacity-0 group-hover:opacity-100 p-1 hover:bg-slate-800 hover:text-rose-455 hover:text-rose-500 rounded transition duration-200 ml-1 shrink-0 cursor-pointer"
-                    title="Delete Thread"
+                    className="mr-2 shrink-0 rounded p-1 text-slate-500 opacity-0 transition duration-200 hover:bg-slate-800 hover:text-rose-500 focus:opacity-100 group-hover:opacity-100"
+                    aria-label={`Delete ${session.title}`}
                   >
                     <Trash2 size={11} />
                   </button>
@@ -741,122 +1167,126 @@ export default function App() {
       </aside>
 
       {/* CENTER WORKSPACE PANE */}
-      <main className="flex-1 flex flex-col bg-[#0B0C0E] h-full overflow-hidden">
+      <main
+        className="flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[#080b10]"
+        aria-label="Provenance workspace"
+        aria-hidden={(isNavigationOpen || isActivityOpen) || undefined}
+        inert={(isNavigationOpen || isActivityOpen) || undefined}
+      >
         
         {/* Workspace Tab Navigation bar */}
-        <header className="h-16 border-b border-slate-800 bg-[#0F1115]/50 backdrop-blur-sm flex items-center px-6 justify-between shrink-0 z-10">
-          <div className="flex items-center gap-2">
-            <div className="flex bg-[#0B0C0E] border border-slate-800 p-0.5 rounded-lg">
-              <button
-                onClick={() => { setActivePanelTab('chat'); setTargetBranchParentId(null); }}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'chat' 
-                    ? 'bg-teal-600 text-white font-bold' 
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <MessageSquare size={13} />
-                Arena Chat
-              </button>
+        <header className="z-20 shrink-0 border-b border-slate-800 bg-[#0d1117]/95 backdrop-blur">
+          <div className="flex min-h-16 items-center gap-3 px-3 sm:px-4">
+            <button
+              ref={navigationTriggerRef}
+              type="button"
+              onClick={() => setIsNavigationOpen(true)}
+              className="rounded-lg border border-slate-800 bg-slate-900/70 p-2 text-slate-300 hover:border-slate-700 hover:text-white lg:hidden"
+              aria-label="Open conversation navigation"
+              aria-expanded={isNavigationOpen}
+              aria-controls="primary-navigation"
+            >
+              <Menu size={17} />
+            </button>
 
-              <button
-                onClick={() => { setMissionFocusId(null); setActivePanelTab('missions'); setTargetBranchParentId(null); }}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'missions'
-                    ? 'bg-teal-600 text-white font-bold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Compass size={13} />
-                Research Missions
-              </button>
-
-              <button
-                onClick={() => { setActivePanelTab('schedules'); setTargetBranchParentId(null); }}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'schedules'
-                    ? 'bg-violet-600 text-white font-bold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <CalendarClock size={13} />
-                Schedules
-              </button>
-
-              <button
-                onClick={() => { setActivePanelTab('desktop'); setTargetBranchParentId(null); }}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'desktop'
-                    ? 'bg-sky-600 text-white font-bold'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <MonitorCog size={13} />
-                Desktop
-              </button>
-              
-              <button
-                onClick={() => setActivePanelTab('tree')}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'tree' 
-                    ? 'bg-teal-600 text-white font-bold' 
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Network size={13} />
-                Theory Tree
-              </button>
-
-              <button
-                onClick={() => setActivePanelTab('mutator')}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-                  activePanelTab === 'mutator' 
-                    ? 'bg-teal-600 text-white font-bold animate-pulse' 
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Zap size={13} className="text-amber-400" />
-                Math Mutator
-              </button>
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-400">
+                Trusted agent workspace
+              </p>
+              <h1 className="truncate text-sm font-bold text-white">{activeNavigationItem?.label ?? 'Overview'}</h1>
             </div>
+
+            <button
+              ref={activityTriggerRef}
+              type="button"
+              onClick={() => setIsActivityOpen(true)}
+              className="flex items-center gap-2 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/20 2xl:hidden"
+              aria-label="Open live agent activity"
+              aria-expanded={isActivityOpen}
+              aria-controls="agent-activity-inspector"
+            >
+              <Activity size={15} />
+              <span className="hidden sm:inline">Live Activity</span>
+            </button>
           </div>
 
-          <div className="flex items-center space-x-3">
-            <div className="text-right">
-              <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest block">
-                {activePanelTab === 'missions'
-                  ? 'Mission Authority'
-                  : activePanelTab === 'schedules'
-                    ? 'Schedule Authority'
-                    : activePanelTab === 'desktop' ? 'Desktop Authority' : 'Active Leaf Address'}
-              </span>
-              <span className="text-[10px] font-mono text-teal-400">
-                {activePanelTab === 'missions'
-                  ? 'Kernel-owned state'
-                  : activePanelTab === 'schedules'
-                    ? 'Durable kernel timer'
-                    : activePanelTab === 'desktop'
-                      ? 'Approval-gated native worker'
-                  : activeSession?.activeLeafId ? activeSession.activeLeafId.substring(0, 15) + "..." : "none"}
-              </span>
+          <nav
+            className="overflow-x-auto border-t border-slate-800/70 px-2 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:px-3"
+            aria-label="Primary workspaces"
+          >
+            <div className="flex min-w-max gap-1">
+              {navigationItems.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  aria-current={activePanelTab === item.id ? 'page' : undefined}
+                  onClick={() => {
+                    if (item.id === 'missions') setMissionFocusId(null);
+                    setActivePanelTab(item.id);
+                    setTargetBranchParentId(null);
+                  }}
+                  className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                    activePanelTab === item.id
+                      ? 'bg-cyan-500/15 text-cyan-200 ring-1 ring-inset ring-cyan-500/30'
+                      : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-100'
+                  }`}
+                >
+                  {item.icon}
+                  {item.label}
+                </button>
+              ))}
             </div>
-          </div>
+          </nav>
         </header>
+
+        {activePanelTab === 'overview' && (
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6" role="region" aria-label="Overview">
+            <div className="mx-auto max-w-6xl space-y-4">
+              <section className="overflow-hidden rounded-2xl border border-cyan-500/20 bg-gradient-to-br from-cyan-500/[0.08] via-[#10161f] to-blue-500/[0.05] p-5 sm:p-7">
+                <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+                  <div className="max-w-3xl">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-cyan-300">
+                      Operations Overview
+                    </p>
+                    <h2 className="mt-2 text-2xl font-black tracking-tight text-white sm:text-3xl">
+                      See what the agent is doing, what is blocked, and what evidence it produced.
+                    </h2>
+                    <p className="mt-3 max-w-2xl text-sm leading-relaxed text-slate-400">
+                      The Live Operations inspector is derived from authenticated kernel state. Browser and desktop cards show
+                      the latest recorded target and action, not a fabricated video feed or private chain of thought.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsActivityOpen(true)}
+                    className="flex shrink-0 items-center justify-center gap-2 rounded-xl border border-cyan-400/30 bg-cyan-500/15 px-4 py-3 text-sm font-bold text-cyan-100 hover:bg-cyan-500/25 2xl:hidden"
+                  >
+                    <Activity size={17} />
+                    Open Live Operations
+                  </button>
+                </div>
+              </section>
+              <AuthPanel />
+              {kernelAccessReady ? (
+                <>
+                  <KernelPanel />
+                  <RuntimePanel />
+                  <ProviderPanel />
+                  <LearningPanel />
+                </>
+              ) : (
+                <KernelAccessNotice />
+              )}
+            </div>
+          </div>
+        )}
 
         {/* PANEL VIEW: 1. THE ARENA CHAT SYSTEM */}
         {activePanelTab === 'chat' && (
-          <div className="flex-1 flex flex-col justify-between overflow-hidden">
+          <div className="flex-1 flex flex-col justify-between overflow-hidden" role="region" aria-label="Agent Chat">
             
             {/* Thread timeline scroll Area */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-4">
-              <div className="max-w-4xl mx-auto space-y-4">
-                <AuthPanel />
-                <KernelPanel />
-                <LearningPanel />
-                <ProviderPanel />
-                <RuntimePanel />
-              </div>
-              
+            <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-4">
               {/* Branch off system alerts */}
               {targetBranchParentId && (
                 <div className="bg-[#16181D] border border-yellow-500/20 text-yellow-500 p-3 rounded-xl flex items-center justify-between z-10 animate-fade-in mb-2">
@@ -883,7 +1313,7 @@ export default function App() {
                     <div>
                       <h4 className="text-slate-100 font-bold text-xs uppercase tracking-wider mb-1">CONVERSATIONAL RECOGNITIVE GRAPH</h4>
                       <p className="text-xs text-slate-400 leading-relaxed">
-                        To fork alternate trajectories, hover over any response bubble and select the <span className="text-teal-400 font-bold font-mono">[Branch Dialog]</span> operator. The system supports full traversal up and down parallel branches, and mutations representing novel priorities can be engineered inside the Mutator tab.
+                        Branch from any response to explore an alternate conversation path. Each new assistant response shows its provider and the ledger reference returned by the server; this browser view does not independently reverify that reference.
                       </p>
                     </div>
                   </div>
@@ -895,7 +1325,7 @@ export default function App() {
                         <button
                           key={i}
                           onClick={() => handleSendMessage(str)}
-                          disabled={isCochatting}
+                          disabled={isCochatting || !kernelAccessReady}
                           className="text-left px-3 py-2 bg-slate-900 border border-slate-800/80 text-xs text-slate-400 rounded-lg hover:text-teal-400 hover:border-teal-500/20 transition-all cursor-pointer truncate"
                         >
                           {str}
@@ -920,7 +1350,7 @@ export default function App() {
                     {/* Meta tags with Branch sibling switches */}
                     <div className="flex items-center gap-2.5 mb-1 text-[10px] font-mono text-slate-500 w-full justify-between">
                       <div className="flex items-center gap-1.5">
-                        <span className="font-semibold text-slate-400">{isUser ? 'HUMAN EXPERIMENTER' : 'RECOGNITIVE COGNIZANT'}</span>
+                        <span className="font-semibold text-slate-400">{isUser ? 'YOU' : 'PROVENANCE'}</span>
                         <span>•</span>
                         <span>{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                       </div>
@@ -957,7 +1387,7 @@ export default function App() {
                     }`}>
                       
                       {/* Branch & Mutator overlay tags visible on bubble hover */}
-                      <div className="absolute right-3 top-3 opacity-0 group-hover/bubble:opacity-100 transition-opacity duration-200 flex items-center gap-1.5 bg-[#0B0C0E]/90 p-1 rounded border border-slate-800 shadow-xl z-10">
+                      <div className="absolute right-3 top-3 opacity-0 transition-opacity duration-200 group-hover/bubble:opacity-100 group-focus-within/bubble:opacity-100 flex items-center gap-1.5 bg-[#0B0C0E]/90 p-1 rounded border border-slate-800 shadow-xl z-10">
                         <button
                           onClick={() => {
                             setTargetBranchParentId(m.id);
@@ -973,7 +1403,7 @@ export default function App() {
                           onClick={() => {
                             setMutationSourceText(m.content);
                             setActivePanelTab('mutator');
-                            showAlert("Dialogue context transferred to Mathematics Mutator!", "success");
+                            showAlert("Dialogue context transferred to Research Lab", "success");
                           }}
                           className="px-1.5 py-0.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 rounded text-[9.5px] font-mono font-bold flex items-center gap-1 cursor-pointer transition"
                           title="Extract concept for math mutation"
@@ -984,6 +1414,20 @@ export default function App() {
                       </div>
 
                       <p className="whitespace-pre-wrap font-sans leading-relaxed">{m.content}</p>
+
+                      {!isUser && m.provenance && (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-slate-800/80 pt-2.5 text-[10px]">
+                          <span className="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-1 font-semibold text-violet-300">
+                            Response record: {m.provenance.provider} / {m.provenance.model}
+                          </span>
+                          <span
+                            className="font-mono text-slate-600"
+                            title={`Server-returned ledger reference: ${m.provenance.evidenceEventId}. Not reverified in this browser view.`}
+                          >
+                            Ledger ref {m.provenance.evidenceEventId.slice(0, 12)} (not reverified)
+                          </span>
+                        </div>
+                      )}
 
                       {/* Decoded memory context block tracers */}
                       {!isUser && m.retrievedMemories && m.retrievedMemories.length > 0 && (
@@ -1015,14 +1459,22 @@ export default function App() {
               {isCochatting && (
                 <div className="flex flex-col items-start max-w-2xl mx-auto">
                   <div className="flex items-center gap-1 text-[10px] font-mono text-slate-500 mb-1">
-                    <span>RECOGNITIVE ACTIVE WEIGHTS</span>
+                    <span>OPERATIONAL STATUS</span>
                     <span>•</span>
-                    <span className="text-teal-400 animate-pulse font-bold">Injecting Context maps...</span>
+                    <span className="text-teal-400 font-bold">Kernel-supervised request</span>
                   </div>
                   <div className="p-4 rounded-xl bg-[#16181D] border border-slate-850 text-xs text-slate-500 space-y-2 w-72">
                     <div className="flex items-center gap-1.5">
                       <div className="h-1.5 w-1.5 bg-teal-400 rounded-full animate-ping"></div>
-                      <span className="font-mono text-[9px] uppercase tracking-wider text-slate-400">Resolving tree convergence...</span>
+                      <span className="font-mono text-[9px] uppercase tracking-wider text-slate-400">
+                        {chatStage === 'routing'
+                          ? 'Routing through the provider policy'
+                          : chatStage === 'recording'
+                            ? 'Recording response evidence'
+                            : chatStage === 'extracting'
+                              ? 'Checking source-backed memory candidates'
+                              : 'Waiting for kernel state'}
+                      </span>
                     </div>
                     <div className="space-y-1">
                       <div className="h-1 bg-slate-800 rounded w-full animate-pulse"></div>
@@ -1045,17 +1497,21 @@ export default function App() {
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') handleSendMessage(); }}
-                  placeholder={isCochatting ? 'Wait until pipeline resolves...' : 'Interact with agent (e.g., "challenge my previous math theorem")'}
-                  disabled={isCochatting}
+                  placeholder={!kernelAccessReady
+                    ? 'Sign in from Overview to use the agent'
+                    : isCochatting
+                      ? 'Wait until pipeline resolves...'
+                      : 'Interact with agent (e.g., "challenge my previous math theorem")'}
+                  disabled={isCochatting || !kernelAccessReady}
                   className="w-full bg-[#0B0C0E] border border-slate-800 rounded-xl pl-4 pr-12 py-3.5 text-xs placeholder-slate-650 text-slate-200 focus:outline-[#1F232B] focus:border-teal-500 focus:outline-none transition-all focus:ring-1 focus:ring-teal-500"
                   id="chat_input_arena"
                 />
 
                 <button
                   onClick={() => handleSendMessage()}
-                  disabled={isCochatting || !inputText.trim()}
+                  disabled={isCochatting || !kernelAccessReady || !inputText.trim()}
                   className={`absolute right-2 px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white font-bold transition rounded-lg flex items-center justify-center cursor-pointer ${
-                    isCochatting || !inputText.trim() 
+                    isCochatting || !kernelAccessReady || !inputText.trim()
                       ? 'bg-slate-800/10 text-slate-550 border border-slate-800' 
                       : 'hover:scale-105 active:scale-95 shadow-lg shadow-teal-500/10'
                   }`}
@@ -1081,40 +1537,70 @@ export default function App() {
 
         {/* PANEL VIEW: RESEARCH TO VERIFIED REPORT MISSIONS */}
         {activePanelTab === 'missions' && (
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6" role="region" aria-label="Research Missions">
             <div className="max-w-5xl mx-auto space-y-4">
+              <div className="rounded-xl border border-cyan-500/20 bg-cyan-500/[0.06] px-4 py-3">
+                <p className="text-xs font-semibold text-cyan-200">Mission Authority</p>
+                <p className="mt-1 text-[11px] text-slate-500">Kernel-owned tasks, budgets, sources, and verification evidence.</p>
+              </div>
               <AuthPanel />
-              <ResearchMissionPanel initialMissionId={missionFocusId} />
+              {kernelAccessReady
+                ? <ResearchMissionPanel initialMissionId={missionFocusId} />
+                : <KernelAccessNotice />}
             </div>
           </div>
         )}
 
         {/* PANEL VIEW: DURABLE RECURRING RESEARCH */}
         {activePanelTab === 'schedules' && (
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6" role="region" aria-label="Schedules">
             <div className="max-w-6xl mx-auto space-y-4">
+              <div className="rounded-xl border border-violet-500/20 bg-violet-500/[0.06] px-4 py-3">
+                <p className="text-xs font-semibold text-violet-200">Schedule Authority</p>
+                <p className="mt-1 text-[11px] text-slate-500">Durable kernel timer, bounded occurrences, and explicit recovery controls.</p>
+              </div>
               <AuthPanel />
-              <RecurringResearchPanel onOpenMission={(missionId) => {
-                setMissionFocusId(missionId);
-                setActivePanelTab('missions');
-              }} />
+              {kernelAccessReady ? (
+                <RecurringResearchPanel onOpenMission={(missionId) => {
+                  setMissionFocusId(missionId);
+                  setActivePanelTab('missions');
+                }} />
+              ) : (
+                <KernelAccessNotice />
+              )}
             </div>
           </div>
         )}
 
         {/* PANEL VIEW: NATIVE WINDOWS UI AUTOMATION */}
         {activePanelTab === 'desktop' && (
-          <div className="flex-1 overflow-y-auto p-6">
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6" role="region" aria-label="Desktop">
             <div className="max-w-6xl mx-auto space-y-4">
+              <div className="rounded-xl border border-sky-500/20 bg-sky-500/[0.06] px-4 py-3">
+                <p className="text-xs font-semibold text-sky-200">Desktop Authority</p>
+                <p className="mt-1 text-[11px] text-slate-500">Approval-gated native worker with authenticated UI Automation control maps.</p>
+              </div>
               <AuthPanel />
-              <DesktopPanel />
+              {kernelAccessReady ? <DesktopPanel /> : <KernelAccessNotice />}
             </div>
+          </div>
+        )}
+
+        {activePanelTab === 'knowledge' && (
+          <div className="min-h-0 flex-1 overflow-hidden" role="region" aria-label="Knowledge">
+            <MemoryDashboard
+              memories={memories}
+              profile={profile}
+              isConsolidating={isConsolidating}
+              agentFramework={agentFramework}
+              onSetAgentFramework={setAgentFramework}
+            />
           </div>
         )}
 
         {/* PANEL VIEW: 2. INTERACTIVE DIALOGUE TREE & MIND MAP VISUALIZER */}
         {activePanelTab === 'tree' && (
-          <div className="flex-1 p-6 overflow-y-auto space-y-4">
+          <div className="flex-1 p-3 sm:p-6 overflow-y-auto space-y-4" role="region" aria-label="Dialogue Map">
             <div className="bg-[#16181D] border border-slate-800 p-4.5 rounded-xl">
               <h3 className="text-slate-100 font-bold text-xs uppercase tracking-wider mb-1 flex items-center gap-1 px-1">
                 <Network size={14} className="text-teal-400" />
@@ -1148,10 +1634,11 @@ export default function App() {
                             const isCurrentlyActiveInTimeline = activePath.some(pathNode => pathNode.id === child.id);
                             
                             return (
-                              <div
+                              <button
                                 key={child.id}
+                                type="button"
                                 onClick={() => handleJumpToNode(child.id)}
-                                className={`p-3.5 rounded-lg border text-left transition-all cursor-pointer relative group/node ${
+                                className={`w-full p-3.5 rounded-lg border text-left transition-all cursor-pointer relative group/node focus:outline-none focus:ring-2 focus:ring-teal-500/60 ${
                                   isCurrentlyActiveInTimeline
                                     ? 'bg-[#16181D] border-teal-500/60 shadow-lg shadow-teal-500/5'
                                     : 'bg-slate-900/40 border-slate-800 text-slate-400 hover:border-slate-700 hover:bg-slate-900/80'
@@ -1177,7 +1664,7 @@ export default function App() {
                                     <span className="text-[#0D9488] font-bold">{child.childrenIds.length} Child links</span>
                                   )}
                                 </div>
-                              </div>
+                              </button>
                             );
                           })}
                         </div>
@@ -1192,18 +1679,19 @@ export default function App() {
 
         {/* PANEL VIEW: 3. MATHEMATICAL MUTATOR & ADVANCED INSIGHT WORKSPACE */}
         {activePanelTab === 'mutator' && (
-          <div className="flex-1 p-6 overflow-y-auto space-y-4">
-            
+          <div className="flex-1 p-3 sm:p-6 overflow-y-auto space-y-4" role="region" aria-label="Research Lab">
+            {!kernelAccessReady && <KernelAccessNotice />}
+
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
               {/* Controls Column */}
               <div className="lg:col-span-5 space-y-4">
                 <div className="bg-[#16181D] border border-slate-800 p-4.5 rounded-xl space-y-3">
                   <div className="flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-amber-400">
                     <Zap size={15} />
-                    <span>Aether Mutation Operators</span>
+                    <span>Provider Research Draft</span>
                   </div>
                   <p className="text-xs text-slate-400 leading-relaxed font-sans">
-                    Take high-signal inputs (mathematical assumptions, formulas, or dialog nodes), apply heuristic stress operators, and mutate them into speculative academic insights.
+                    Apply a heuristic prompt transform to a premise and ask the configured provider for a speculative draft. The output is not an independently verified calculation, proof, or research finding.
                   </p>
                 </div>
 
@@ -1214,6 +1702,7 @@ export default function App() {
                     <textarea
                       value={mutationSourceText}
                       onChange={(e) => setMutationSourceText(e.target.value)}
+                      disabled={!kernelAccessReady || isMutating}
                       className="w-full text-xs bg-[#0B0C0E] border border-slate-800 rounded-lg p-3 text-slate-200 focus:outline-none focus:border-amber-500 min-h-[140px] leading-relaxed font-sans"
                       placeholder="e.g. Non-Abelian Gauge theories with scalar lattices..."
                     />
@@ -1221,7 +1710,7 @@ export default function App() {
 
                   {/* Operator grid */}
                   <div>
-                    <label className="block text-[10px] font-mono uppercase tracking-widest text-slate-500 mb-2 font-bold select-none">Mutation Operator:</label>
+                    <label className="block text-[10px] font-mono uppercase tracking-widest text-slate-500 mb-2 font-bold select-none">Drafting Operator:</label>
                     <div className="grid grid-cols-1 gap-1.5">
                       {[
                         { id: 'heuristic_leap', label: 'Heuristic Leap (Analogical Transfer)', desc: 'Port abstract structures from geometry & physics to breed novel isomorphisms.' },
@@ -1233,6 +1722,7 @@ export default function App() {
                           key={op.id}
                           type="button"
                           onClick={() => setMutationOperator(op.id as any)}
+                          disabled={!kernelAccessReady || isMutating}
                           className={`p-2.5 rounded-lg border text-left flex items-start gap-2.5 transition cursor-pointer select-none ${
                             mutationOperator === op.id
                               ? 'bg-[#1F232B] border-amber-500/60 text-amber-400'
@@ -1252,15 +1742,15 @@ export default function App() {
                   {/* Seed Mutator Button */}
                   <button
                     onClick={handlePerformMutation}
-                    disabled={isMutating || !mutationSourceText.trim()}
+                    disabled={!kernelAccessReady || isMutating || !mutationSourceText.trim()}
                     className={`w-full py-2.5 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer ${
-                      isMutating || !mutationSourceText.trim()
+                      !kernelAccessReady || isMutating || !mutationSourceText.trim()
                         ? 'bg-slate-800/20 text-slate-650'
                         : 'bg-amber-500 hover:bg-amber-600 active:scale-95 text-black font-black font-mono shadow-lg shadow-amber-500/10 hover:shadow-amber-500/20'
                     }`}
                   >
                     <Zap size={13} className={isMutating ? 'animate-spin' : ''} />
-                    {isMutating ? 'ENGINEERING INSIGHT...' : 'MUTATE COGNITIVE SYSTEM'}
+                    {isMutating ? 'REQUESTING PROVIDER DRAFT...' : 'GENERATE PROVIDER DRAFT'}
                   </button>
                 </div>
               </div>
@@ -1276,15 +1766,16 @@ export default function App() {
                         <span className="text-[9.5px] font-mono uppercase tracking-wider bg-amber-500/10 text-amber-500 border border-amber-500/20 px-2.5 py-1 rounded">
                           {activeMutation.operator.replace('_', ' ')} Applied
                         </span>
-                        <div className="text-[8px] text-slate-500 font-mono mt-1.5">BRED INDEX: {activeMutation.id}</div>
+                        <div className="text-[8px] text-slate-500 font-mono mt-1.5">DRAFT ID: {activeMutation.id}</div>
                       </div>
                       
                       <button
                         onClick={() => void commitMutationToMemory()}
-                        className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 text-white rounded text-xs font-semibold flex items-center gap-1 select-none transition cursor-pointer"
+                        disabled={!kernelAccessReady || isSubmittingMutation}
+                        className="px-3 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:bg-slate-800 disabled:text-slate-500 text-white rounded text-xs font-semibold flex items-center gap-1 select-none transition cursor-pointer disabled:cursor-not-allowed"
                       >
                         <HardDrive size={12} />
-                        Submit Candidate
+                        {isSubmittingMutation ? 'Submitting Candidate...' : 'Submit Review Candidate'}
                       </button>
                     </div>
 
@@ -1299,19 +1790,19 @@ export default function App() {
 
                       {/* Thesis Section */}
                       <div className="bg-[#0B0C0E]/80 border border-slate-850 p-3.5 rounded-lg space-y-1">
-                        <span className="text-[9px] font-mono text-amber-400 uppercase tracking-wider block font-bold">MUTATED CONJECTURE INSIGHT</span>
+                        <span className="text-[9px] font-mono text-amber-400 uppercase tracking-wider block font-bold">MODEL-GENERATED CONJECTURE (UNVERIFIED)</span>
                         <p className="text-slate-300 text-xs leading-relaxed font-sans">{activeMutation.novelInsight}</p>
                       </div>
 
                       {/* Analytical bounds section */}
                       <div className="bg-[#0B0C0E]/40 border border-slate-850 p-3.5 rounded-lg space-y-1">
-                        <span className="text-[9px] font-mono text-teal-400 uppercase tracking-wider block font-bold">FORMAL MATHEMATICAL BOUNDS</span>
+                        <span className="text-[9px] font-mono text-teal-400 uppercase tracking-wider block font-bold">MODEL-PROPOSED BOUNDS (NOT VERIFIED)</span>
                         <p className="text-slate-400 text-xs font-mono leading-relaxed">{activeMutation.mathematicalBounds}</p>
                       </div>
 
                       {/* Action item tracks */}
                       <div className="space-y-2">
-                        <span className="text-[9px] font-mono text-slate-500 uppercase tracking-wider block font-bold">Priority Research Directions:</span>
+                        <span className="text-[9px] font-mono text-slate-500 uppercase tracking-wider block font-bold">Suggested Validation Directions:</span>
                         <div className="space-y-1">
                           {activeMutation.suggestedActionItems.map((item, id) => (
                             <div key={id} className="flex items-start gap-2 text-xs text-slate-400 hover:text-slate-200 leading-normal bg-slate-900/40 p-2 rounded border border-slate-850">
@@ -1323,14 +1814,24 @@ export default function App() {
                           ))}
                         </div>
                       </div>
+
+                      <p className="border-t border-slate-800/80 pt-3 text-[10px] leading-relaxed text-slate-500">
+                        Local response record. Ledger ref{' '}
+                        <span className="font-mono text-slate-400">
+                          {activeMutation.evidenceEventId
+                            ? activeMutation.evidenceEventId.slice(0, 16)
+                            : 'not returned'}
+                        </span>{' '}
+                        was returned by the server and is not reverified in this browser view.
+                      </p>
                     </div>
                   </div>
                 ) : (
                   <div className="border border-dashed border-slate-800 rounded-xl p-16 text-center bg-[#16181D]/30 flex flex-col items-center justify-center min-h-[450px]">
                     <Layers size={36} className="text-slate-650 mb-3" />
-                    <span className="text-xs text-slate-400 font-bold block">Conjecture Reactor Offline</span>
+                    <span className="text-xs text-slate-400 font-bold block">No provider draft yet</span>
                     <span className="text-[11px] text-slate-550 font-sans block max-w-sm mx-auto leading-normal mt-1.5">
-                      Input theoretical premises on the left controls, select the heuristic mutation criteria operator, and trigger calculations to display novel insights here.
+                      Generate a provider draft from a premise and heuristic operator. Review it as a hypothesis, not a calculation or proof.
                     </span>
                   </div>
                 )}
@@ -1342,16 +1843,13 @@ export default function App() {
 
       </main>
 
-      {/* RIGHT SIDEBAR PANEL - The Local Agent Knowledgebase */}
-      <aside className="w-80 border-l border-slate-800 shrink-0 h-full overflow-hidden block">
-        <MemoryDashboard
-          memories={memories}
-          profile={profile}
-          isConsolidating={isConsolidating}
-          agentFramework={agentFramework}
-          onSetAgentFramework={setAgentFramework}
-        />
-      </aside>
+      <AgentObservatory
+        className={`${isActivityOpen ? 'flex' : 'hidden'} fixed inset-y-0 right-0 z-50 w-[min(24rem,100vw)] border-l border-slate-800 shadow-2xl 2xl:static 2xl:flex 2xl:w-[23rem] 2xl:shrink-0 2xl:shadow-none`}
+        closeButtonRef={activityCloseRef}
+        drawerOpen={isActivityOpen}
+        enabled={kernelAccessReady}
+        onClose={() => setIsActivityOpen(false)}
+      />
 
     </div>
   );

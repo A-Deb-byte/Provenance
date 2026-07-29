@@ -41,7 +41,12 @@ import { createEmptyUsage, reserveBudget } from './budget';
 import { createCapabilityToken, useCapabilityToken } from './capabilities';
 import { isGoalContractInput } from './guards';
 import { createKernelId } from './ids';
-import { appendKernelEvent, KernelEventInput, readKernelEvents } from './ledger';
+import { appendKernelEvent, KernelEventInput, readKernelEvents, readKernelEventTail } from './ledger';
+import type {
+  ObservatoryActiveAction,
+  ObservatoryActiveProvider,
+  ObservatoryActiveRecurring,
+} from './observatory';
 import {
   CreateMemoryCandidateInput,
   createMemoryCandidate as createMemoryCandidateRecord,
@@ -310,6 +315,30 @@ const isWithinRoot = (root: string, candidate: string): boolean => {
 
 const SNAPSHOT_COMMITTED_EVENT_TYPE = 'system.snapshot_committed';
 const SNAPSHOT_PREPARED_EVENT_TYPE = 'system.snapshot_prepared';
+export const MAX_KERNEL_AUDIT_REASON_CHARS = 1_000;
+export const MAX_PROVIDER_REQUEST_ID_CHARS = 200;
+
+const normalizedAuditReason = (value: string, label: string): string => {
+  const reason = value.trim();
+  if (!reason) throw new Error(`${label} is required.`);
+  if (reason.length > MAX_KERNEL_AUDIT_REASON_CHARS) {
+    throw new Error(`${label} must be at most ${MAX_KERNEL_AUDIT_REASON_CHARS} characters.`);
+  }
+  return reason;
+};
+
+const assertProviderRequestId = (request: ProviderRequest): void => {
+  if (
+    typeof request?.id !== 'string' ||
+    !request.id.trim() ||
+    request.id !== request.id.trim() ||
+    request.id.length > MAX_PROVIDER_REQUEST_ID_CHARS
+  ) {
+    throw new Error(
+      `Provider request id must be a trimmed non-empty string of at most ${MAX_PROVIDER_REQUEST_ID_CHARS} characters.`,
+    );
+  }
+};
 
 const isSnapshotCommitEvent = (event: KernelEvent): boolean => (
   event.type === SNAPSHOT_COMMITTED_EVENT_TYPE &&
@@ -684,9 +713,18 @@ export const createKernelService = (options: KernelServiceOptions) => {
   const workerRegistry = createWorkerRegistry(options.workerRegistrations ?? defaultWorkerRegistrations());
   const actionWorkers: Record<string, KernelActionWorker> = { ...(options.actionWorkers ?? {}) };
   const capabilityGrantStore = options.capabilityGrantStore ?? createMemoryCapabilityGrantStore();
-  const activeProviderControllers = new Map<string, AbortController>();
-  const activeActionControllers = new Map<string, AbortController>();
-  const activeRecurringResearchControllers = new Map<string, AbortController>();
+  const activeProviderControllers = new Map<string, {
+    controller: AbortController;
+    observatory: ObservatoryActiveProvider;
+  }>();
+  const activeActionControllers = new Map<string, {
+    controller: AbortController;
+    observatory: ObservatoryActiveAction;
+  }>();
+  const activeRecurringResearchControllers = new Map<string, {
+    controller: AbortController;
+    observatory: ObservatoryActiveRecurring;
+  }>();
   const skillEvaluatorAllowlist = new Set(
     (options.skillEvaluatorAllowlist ?? []).map((id) => id.trim()).filter(Boolean),
   );
@@ -697,12 +735,31 @@ export const createKernelService = (options: KernelServiceOptions) => {
     : RECURRING_RESEARCH_DEFAULT_TICK_MS;
   let mutationQueue: Promise<void> = Promise.resolve();
   let recoveryInProgress = false;
+  let recoveryStartedAt: string | undefined;
   let recoveryPromise: Promise<InterruptedTaskRecoveryResult> | undefined;
+  let lastAuthenticatedObservatoryState: KernelState | undefined;
 
   const withMutation = <T>(work: () => Promise<T>): Promise<T> => {
     const result = mutationQueue.then(work, work);
     mutationQueue = result.then(() => undefined, () => undefined);
     return result;
+  };
+
+  const invalidateObservatoryState = (): void => {
+    lastAuthenticatedObservatoryState = undefined;
+  };
+
+  const cacheAuthenticatedObservatoryState = (state: KernelState): KernelState => {
+    lastAuthenticatedObservatoryState = structuredClone(state);
+    return state;
+  };
+
+  const appendLedgerEvent = async (
+    previousHash: string | null,
+    input: KernelEventInput,
+  ): Promise<KernelEvent> => {
+    invalidateObservatoryState();
+    return appendKernelEvent(options.runtimeDir, previousHash, input);
   };
 
   const assessObservation = async (content: string, parentSignal?: AbortSignal) => {
@@ -727,7 +784,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
   };
 
   const appendEvent = async (state: KernelState, input: KernelEventInput) => {
-    const event = await appendKernelEvent(options.runtimeDir, state.lastEventHash, input);
+    const event = await appendLedgerEvent(state.lastEventHash, input);
     return { event, state: { ...state, lastEventHash: event.hash } };
   };
 
@@ -735,6 +792,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     pending: PendingKernelSnapshot,
     committedEvent?: KernelEvent,
   ): Promise<KernelState> => {
+    invalidateObservatoryState();
     const events = await readKernelEvents(options.runtimeDir);
     const prepared = events.find((candidate) => candidate.hash === pending.baseEventHash);
     if (
@@ -745,8 +803,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     ) {
       throw new Error('Pending kernel snapshot is not authenticated by a preparation event.');
     }
-    const event = committedEvent ?? await appendKernelEvent(
-      options.runtimeDir,
+    const event = committedEvent ?? await appendLedgerEvent(
       pending.baseEventHash,
       {
         actor: 'system',
@@ -773,17 +830,18 @@ export const createKernelService = (options: KernelServiceOptions) => {
     await writeKernelState(options.runtimeDir, committedState);
     await writeKernelRecoveryState(options.runtimeDir, committedState);
     await clearPendingKernelSnapshot(options.runtimeDir);
-    return committedState;
+    return cacheAuthenticatedObservatoryState(committedState);
   };
 
   const commitState = async (state: KernelState): Promise<KernelState> => {
+    invalidateObservatoryState();
     const events = await readKernelEvents(options.runtimeDir);
     const ledgerHead = events.at(-1)?.hash ?? null;
     if (state.lastEventHash !== ledgerHead) {
       throw new Error('Kernel snapshot commit base does not match the event ledger.');
     }
     const stateHash = hashKernelStateContent(state);
-    const prepared = await appendKernelEvent(options.runtimeDir, state.lastEventHash, {
+    const prepared = await appendLedgerEvent(state.lastEventHash, {
       actor: 'system',
       type: SNAPSHOT_PREPARED_EVENT_TYPE,
       entityId: 'kernel-state',
@@ -815,6 +873,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
   };
 
   const readConsistentState = async (): Promise<KernelState> => {
+    invalidateObservatoryState();
     const [state, recoveryState, pending, events] = await Promise.all([
       readKernelState(options.runtimeDir),
       readKernelRecoveryState(options.runtimeDir),
@@ -865,7 +924,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       await writeKernelState(options.runtimeDir, verified.candidate);
       await writeKernelRecoveryState(options.runtimeDir, verified.candidate);
       await clearPendingKernelSnapshot(options.runtimeDir);
-      return verified.candidate;
+      return cacheAuthenticatedObservatoryState(verified.candidate);
     }
 
     if (verified) {
@@ -873,7 +932,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       if (tail.some((event) => isSnapshotCommitEvent(event))) {
         throw new Error('Kernel snapshot integrity check failed: a newer committed snapshot is unavailable.');
       }
-      const recoveryEvent = await appendKernelEvent(options.runtimeDir, ledgerHead, {
+      const recoveryEvent = await appendLedgerEvent(ledgerHead, {
         actor: 'system',
         type: 'system.snapshot_recovered',
         entityId: 'kernel-state',
@@ -888,7 +947,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
     const hasSnapshotCommit = snapshotEventIndexes.size > 0;
     if (!hasSnapshotCommit && state.lastEventHash === ledgerHead) {
-      if (events.length === 0) return state;
+      if (events.length === 0) return cacheAuthenticatedObservatoryState(state);
       return commitState(state);
     }
 
@@ -923,6 +982,25 @@ export const createKernelService = (options: KernelServiceOptions) => {
   const getState = (): Promise<KernelState> => withMutation(readConsistentState);
 
   const getEvents = () => withMutation(() => readKernelEvents(options.runtimeDir));
+
+  const getObservatoryData = (eventLimit = 200) => withMutation(async () => {
+    const state = lastAuthenticatedObservatoryState ?? await readConsistentState();
+    const tail = await readKernelEventTail(options.runtimeDir, state.lastEventHash, eventLimit);
+    return {
+      state,
+      events: tail.events,
+      eventsTruncated: tail.truncated,
+      activeRuntime: {
+        providers: [...activeProviderControllers.values()].map((entry) => entry.observatory),
+        actions: [...activeActionControllers.values()].map((entry) => entry.observatory),
+        recurring: [...activeRecurringResearchControllers.values()].map((entry) => entry.observatory),
+        recovery: {
+          inProgress: recoveryInProgress,
+          startedAt: recoveryStartedAt,
+        },
+      },
+    };
+  });
 
   const createGoal = (input: GoalContractInput): Promise<GoalContract> => withMutation(async () => {
     if (!isGoalContractInput(input)) {
@@ -1195,13 +1273,13 @@ export const createKernelService = (options: KernelServiceOptions) => {
     status: Extract<ApprovalStatus, 'approved' | 'denied'>,
     reason: string,
   ) => withMutation(async () => {
+    const decisionReason = normalizedAuditReason(reason, 'Approval decision reason');
     let state = await readConsistentState();
     const approval = state.approvals.find((candidate) => candidate.id === approvalId);
     if (!approval) throw new Error('Approval not found.');
     if (approval.status !== 'pending') throw new Error('Approval has already been decided.');
-    if (!reason.trim()) throw new Error('Approval decision reason is required.');
 
-    const decided = decideApprovalRecord(approval, status, reason);
+    const decided = decideApprovalRecord(approval, status, decisionReason);
     const approvalAutomationId = approval.taskId.startsWith('automation:')
       ? approval.taskId.slice('automation:'.length)
       : undefined;
@@ -1216,7 +1294,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
         automationId: approvalAutomationId,
         riskLevel: approval.riskLevel,
         authorityBindingHash: approval.authorityBindingHash,
-        reason,
+        reason: decisionReason,
       },
     });
     state = appended.state;
@@ -1683,6 +1761,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
   interface PreparedProviderExecution {
     plan: ProviderRoutePlan;
     requestHash: string;
+    startedAt: string;
+    startEventId: string;
   }
 
   const prepareProviderExecution = (
@@ -1739,7 +1819,12 @@ export const createKernelService = (options: KernelServiceOptions) => {
         ? { ...candidate, usage: reserved.usage, updatedAt: new Date().toISOString() }
         : candidate),
     });
-    return { plan, requestHash };
+    return {
+      plan,
+      requestHash,
+      startedAt: appended.event.timestamp,
+      startEventId: appended.event.id,
+    };
   });
 
   const recordProviderSuccess = (
@@ -1809,6 +1894,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     policy: ProviderRoutingPolicy,
     parentSignal?: AbortSignal,
   ): Promise<ProviderExecution> => {
+    assertProviderRequestId(request);
     const prepared = await prepareProviderExecution(goalId, request, policy);
     if (!options.providerRouter) throw new Error('Provider router is unavailable.');
     if (recoveryInProgress) throw new Error('Provider dispatch is unavailable while recovery is in progress.');
@@ -1821,7 +1907,19 @@ export const createKernelService = (options: KernelServiceOptions) => {
     const abortFromParent = () => controller.abort();
     if (parentSignal?.aborted) controller.abort();
     else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
-    activeProviderControllers.set(request.id, controller);
+    const runtimeId = prepared.startEventId;
+    activeProviderControllers.set(runtimeId, {
+      controller,
+      observatory: {
+        id: request.id,
+        goalId,
+        startedAt: prepared.startedAt,
+        routes: prepared.plan.selections.map((selection) => ({
+          provider: selection.provider,
+          model: selection.model,
+        })),
+      },
+    });
     try {
       const current = await getState();
       if (current.controls.stopAll) throw new Error('Stop All became active before provider dispatch.');
@@ -1842,7 +1940,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
     } finally {
       clearTimeout(timeout);
       parentSignal?.removeEventListener('abort', abortFromParent);
-      activeProviderControllers.delete(request.id);
+      if (activeProviderControllers.get(runtimeId)?.controller === controller) {
+        activeProviderControllers.delete(runtimeId);
+      }
     }
   };
 
@@ -2487,7 +2587,18 @@ export const createKernelService = (options: KernelServiceOptions) => {
     const abortFromParent = () => controller.abort();
     if (parentSignal?.aborted) controller.abort();
     else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
-    activeActionControllers.set(prepared.activeStep.id, controller);
+    activeActionControllers.set(prepared.activeStep.id, {
+      controller,
+      observatory: {
+        id: prepared.activeStep.id,
+        kind: 'mission',
+        goalId: prepared.intent.goalId,
+        taskId: prepared.intent.taskId,
+        missionId: prepared.missionId,
+        startedAt: prepared.activeStep.startedAt,
+        action: prepared.intent.action,
+      },
+    });
     let dispatch: KernelActionWorkerResult;
     try {
       const current = await getState();
@@ -2511,7 +2622,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
       };
     } finally {
       parentSignal?.removeEventListener('abort', abortFromParent);
-      activeActionControllers.delete(prepared.activeStep.id);
+      if (activeActionControllers.get(prepared.activeStep.id)?.controller === controller) {
+        activeActionControllers.delete(prepared.activeStep.id);
+      }
     }
     if ((await getState()).controls.stopAll && dispatch.status === 'succeeded') {
       dispatch = {
@@ -3785,7 +3898,16 @@ export const createKernelService = (options: KernelServiceOptions) => {
       return { outcome: 'started', ...prepared, reason: 'Occurrence is already running.' };
     }
     const controller = new AbortController();
-    activeRecurringResearchControllers.set(prepared.occurrence.id, controller);
+    activeRecurringResearchControllers.set(prepared.occurrence.id, {
+      controller,
+      observatory: {
+        occurrenceId: prepared.occurrence.id,
+        scheduleId: prepared.schedule.contract.id,
+        goalId: prepared.occurrence.goalId,
+        missionId: prepared.mission.id,
+        startedAt: prepared.occurrence.attemptStartedAt ?? prepared.occurrence.updatedAt,
+      },
+    });
     let deadlineExceeded = false;
     const timeoutMs = Math.max(1, Date.parse(prepared.occurrence.deadlineAt) - Date.now());
     const deadlineTimer = setTimeout(() => {
@@ -3809,7 +3931,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
       executionError = error;
     } finally {
       clearTimeout(deadlineTimer);
-      activeRecurringResearchControllers.delete(prepared.occurrence.id);
+      if (activeRecurringResearchControllers.get(prepared.occurrence.id)?.controller === controller) {
+        activeRecurringResearchControllers.delete(prepared.occurrence.id);
+      }
     }
 
     try {
@@ -4109,7 +4233,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
   };
 
   const abortRecurringResearchRuns = async (): Promise<void> => {
-    for (const controller of activeRecurringResearchControllers.values()) controller.abort();
+    for (const entry of activeRecurringResearchControllers.values()) entry.controller.abort();
     const deadline = Date.now() + 5_000;
     while (activeRecurringResearchControllers.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -4178,7 +4302,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     enabled: boolean,
     reason: string,
   ): Promise<AutomationContract> => withMutation(async () => {
-    if (!reason.trim()) throw new Error('Automation state change reason is required.');
+    const stateChangeReason = normalizedAuditReason(reason, 'Automation state change reason');
     let state = await readConsistentState();
     const automation = state.automations.find((candidate) => candidate.id === automationId);
     if (!automation) throw new Error('Automation not found.');
@@ -4200,7 +4324,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       type: enabled ? 'automation.enabled' : 'automation.disabled',
       entityId: automationId,
       entityType: 'automation',
-      payload: { automationId, reason: reason.trim() },
+      payload: { automationId, reason: stateChangeReason },
     });
     state = appended.state;
     await commitState({
@@ -4493,7 +4617,18 @@ export const createKernelService = (options: KernelServiceOptions) => {
     });
 
     const controller = new AbortController();
-    activeActionControllers.set(intent.id, controller);
+    activeActionControllers.set(intent.id, {
+      controller,
+      observatory: {
+        id: intent.id,
+        kind: 'automation',
+        goalId: automation.goalId,
+        taskId: intent.taskId,
+        automationId,
+        startedAt: appended.event.timestamp,
+        action: intent.action,
+      },
+    });
     return {
       kind: 'dispatch',
       automationId,
@@ -4538,7 +4673,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
     let fenceReason: string | undefined;
     let fenceErrorCode: string | undefined;
-    if (activeActionControllers.get(prepared.intent.id) !== prepared.controller || !runStarted) {
+    if (activeActionControllers.get(prepared.intent.id)?.controller !== prepared.controller || !runStarted) {
       fenceReason = 'Automation dispatch ownership changed before result commit.';
       fenceErrorCode = 'stale_dispatch';
     } else if (prepared.controller.signal.aborted) {
@@ -4766,7 +4901,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       );
     } finally {
       clearTimeout(timeout);
-      if (activeActionControllers.get(prepared.intent.id) === prepared.controller) {
+      if (activeActionControllers.get(prepared.intent.id)?.controller === prepared.controller) {
         activeActionControllers.delete(prepared.intent.id);
       }
     }
@@ -4778,27 +4913,27 @@ export const createKernelService = (options: KernelServiceOptions) => {
   };
 
   const setStopAll = (stopAll: boolean, reason: string): Promise<KernelControls> => withMutation(async () => {
-    if (!reason.trim()) throw new Error('Stop All state change reason is required.');
+    const controlReason = normalizedAuditReason(reason, 'Stop All state change reason');
     let state = await readConsistentState();
     if (state.controls.stopAll === stopAll) {
       throw new Error(`Kernel execution is already ${stopAll ? 'stopped' : 'running'}.`);
     }
     if (stopAll) {
-      for (const controller of activeProviderControllers.values()) controller.abort();
-      for (const controller of activeActionControllers.values()) controller.abort();
-      for (const controller of activeRecurringResearchControllers.values()) controller.abort();
+      for (const entry of activeProviderControllers.values()) entry.controller.abort();
+      for (const entry of activeActionControllers.values()) entry.controller.abort();
+      for (const entry of activeRecurringResearchControllers.values()) entry.controller.abort();
     }
 
     const now = new Date().toISOString();
     const controls: KernelControls = stopAll
-      ? { stopAll: true, stopAllReason: reason.trim(), updatedAt: now }
+      ? { stopAll: true, stopAllReason: controlReason, updatedAt: now }
       : { stopAll: false, updatedAt: now };
     const appended = await appendEvent(state, {
       actor: 'user',
       type: stopAll ? 'control.stop_all' : 'control.resumed',
       entityId: 'kernel',
       entityType: 'control',
-      payload: { reason: reason.trim() },
+      payload: { reason: controlReason },
     });
     state = appended.state;
     await commitState({ ...state, controls });
@@ -5015,6 +5150,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       return Promise.reject(new Error('Recovery requires a quiescent kernel with no active external dispatch.'));
     }
     recoveryInProgress = true;
+    recoveryStartedAt = new Date().toISOString();
     const pending = (async () => {
       await Promise.resolve();
       if (
@@ -5031,6 +5167,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       if (recoveryPromise === tracked) {
         recoveryPromise = undefined;
         recoveryInProgress = false;
+        recoveryStartedAt = undefined;
       }
     });
     recoveryPromise = tracked;
@@ -5191,6 +5328,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
   return {
     getState,
     getEvents,
+    getObservatoryData,
     createGoal,
     stepGoal,
     stepGoalsInParallel,

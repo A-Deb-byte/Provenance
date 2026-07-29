@@ -85,4 +85,63 @@ describe('kernel provider integration', () => {
     await expect(kernel.executeProviderRequest(goal.id, { ...request, id: 'provider_request_2' }, { mode: 'automatic' }))
       .rejects.toThrow('Provider call budget exceeded');
   });
+
+  it('exposes only controller-owned active provider metadata to the observatory', async () => {
+    let signalStarted!: () => void;
+    let releaseProvider!: () => void;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const delayedAdapter: ProviderAdapter = {
+      ...adapter,
+      async generate(providerRequest): Promise<ProviderResult> {
+        signalStarted();
+        await providerGate;
+        return {
+          requestId: providerRequest.id,
+          provider: 'gemini',
+          model: 'gemini-test',
+          text: 'bounded result',
+          toolCalls: [],
+          usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+          finishReason: 'stop',
+          latencyMs: 1,
+        };
+      },
+    };
+    const kernel = createKernelService({
+      runtimeDir,
+      allowedWorkspaceRoot: workspaceRoot,
+      providerRouter: new ProviderRouter([delayedAdapter]),
+    });
+    const goal = await kernel.createGoal({
+      objective: 'Observe one live provider call',
+      successCriteria: ['The runtime owner is visible'],
+      constraints: ['Do not expose prompts'],
+      autonomyLevel: 'bounded',
+      workspaceRoot,
+      verificationCommands: ['npm test'],
+      budget: { maxOperations: 2, maxCommandRuntimeMs: 1000, maxApprovals: 0, maxProviderCalls: 1 },
+    });
+
+    const execution = kernel.executeProviderRequest(goal.id, request, { mode: 'automatic' });
+    await started;
+    try {
+      const active = await kernel.getObservatoryData();
+      expect(active.activeRuntime.providers).toEqual([
+        expect.objectContaining({
+          id: request.id,
+          goalId: goal.id,
+          routes: [{ provider: 'gemini', model: 'gemini-test' }],
+        }),
+      ]);
+    } finally {
+      releaseProvider();
+    }
+    await execution;
+    expect((await kernel.getObservatoryData()).activeRuntime.providers).toEqual([]);
+  });
 });

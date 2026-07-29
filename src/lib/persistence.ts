@@ -1,9 +1,9 @@
 import { AgentFramework, AgentProviderConfig, ChatSession, MemoryItem, ProviderName, UserProfile } from '../types';
 
 export const STORAGE_KEYS = {
-  sessions: 'agent_kb_sessions_v2',
-  activeSessionId: 'agent_kb_active_sid_v2',
-  framework: 'agent_kb_framework',
+  sessions: 'agent_kb_open_sessions_v1',
+  activeSessionId: 'agent_kb_open_active_sid_v1',
+  framework: 'agent_kb_open_framework_v1',
 } as const;
 
 const LEGACY_AUTHORITATIVE_KEYS = [
@@ -70,11 +70,19 @@ export const isUserProfile = (value: unknown): value is UserProfile => {
 
 export const isMessage = (value: unknown): value is ChatSession['messages'][number] => {
   if (!isRecord(value)) return false;
+  const provenance = value.provenance;
+  const validProvenance = provenance === undefined || (
+    isRecord(provenance) &&
+    typeof provenance.provider === 'string' &&
+    typeof provenance.model === 'string' &&
+    typeof provenance.evidenceEventId === 'string'
+  );
   return (
     typeof value.id === 'string' &&
     (value.role === 'user' || value.role === 'assistant' || value.role === 'system') &&
     typeof value.content === 'string' &&
     typeof value.timestamp === 'string' &&
+    validProvenance &&
     (value.parentId === undefined || value.parentId === null || typeof value.parentId === 'string') &&
     (value.childrenIds === undefined || isStringArray(value.childrenIds))
   );

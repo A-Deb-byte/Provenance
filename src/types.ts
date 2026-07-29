@@ -28,6 +28,11 @@ export interface Message {
   content: string;
   timestamp: string;
   retrievedMemories?: MemoryItem[]; // The memories that were injected as context during this turn
+  provenance?: {
+    provider: string;
+    model: string;
+    evidenceEventId: string;
+  };
   parentId?: string | null;           // For building branched conversation trees
   childrenIds?: string[];
 }
