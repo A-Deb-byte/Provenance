@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, ChevronRight, Layers, Play, PowerOff, ShieldAlert, ShieldCheck, Sparkles, Split, XOctagon } from 'lucide-react';
+import { Bot, Brain, ChevronRight, Layers, Play, PowerOff, ShieldAlert, ShieldCheck, Sparkles, Split, XOctagon } from 'lucide-react';
 import type {
   AgentAuthorityMode,
   AgentDomain,
@@ -184,6 +184,16 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
       `/api/kernel/agents/spawns/${spawnId}/step`, { method: 'POST' },
     );
     return `${outcome.kind}: ${outcome.reason}`;
+  });
+
+  const planWithModel = (spawnId: string) => runAction(async () => {
+    const outcome = await request<{ ok: boolean; reason: string; rejected?: { value: string }[] }>(
+      `/api/kernel/agents/spawns/${spawnId}/plan`, { method: 'POST' },
+    );
+    const refused = outcome.rejected?.length
+      ? ` ${outcome.rejected.length} proposed target(s) were outside this agent's permitted origins and were discarded.`
+      : '';
+    return `${outcome.ok ? 'Plan accepted' : 'Plan rejected'}: ${outcome.reason}${refused}`;
   });
 
   const dispatchProposal = (proposalId: string) => runAction(async () => {
@@ -442,6 +452,17 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
                   className="inline-flex items-center gap-1 rounded-lg border border-amber-700 bg-amber-950/30 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/30 disabled:opacity-50"
                 >
                   <ShieldCheck className="h-3 w-3" aria-hidden="true" />Authorize
+                </button>
+              )}
+              {item.status === 'running' && execution?.enabled && (
+                <button
+                  type="button"
+                  onClick={() => planWithModel(item.id)}
+                  disabled={busy}
+                  title="Ask a model what to work on. Anything outside this agent's permitted origins is discarded."
+                  className="inline-flex items-center gap-1 rounded-lg border border-violet-700 bg-violet-950/30 px-3 py-1 text-xs font-semibold text-violet-200 hover:bg-violet-900/30 disabled:opacity-50"
+                >
+                  <Brain className="h-3 w-3" aria-hidden="true" />Plan with model
                 </button>
               )}
               {item.status === 'running' && execution?.enabled && (

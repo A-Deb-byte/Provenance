@@ -142,6 +142,12 @@ import {
 } from './agents/executor';
 import { decomposeObjective } from './agents/orchestrator';
 import {
+  buildPlannerPrompt,
+  parseProposedPlan,
+  validateAgentPlan,
+  type RejectedTarget,
+} from './agents/planner';
+import {
   AGENT_AUTHORITY_MODES,
   AGENT_DOMAINS,
   AGENT_TIERS,
@@ -155,6 +161,13 @@ import {
   type AgentSpawn,
   type AgentTier,
 } from './agents/types';
+
+export type AgentPlanOutcome = {
+  ok: boolean;
+  reason: string;
+  spawn: AgentSpawn;
+  rejected: RejectedTarget[];
+};
 
 export type AgentStepOutcome = {
   kind: 'stepped' | 'completed' | 'failed' | 'proposed';
@@ -6085,6 +6098,108 @@ export const createKernelService = (options: KernelServiceOptions) => {
     };
   });
 
+  /**
+   * Asks a model what this agent should work on, then keeps only what the
+   * agent was already permitted to do.
+   *
+   * The model gains nothing by answering. Its response is untrusted text: it is
+   * parsed defensively, every target is checked against origins already
+   * configured for the worker, and anything else is discarded and ledgered. A
+   * model cannot introduce an origin, an action, or an operation the kernel
+   * would not have allowed a human to request.
+   */
+  const planAgentWithModel = async (spawnId: string): Promise<AgentPlanOutcome> => {
+    if (!agentExecutionEnabled()) throw new Error(agentExecutionStatus().reason);
+    if (!options.providerRouter) throw new Error('Provider router is unavailable.');
+
+    // Read and validate before taking any lock. executeProviderRequest acquires
+    // the mutation lock itself, so the provider call must happen outside one.
+    const state = await getState();
+    const fleet = fleetOf(state);
+    const spawn = fleet.spawns.find((candidate) => candidate.id === spawnId);
+    if (!spawn) throw new Error('Agent spawn not found.');
+    if (spawn.status !== 'running') throw new Error(`Agent is ${spawn.status} and cannot be planned for.`);
+    if (state.controls.stopAll) throw new Error('Stop All is active. Resume the kernel before planning.');
+    const definition = fleet.definitions.find((item) => item.id === spawn.definitionId);
+    const workerId = definition?.workerIds[0];
+    if (!workerId) throw new Error('Agent definition lists no worker to plan within.');
+    const registration = workerRegistry.get(workerId);
+    if (!registration) throw new Error(`Agent worker ${workerId} is not registered.`);
+
+    const prompt = buildPlannerPrompt(spawn, registration);
+    const requestId = createKernelId('plan');
+    const execution = await executeProviderRequest(spawn.goalId, {
+      id: requestId,
+      messages: [
+        { role: 'system', content: prompt.system },
+        { role: 'user', content: prompt.user },
+      ],
+      requiredCapabilities: ['text'],
+      responseFormat: { type: 'json_object' },
+      temperature: 0,
+    }, options.researchRoutingPolicy ?? { mode: 'automatic' });
+
+    // First successful result only: a disagreeing router is not a licence to
+    // merge plans, and every target is validated regardless of source.
+    const planText = execution.results[0]?.text ?? '';
+    const proposal = parseProposedPlan(planText);
+    const validation = proposal
+      ? validateAgentPlan(proposal, spawn, registration, spawn.budget.maxOperations - spawn.operationsUsed)
+      : {
+        ok: false,
+        reason: 'Planner response was not a JSON object.',
+        targets: [] as string[],
+        action: 'inspect' as const,
+        selector: undefined,
+        rejected: [],
+        truncated: 0,
+        rationale: undefined,
+      };
+
+    return withMutation(async () => {
+      let working = await readConsistentState();
+      // Refusals are ledgered with what was rejected and why, so a narrowed or
+      // failed plan is visible rather than an unexplained absence of work.
+      const appended = await appendEvent(working, {
+        actor: 'kernel',
+        type: validation.ok ? 'agent.plan_accepted' : 'agent.plan_rejected',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: {
+          spawnId: spawn.id,
+          providerRequestId: requestId,
+          reason: validation.reason,
+          acceptedTargets: validation.targets.length,
+          rejected: validation.rejected,
+          truncated: validation.truncated,
+          action: validation.action,
+          // The model's stated reasoning is evidence, not instruction.
+          rationale: validation.rationale,
+        },
+      });
+      working = appended.state;
+
+      if (!validation.ok) {
+        await commitState(working);
+        return { ok: false, reason: validation.reason, spawn, rejected: validation.rejected };
+      }
+
+      const planned: AgentSpawn = {
+        ...spawn,
+        targets: validation.targets,
+        targetAction: validation.action === 'click' ? ('click' as const) : undefined,
+        targetSelector: validation.selector,
+        updatedAt: new Date().toISOString(),
+      };
+      const nextFleet = fleetOf(working);
+      await commitState(withFleet(working, {
+        ...nextFleet,
+        spawns: nextFleet.spawns.map((item) => item.id === planned.id ? planned : item),
+      }));
+      return { ok: true, reason: validation.reason, spawn: planned, rejected: validation.rejected };
+    });
+  };
+
   /** Fans an orchestrator's targets out across child agents. */
   const runAgentOrchestration = (
     spawnId: string,
@@ -6277,6 +6392,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     createAgentDefinition,
     agentExecutionStatus,
     runAgentStep,
+    planAgentWithModel,
     dispatchAgentProposal,
     runAgentOrchestration,
     spawnAgent,

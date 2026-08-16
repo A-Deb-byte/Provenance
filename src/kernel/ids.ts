@@ -5,6 +5,7 @@ export type IdPrefix =
   | 'spawn'
   | 'proposal'
   | 'intent'
+  | 'plan'
   | 'goal'
   | 'task'
   | 'event'

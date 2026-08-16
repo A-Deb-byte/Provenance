@@ -163,7 +163,33 @@ Because the deterministic planner previously only ever produced `browser.inspect
 agent now carries a `targetAction` (`inspect` or `click`), so an L2 action is
 derivable and the boundary is exercised by real work.
 
+## Model-driven planning
+
+A model may now *propose* what an agent works on. It gains no authority by doing
+so — its response is untrusted text, validated deterministically against bounds
+it cannot influence.
+
+The rule that matters: **a model can never introduce an origin.** Every proposed
+target must fall inside an origin already configured for the agent's worker.
+A hallucinated, attacker-suggested, or prompt-injected URL is discarded and
+ledgered, not clamped into something adjacent.
+
+`validateAgentPlan` also refuses malformed URLs, non-http schemes, embedded
+credentials, duplicates, unsupported actions, a click with no selector, and
+oversized lists; truncates to the remaining operation budget; and **fails rather
+than succeeding emptily** when every target is refused. An unrecognised action is
+rejected outright rather than defaulting to the safe one — silently substituting
+`inspect` would let a malformed plan through as if it had been understood.
+
+Planning does not raise the ceiling. A planner may choose `click` for a
+`T0_reader`; the agent still has to propose it, and a human still decides.
+Every acceptance and rejection is ledgered (`agent.plan_accepted`,
+`agent.plan_rejected`) with what was discarded and why, so a narrowed plan is
+visible rather than an unexplained absence of work.
+
+The model's stated rationale is recorded as evidence, bounded in length, and is
+never treated as instruction.
+
 ## Still out
 
-A model-driven planner (targets and target action are operator-supplied today)
-and skill→agent binding.
+Skill→agent binding.

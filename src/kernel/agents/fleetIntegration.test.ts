@@ -417,3 +417,135 @@ describe('proposal to dispatch loop', () => {
     expect(dispatched).toEqual([]);
   });
 });
+
+describe('model-driven planning', () => {
+  // A stub router standing in for a model. What matters is not what it says but
+  // that the kernel keeps only what the agent was already permitted to do.
+  const routerReturning = (content: string) => ({
+    plan: () => ({ selections: [{ provider: 'gemini', model: 'stub' }], mode: 'automatic' }),
+    execute: async () => ({
+      plan: { selections: [{ provider: 'gemini', model: 'stub' }], mode: 'automatic' },
+      results: [{
+        requestId: 'req_1', provider: 'gemini', model: 'stub', text: content,
+        toolCalls: [], usage: { inputTokens: 1, outputTokens: 1 },
+        finishReason: 'stop', latencyMs: 1,
+      }],
+      errors: [],
+      disagreement: false,
+    }),
+  }) as never;
+
+  const plannerKernel = (content: string) => createKernelService({
+    runtimeDir,
+    allowedWorkspaceRoot: workspaceRoot,
+    agentExecutionEnabled: true,
+    workerRegistrations: [clickRegistration],
+    actionWorkers: { [CLICK_WORKER_ID]: recordingWorker },
+    providerRouter: routerReturning(content),
+  });
+
+  const plannedAgent = async () => {
+    // Planning spends a provider call, so the goal must budget for one.
+    const goal = await kernel.createGoal({
+      ...goalInput,
+      budget: { ...goalInput.budget, maxProviderCalls: 5 },
+    });
+    const definition = await kernel.createAgentDefinition({
+      name: 'planner-driven', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [CLICK_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: definition.id, goalId: goal.id, objective: 'Survey the docs',
+      requestedAuthority: 'propose_only',
+    });
+    return spawn;
+  };
+
+  it('accepts a model plan and turns it into real, dispatchable work', async () => {
+    kernel = plannerKernel(JSON.stringify({
+      targets: ['https://example.com/a', 'https://example.com/b'],
+      action: 'inspect',
+      rationale: 'Both pages cover the topic.',
+    }));
+    const spawn = await plannedAgent();
+
+    const planned = await kernel.planAgentWithModel(spawn.id);
+
+    expect(planned.ok).toBe(true);
+    expect(planned.spawn.targets).toEqual(['https://example.com/a', 'https://example.com/b']);
+    expect(await eventTypes()).toContain('agent.plan_accepted');
+
+    // The plan is real: the agent now does the work the model chose.
+    const step = await kernel.runAgentStep(spawn.id);
+    expect(step.kind).toBe('stepped');
+    expect(dispatched).toEqual(['https://example.com/a']);
+  });
+
+  it('discards targets outside the worker origins and ledgers the refusal', async () => {
+    // A model steered by injected page content still cannot reach a new origin.
+    kernel = plannerKernel(JSON.stringify({
+      targets: ['https://example.com/keep', 'https://evil.test/exfiltrate'],
+      action: 'inspect',
+    }));
+    const spawn = await plannedAgent();
+
+    const planned = await kernel.planAgentWithModel(spawn.id);
+
+    expect(planned.ok).toBe(true);
+    expect(planned.spawn.targets).toEqual(['https://example.com/keep']);
+    expect(planned.rejected).toEqual([
+      { value: 'https://evil.test/exfiltrate', reasonCode: 'origin_not_configured' },
+    ]);
+    expect(await eventTypes()).toContain('agent.plan_accepted');
+  });
+
+  it('rejects a plan whose every target is outside the boundary', async () => {
+    kernel = plannerKernel(JSON.stringify({ targets: ['https://evil.test/a'], action: 'inspect' }));
+    const spawn = await plannedAgent();
+
+    const planned = await kernel.planAgentWithModel(spawn.id);
+
+    expect(planned.ok).toBe(false);
+    expect(planned.spawn.targets).toBeUndefined();
+    expect(await eventTypes()).toContain('agent.plan_rejected');
+    // Nothing was dispatched, and the agent has no work.
+    const step = await kernel.runAgentStep(spawn.id);
+    expect(step.kind).toBe('completed');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('rejects a non-JSON model response rather than guessing', async () => {
+    kernel = plannerKernel('I think you should visit https://evil.test');
+    const spawn = await plannedAgent();
+
+    const planned = await kernel.planAgentWithModel(spawn.id);
+
+    expect(planned.ok).toBe(false);
+    expect(planned.reason).toContain('not a JSON object');
+    expect(await eventTypes()).toContain('agent.plan_rejected');
+  });
+
+  it('keeps a model-planned click below the agent ceiling by proposing it', async () => {
+    // The planner may choose a click; that does not grant the agent authority
+    // to perform one. A T0 reader still has to propose it.
+    kernel = plannerKernel(JSON.stringify({
+      targets: ['https://example.com/a'], action: 'click', selector: '#accept',
+    }));
+    const spawn = await plannedAgent();
+
+    const planned = await kernel.planAgentWithModel(spawn.id);
+    expect(planned.ok).toBe(true);
+    expect(planned.spawn.targetAction).toBe('click');
+
+    const step = await kernel.runAgentStep(spawn.id);
+    expect(step.kind).toBe('proposed');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('refuses to plan while execution is disabled', async () => {
+    kernel = makeKernel(false);
+    const spawn = await plannedAgent();
+
+    await expect(kernel.planAgentWithModel(spawn.id)).rejects.toThrow('Agent execution is disabled');
+  });
+});

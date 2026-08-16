@@ -775,6 +775,15 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
   });
 
+  router.post('/agents/spawns/:spawnId/plan', async (req, res) => {
+    try {
+      res.json(await kernel.planAgentWithModel(req.params.spawnId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent spawn not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
   router.post('/agents/proposals/:proposalId/dispatch', async (req, res) => {
     try {
       res.json(await kernel.dispatchAgentProposal(req.params.proposalId));
