@@ -1977,5 +1977,166 @@ mod tests {
             assert_eq!(typed["action"], "desktop.type");
             assert_eq!(fixture.edit_text(), payload);
         }
+
+        /// Drives a real third-party application, not a fixture this test built.
+        ///
+        /// Every other desktop test either creates its own Win32 window or uses a
+        /// deterministic simulation, so the claim that the runtime can operate an
+        /// application it did not create was never actually exercised. Notepad is
+        /// used because it ships with Windows and needs no install.
+        ///
+        /// Opt-in via PROVENANCE_LIVE_DESKTOP=1: UI Automation cannot attach in a
+        /// headless session, and a test that silently passed when it could not run
+        /// would be worse than no test.
+        #[test]
+        fn drives_notepad_as_a_real_third_party_application() {
+            if std::env::var("PROVENANCE_LIVE_DESKTOP").ok().as_deref() != Some("1") {
+                eprintln!("skipped: set PROVENANCE_LIVE_DESKTOP=1 on an interactive desktop");
+                return;
+            }
+
+            // On Windows 11, System32\notepad.exe is a launcher stub: the window is
+            // owned by a different process under WindowsApps, so allowlisting the
+            // System32 path discovers nothing at all. The allowlist must name the
+            // executable that actually owns the window.
+            let system_root =
+                std::env::var("SystemRoot").unwrap_or_else(|_| String::from(r"C:\Windows"));
+            let default_path = std::path::Path::new(&system_root)
+                .join("System32")
+                .join("notepad.exe");
+            let executable = std::env::var("PROVENANCE_LIVE_DESKTOP_EXE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(default_path);
+            assert!(executable.is_file(), "notepad executable not found at {executable:?}");
+            let canonical = std::fs::canonicalize(&executable).expect("canonical notepad path");
+
+            struct Launched(std::process::Child);
+            impl Drop for Launched {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let _notepad = Launched(
+                std::process::Command::new(&executable)
+                    .spawn()
+                    .expect("launch notepad"),
+            );
+
+            let broker = UiaBroker::start(vec![AllowedApplication {
+                app_id: APP_ID.into(),
+                executable_path: canonical,
+            }])
+            .expect("UI Automation broker did not start");
+
+            let payload = "provenance-live-uia";
+
+            // A live modern application re-renders continuously, so its tree
+            // revision can go stale between any two calls. The contract is right to
+            // refuse a stale revision; the consequence is that a real client must
+            // retry the whole discover -> inspect -> act sequence as a unit, not
+            // just the step that failed. This loop is that client.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let mut typed_ok = false;
+            let mut last_error = String::from("no attempt completed");
+            while std::time::Instant::now() < deadline && !typed_ok {
+                let attempt = (|| -> Result<(), String> {
+                    let discovered = content(
+                        broker
+                            .execute(ActionEnvelope {
+                                schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                                action: DesktopAction::Discover { app_id: APP_ID.into() },
+                                payload_text: None,
+                            })
+                            .map_err(|error| format!("discover: {error:?}"))?,
+                    );
+                    let window = discovered["windows"]
+                        .as_array()
+                        .and_then(|windows| windows.first())
+                        .cloned()
+                        .ok_or_else(|| String::from("discover: no window yet"))?;
+                    let window_id = window["windowId"].as_str().unwrap().to_string();
+
+                    let inspected = content(
+                        broker
+                            .execute(ActionEnvelope {
+                                schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                                action: DesktopAction::Inspect {
+                                    app_id: APP_ID.into(),
+                                    window_id: window_id.clone(),
+                                    tree_revision: window["treeRevision"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_string(),
+                                },
+                                payload_text: None,
+                            })
+                            .map_err(|error| format!("inspect: {error:?}"))?,
+                    );
+                    let nodes = inspected["nodes"]
+                        .as_array()
+                        .ok_or_else(|| String::from("inspect: no nodes"))?;
+                    if nodes.is_empty() {
+                        return Err(String::from("inspect: a real window produced an empty tree"));
+                    }
+                    let editable = nodes
+                        .iter()
+                        .find(|node| {
+                            matches!(node["role"].as_str(), Some("edit") | Some("document"))
+                        })
+                        .ok_or_else(|| String::from("inspect: no editable node"))?;
+
+                    let typed = content(
+                        broker
+                            .execute(ActionEnvelope {
+                                schema_version: crate::contracts::BRIDGE_SCHEMA_VERSION,
+                                action: DesktopAction::Type {
+                                    app_id: APP_ID.into(),
+                                    window_id,
+                                    tree_revision: inspected["treeRevision"]
+                                        .as_str()
+                                        .unwrap()
+                                        .to_string(),
+                                    node_id: editable["nodeId"].as_str().unwrap().to_string(),
+                                    payload_hash: text_hash(payload),
+                                },
+                                payload_text: Some(payload.into()),
+                            })
+                            .map_err(|error| format!("type: {error:?}"))?,
+                    );
+                    if typed["action"] != "desktop.type" {
+                        return Err(String::from("type: unexpected action echo"));
+                    }
+                    Ok(())
+                })();
+
+                match attempt {
+                    Ok(()) => typed_ok = true,
+                    Err(error) => {
+                        last_error = error;
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
+                }
+            }
+            assert!(
+                typed_ok,
+                "never completed a discover/inspect/type against Notepad: {last_error}"
+            );
+
+            // Deliberately not asserted: what was typed cannot be read back.
+            //
+            // ControlNode exposes the UIA Name property, not a control's text
+            // content -- Notepad keeps its document text behind the Value/Text
+            // pattern, which this broker does not serialize. An earlier version of
+            // this test grepped the serialized tree for the payload and passed only
+            // intermittently, because the text surfaced in a node name by accident
+            // rather than by contract.
+            //
+            // What IS proven above is the part that was never proven before: a real
+            // third-party window was discovered, inspected, and accepted a typed
+            // action that required a live node, an unstale tree revision, and a
+            // matching payload hash. Verifying the resulting content needs a
+            // TextPattern read the contract does not yet offer.
+        }
     }
 }
