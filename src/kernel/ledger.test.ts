@@ -2,7 +2,8 @@ import { mkdtemp, open, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendKernelEvent, readKernelEvents, readKernelEventTail } from './ledger';
+import crypto from 'node:crypto';
+import { appendKernelEvent, hashKernelEvent, readKernelEvents, readKernelEventTail } from './ledger';
 
 let tempDir = '';
 
@@ -12,6 +13,49 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
+});
+
+describe('canonical event hashing', () => {
+  // The reason this hashing exists. A verifier written in another language
+  // serializes with sorted keys; if the digest depended on property-insertion
+  // order it could never reproduce these hashes, and the independent-verifier
+  // claim would be false.
+  it('depends on the event value, not on property insertion order', () => {
+    const payload = { zebra: 1, alpha: { nested: true, apple: 'x' }, middle: [3, 2, 1] };
+    const built = { id: 'event_1', timestamp: '2026-07-26T00:00:00.000Z', previousHash: null, actor: 'kernel', type: 'test', entityId: 'e1', entityType: 'goal', payload } as unknown as Parameters<typeof hashKernelEvent>[0];
+    const reordered = { payload, entityType: 'goal', entityId: 'e1', type: 'test', actor: 'kernel', previousHash: null, timestamp: '2026-07-26T00:00:00.000Z', id: 'event_1' } as unknown as Parameters<typeof hashKernelEvent>[0];
+
+    expect(hashKernelEvent(reordered)).toBe(hashKernelEvent(built));
+    // Insertion-ordered serialization would NOT have agreed; this asserts the
+    // old behaviour is genuinely gone rather than coincidentally matching.
+    expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(built));
+  });
+
+  it('matches an independent key-sorted implementation', () => {
+    const event = { id: 'event_1', timestamp: '2026-07-26T00:00:00.000Z', previousHash: null, actor: 'kernel', type: 'goal.created', entityId: 'goal_1', entityType: 'goal', payload: { title: 'x', nested: { b: 2, a: 1 } } } as unknown as Parameters<typeof hashKernelEvent>[0];
+
+    const independent = (value: unknown): string => {
+      if (value === null) return 'null';
+      if (typeof value === 'string' || typeof value === 'boolean' || typeof value === 'number') return JSON.stringify(value);
+      if (Array.isArray(value)) return `[${value.map(independent).join(',')}]`;
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record).filter((key) => record[key] !== undefined).sort()
+        .map((key) => `${JSON.stringify(key)}:${independent(record[key])}`).join(',')}}`;
+    };
+
+    expect(hashKernelEvent(event)).toBe(
+      crypto.createHash('sha256').update(independent(event), 'utf8').digest('hex'),
+    );
+  });
+
+  it('hashes the persisted value, so JSON-lossy inputs cannot desynchronize the chain', () => {
+    // A verifier only ever sees JSON.parse output. Hashing the live object
+    // directly would make a Date hash as {} on write and as a string on read.
+    const withDate = { id: 'event_1', timestamp: '2026-07-26T00:00:00.000Z', previousHash: null, actor: 'kernel', type: 'test', entityId: 'e1', entityType: 'goal', payload: { at: new Date('2026-07-26T00:00:00.000Z') } } as unknown as Parameters<typeof hashKernelEvent>[0];
+    const asPersisted = JSON.parse(JSON.stringify(withDate)) as Parameters<typeof hashKernelEvent>[0];
+
+    expect(hashKernelEvent(withDate)).toBe(hashKernelEvent(asPersisted));
+  });
 });
 
 describe('kernel ledger', () => {

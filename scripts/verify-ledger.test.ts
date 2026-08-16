@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
+import { hashKernelEvent } from '../src/kernel/ledger';
 
 const verifierPath = path.resolve(process.cwd(), 'scripts', 'verify-ledger.mjs');
 const temporaryDirectories: string[] = [];
@@ -67,10 +68,10 @@ describe('standalone ledger verifier strict mode', () => {
       previousHash: null,
       payload: { result: 'valid' },
     };
-    const hash = crypto
-      .createHash('sha256')
-      .update(JSON.stringify(eventWithoutHash))
-      .digest('hex');
+    // The kernel's own canonical hash, so this fixture cannot drift from the
+    // real chain format. Building it with JSON.stringify would encode the
+    // insertion-ordered digest this verifier no longer accepts.
+    const hash = hashKernelEvent(eventWithoutHash as unknown as Parameters<typeof hashKernelEvent>[0]);
     await writeFile(
       path.join(runtimeDirectory, 'events.jsonl'),
       `${JSON.stringify({ ...eventWithoutHash, hash })}\n`,

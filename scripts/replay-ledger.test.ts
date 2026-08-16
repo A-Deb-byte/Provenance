@@ -10,6 +10,7 @@ import {
   type DispatchDecisionRecord,
 } from '../src/capabilities/decisionRecord';
 import { createCapabilityGrant } from '../src/capabilities/grants';
+import { hashKernelEvent } from '../src/kernel/ledger';
 import { browserScope, browserWorker } from '../src/capabilities/testFixtures';
 import type { ActionIntent } from '../src/capabilities/types';
 import { createKernelService } from '../src/kernel/kernel';
@@ -78,7 +79,9 @@ const writeLedger = async (
       actor: 'kernel',
       ...entry,
     };
-    const hash = crypto.createHash('sha256').update(JSON.stringify(withoutHash)).digest('hex');
+    // The kernel's own hash, so a fixture can never drift from the real chain
+    // format. A change to event hashing must break these tests loudly.
+    const hash = hashKernelEvent(withoutHash as unknown as Parameters<typeof hashKernelEvent>[0]);
     previousHash = hash;
     lines.push(JSON.stringify({ ...withoutHash, hash }));
   }

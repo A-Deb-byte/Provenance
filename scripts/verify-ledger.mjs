@@ -18,9 +18,37 @@ import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+/**
+ * Canonical (key-sorted) JSON. The kernel hashes events this way so the digest
+ * depends on the event's value rather than on V8 property-insertion order. That
+ * is what lets a verifier in another language reproduce these hashes; a
+ * `JSON.stringify` digest could only ever be reproduced by another V8 process
+ * that happened to build the object in the same order.
+ *
+ * Reimplemented here rather than imported, like the rest of this file: a
+ * verifier that shares code with the thing it verifies proves less.
+ */
+const canonicalJson = (value) => {
+  if (value === null) return 'null';
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('canonical JSON requires finite numbers');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value)
+      .filter((key) => value[key] !== undefined)
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  throw new Error(`canonical JSON does not support ${typeof value}`);
+};
+
 const hashEvent = (event) => {
   const { hash, ...withoutHash } = event;
-  return crypto.createHash('sha256').update(JSON.stringify(withoutHash)).digest('hex');
+  return crypto.createHash('sha256').update(canonicalJson(withoutHash), 'utf8').digest('hex');
 };
 
 const fail = (message) => {

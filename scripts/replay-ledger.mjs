@@ -73,9 +73,11 @@ const canonical = (value, seen = new Set()) => {
 
 const sha256 = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 const canonicalHash = (value) => sha256(canonical(value));
+// Canonical, matching the kernel: the chain digest depends on each event's
+// value, not on the property order a particular runtime happened to produce.
 const hashEvent = (event) => {
   const { hash, ...withoutHash } = event;
-  return sha256(JSON.stringify(withoutHash));
+  return canonicalHash(withoutHash);
 };
 
 const isRecord = (value) => typeof value === 'object' && value !== null && !Array.isArray(value);

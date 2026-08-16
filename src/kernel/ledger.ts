@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { appendFile, mkdir, open, readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { stableJson } from '../capabilities/hash';
 import { createKernelId } from './ids';
 import { KernelActor, KernelEvent } from './types';
 
@@ -46,9 +47,28 @@ const withAppendLock = <T>(runtimeDir: string, work: () => Promise<T>): Promise<
   return result;
 };
 
+/**
+ * Canonical event hashing.
+ *
+ * `JSON.stringify` emits keys in insertion order, so the hash it produces is a
+ * function of how the object happened to be built rather than of its value.
+ * That is reproducible inside one V8 process and nowhere else: a verifier in
+ * another language -- the stated purpose of `scripts/verify-ledger.mjs` -- would
+ * serialize with sorted keys and fail every event.
+ *
+ * `stableJson` sorts keys, so the hash depends only on the value.
+ *
+ * The round-trip through JSON is deliberate, not redundant. The writer holds
+ * live objects while every verifier only ever sees `JSON.parse` output, so the
+ * two must be made to hash the same value domain. Without it a `Date` in a
+ * payload would hash as `{}` here (no own enumerable keys) and as an ISO string
+ * on read, and a non-finite number would be written as `null` but throw here.
+ * Normalizing first makes the hash a function of the persisted bytes' value,
+ * which is exactly what an independent verifier can reproduce.
+ */
 export const hashKernelEvent = (event: Omit<KernelEvent, 'hash'>): string => {
-  const canonical = JSON.stringify(event);
-  return crypto.createHash('sha256').update(canonical).digest('hex');
+  const canonical = stableJson(JSON.parse(JSON.stringify(event)) as unknown);
+  return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
 };
 
 export const appendKernelEvent = async (
