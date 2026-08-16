@@ -17,6 +17,34 @@ export const getRequestAccessPrincipal = (req: express.Request): AccessPrincipal
   requestPrincipals.get(req)
 );
 
+/**
+ * Projects an authenticated principal into the oversight attribution the kernel
+ * records on an approval decision.
+ *
+ * Only `multi_user` mode identifies a natural person. The other two modes
+ * authenticate a *deployment*, not a human: an operator token is shared by
+ * construction, and loopback-open authenticates nobody. Recording those as
+ * `shared_credential` keeps the evidence truthful, and lets a four-eyes check
+ * refuse them instead of counting one token twice as two people.
+ */
+export const approvalDecisionPrincipalFor = (
+  principal: AccessPrincipal | undefined,
+): {
+  principalId: string;
+  mode: AccessMode;
+  role: 'admin' | 'operator' | 'viewer';
+  attribution: 'natural_person' | 'shared_credential';
+} | undefined => (
+  principal
+    ? {
+      principalId: principal.principalId,
+      mode: principal.mode,
+      role: principal.role,
+      attribution: principal.mode === 'multi_user' ? 'natural_person' : 'shared_credential',
+    }
+    : undefined
+);
+
 export interface AccessControlDeps {
   userStore: UserStore;
   operatorToken?: string;

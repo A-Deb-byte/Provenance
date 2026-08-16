@@ -12,6 +12,7 @@ import { createApplicationAiRouter } from './src/app-ai/router';
 import {
   accessControlStatus,
   createAccessGuard,
+  approvalDecisionPrincipalFor,
   getRequestAccessPrincipal,
   resolveAccessMode,
 } from './src/auth/accessControl';
@@ -577,6 +578,8 @@ const createServerContext = async () => {
     },
     accessControlStatus: () => accessControlStatus(userStore.count(), operatorToken),
     skillAuthorPrincipal: (request) => getRequestAccessPrincipal(request)?.principalId,
+    approvalDecisionPrincipal: (request) =>
+      approvalDecisionPrincipalFor(getRequestAccessPrincipal(request)),
     recurringResearchSchedulerStatus: () => recurringResearchScheduler?.status() ?? {
       enabled: false,
       starting: false,

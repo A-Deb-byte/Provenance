@@ -280,6 +280,28 @@ export interface KernelEvent {
   hash: string;
 }
 
+/**
+ * Who exercised human oversight over an approval.
+ *
+ * A role category ("a user approved this") cannot demonstrate that a competent
+ * *identified* person exercised oversight, and cannot show that two *distinct*
+ * people acted — the requirement behind four-eyes verification. So the
+ * authenticated principal is recorded, never a client-supplied identity.
+ *
+ * `attribution` is what keeps this honest. Only a multi-user deployment
+ * identifies a natural person; a shared operator token or an unauthenticated
+ * loopback deployment is recorded as a shared credential rather than being
+ * presented as a person. Evidence that overstates who approved something is
+ * worse than evidence that omits it.
+ */
+export interface ApprovalDecisionPrincipal {
+  /** `user:<id>` when identified; otherwise a deployment-mode constant. */
+  principalId: string;
+  mode: 'open' | 'operator_token' | 'multi_user';
+  role: 'admin' | 'operator' | 'viewer';
+  attribution: 'natural_person' | 'shared_credential';
+}
+
 export interface ApprovalRecord {
   id: string;
   goalId: string;
@@ -294,6 +316,8 @@ export interface ApprovalRecord {
   updatedAt: string;
   decidedAt?: string;
   decisionReason?: string;
+  /** Absent on pending approvals and on decisions recorded before attribution existed. */
+  decidedBy?: ApprovalDecisionPrincipal;
 }
 
 export interface PolicyDecision {

@@ -52,6 +52,10 @@ export interface KernelRouterOptions {
   readonly skillEvaluationSourceResolver?: SkillEvaluationSourceResolver;
   readonly skillEvaluatorAllowlist?: readonly string[];
   readonly skillAuthorPrincipal?: (request: express.Request) => string | undefined;
+  /** Resolves the authenticated principal recorded as having decided an approval. */
+  readonly approvalDecisionPrincipal?: (
+    request: express.Request,
+  ) => import('./types').ApprovalDecisionPrincipal | undefined;
   readonly recurringResearchSchedulerStatus?: () => RecurringResearchSchedulerStatus;
   readonly desktopIpcStatus?: () => import('./autonomy').RuntimeFeatureStatus;
   readonly desktopPayloadStore?: import('../desktop/payloadStore').DesktopPayloadStore;
@@ -489,7 +493,12 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
 
     try {
-      res.json(await kernel.decideApproval(req.params.approvalId, status, reason));
+      res.json(await kernel.decideApproval(
+        req.params.approvalId,
+        status,
+        reason,
+        options.approvalDecisionPrincipal?.(req),
+      ));
     } catch (error) {
       const message = errorMessage(error);
       const responseStatus = message === 'Approval not found.'

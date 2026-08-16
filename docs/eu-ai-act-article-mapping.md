@@ -1,8 +1,8 @@
 # EU AI Act — Article 12, 14 and 26 Mapping
 
-- Version: 1.0
+- Version: 1.1
 - Date: 2026-08-16
-- Applies to: Provenance at commit `4d4b4e7`, branch `codex/production-desktop-release-v1`
+- Applies to: Provenance at commit `4d4b4e7` + Gap 1 remediation, branch `codex/production-desktop-release-v1`
 
 ---
 
@@ -192,12 +192,19 @@ it is active. Activation and resumption are ledgered (`control.stop_all`,
 > single chokepoint. It is comprehensive today; a new entry point that omits the
 > check would not fail any existing test. Treat that as a maintenance risk.
 
-### 14(5) — Two-person verification for biometric identification — ✕ Not supported
+### 14(5) — Two-person verification for biometric identification — ✕ Not supported (mechanism now present)
 
-Two independent reasons: Provenance performs no biometric identification, and —
-more fundamentally — **it cannot currently demonstrate that two *distinct*
-natural persons acted**, because approvals are not attributed to an identity.
-See Gap 1.
+Provenance performs no biometric identification, so this clause does not apply
+to it directly.
+
+The underlying capability, however, now exists. Approval decisions record the
+authenticated principal and whether it identified a natural person, and
+`isIndependentlyVerified` (`src/kernel/approvals.ts`) returns true only for two
+decisions made by **two different identified people**. Two approvals through one
+shared operator token are rejected, because they prove nothing about how many
+humans were involved. A deployer building a four-eyes control on top of
+Provenance has a sound primitive; Provenance itself still performs no biometric
+matching.
 
 ---
 
@@ -212,9 +219,9 @@ worker configured scope). An action outside the configured envelope is refused.
 
 - `src/capabilities/validators.ts` — `isActionWithinScope`, `isScopeWithinScope`
 
-### 26(2) — Assign oversight to competent persons with authority — ◐ Partial
+### 26(2) — Assign oversight to competent persons with authority — ● Provided (technical part)
 
-**Provided:** authenticated multi-user access control with three roles
+**Authority:** authenticated multi-user access control with three roles
 (`admin` / `operator` / `viewer`), scrypt-hashed credentials, signed expiring
 session tokens with persisted revocation, and last-administrator protection.
 Viewers can read but cannot mutate. Verified 10/10 including logout revoking an
@@ -222,10 +229,36 @@ unexpired token.
 
 - `src/auth/users.ts`, `src/auth/session.ts`, `src/auth/accessControl.ts`
 
-**Gap:** the ledger records `actor: 'user'` — a role category — **not which
-natural person decided**. You can prove an approval happened and why; you cannot
-prove *who* exercised oversight. See Gap 1. Competence and training remain
-organisational.
+**Attribution:** every approval decision records the **authenticated principal**
+that made it, in both the approval record and the ledger event:
+
+```json
+"decidedBy": {
+  "principalId": "user:alice",
+  "mode": "multi_user",
+  "role": "operator",
+  "attribution": "natural_person"
+}
+```
+
+The identity is taken from the authenticated session, **never from the request
+body** — a client-declared approver would be forgeable and therefore worthless
+as oversight evidence.
+
+`attribution` is the field that keeps this honest. Only `multi_user` mode
+identifies a person; an operator token is shared by construction and
+loopback-open authenticates nobody, so both are recorded as
+`shared_credential` rather than presented as a human.
+
+> **Deployment consequence:** to demonstrate Art. 26(2), run in **multi-user
+> mode**. A shared-token deployment still produces truthful evidence, but that
+> evidence says a shared credential approved the action, which does not
+> establish that an identified competent person exercised oversight.
+
+- `src/auth/accessControl.ts` — `approvalDecisionPrincipalFor`
+- `src/kernel/approvals.ts`, `src/kernel/kernel.ts` — recorded on record and event
+
+Competence and training remain organisational.
 
 ### 26(3) — Ensure input data is relevant and representative — ○ Not addressed
 
@@ -290,20 +323,26 @@ vendor's tooling to check the record.
 
 Ranked by how much they affect the Articles above.
 
-### Gap 1 — Approvals are not attributed to a natural person **(highest impact)**
+### Gap 1 — Approvals were not attributed to a natural person — **CLOSED 2026-08-16**
 
-`decideApproval` writes `actor: 'user'` and a mandatory reason, but no principal
-identity. This directly weakens **Art. 26(2)** (demonstrating which competent
-person exercised oversight) and makes **Art. 14(5)** four-eyes verification
-impossible, since two decisions cannot be shown to come from two distinct people.
+Previously `decideApproval` wrote `actor: 'user'` — a role category — with no
+principal identity, so Art. 26(2) could be argued but not demonstrated and
+Art. 14(5) was impossible.
 
-**The fix is small and the pattern already exists in this codebase.** The
-authenticated principal is computed at the API boundary
-(`getRequestAccessPrincipal`, `src/auth/accessControl.ts`) and is already threaded
-into the kernel for skill authorship (`server.ts:579`). The same needs doing for
-approval decisions.
+Approval decisions now carry the authenticated principal and an explicit
+`attribution` distinguishing an identified natural person from a shared
+credential. `isIndependentlyVerified` accepts two decisions only when two
+*different* identified people made them, and rejects two uses of one shared
+token. See §3 26(2) and §2 14(5).
 
-**Close this before any regulated pilot.**
+Covered by tests asserting the attribution reaches the **ledger** through the
+HTTP API, not merely the in-memory record, and that one person deciding twice,
+one shared token used twice, a missing attribution, and a decision compared with
+itself all fail the independence check.
+
+**Residual:** running in operator-token or open mode still yields
+`shared_credential`. The evidence is truthful, but only multi-user mode
+demonstrates Art. 26(2). This is a deployment choice, not a code gap.
 
 ### Gap 2 — Biometric systems are out of scope
 
@@ -366,9 +405,9 @@ No software discharges these. Listed so they are not mistaken for covered:
 | 14(4)(c) | Interpret outputs | ● Provided — hash-addressed evidence |
 | 14(4)(d) | Decline or override | ● Provided — default-refuse, verified end-to-end |
 | 14(4)(e) | Intervene / stop | ● Provided — global Stop All, ledgered |
-| 14(5) | Two-person biometric verification | ✕ Not supported — see Gap 1 |
+| 14(5) | Two-person biometric verification | ✕ Not supported — no biometrics; distinct-person primitive now exists |
 | 26(1) | Use per instructions | ● Provided — enforced allowlists and scopes |
-| 26(2) | Competent overseers with authority | ◐ **Partial — no natural-person attribution (Gap 1)** |
+| 26(2) | Competent overseers with authority | ● Provided — principal attribution recorded; run multi-user mode |
 | 26(3) | Input data relevance | ○ Not addressed |
 | 26(5) | Monitor, suspend, report | ◐ Partial — suspension provided; reporting organisational |
 | 26(6) | Six-month log retention | ◐ Partial — append-only, but no enforced policy |
@@ -380,9 +419,11 @@ auditor can verify this system's records **without trusting the vendor's
 software** — the format is canonical, the verifiers share no code with the
 kernel, and reproducibility has been demonstrated from a second language.
 
-**The most important thing to fix before selling into a regulated pilot** is
-Gap 1. Until approvals carry a natural-person identity, Art. 26(2) can be
-argued but not demonstrated.
+**Gap 1 is now closed** — approvals carry an authenticated natural-person
+identity, so Art. 26(2) can be demonstrated rather than merely argued, provided
+the deployment runs in multi-user mode. The remaining blockers for a regulated
+pilot are external rather than architectural: no independent security audit and
+no ISO 42001 certification (Gap 5).
 
 ---
 

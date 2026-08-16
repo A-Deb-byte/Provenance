@@ -127,6 +127,7 @@ import {
 } from './store';
 import { buildInitialTaskGraph, getNextReadyTask, markTaskStatus } from './taskGraph';
 import {
+  ApprovalDecisionPrincipal,
   ApprovalStatus,
   BenchmarkRun,
   CapabilityToken,
@@ -1272,6 +1273,10 @@ export const createKernelService = (options: KernelServiceOptions) => {
     approvalId: string,
     status: Extract<ApprovalStatus, 'approved' | 'denied'>,
     reason: string,
+    // Supplied by the server from the authenticated session, never from the
+    // request body: a client-declared approver identity would be forgeable and
+    // therefore worthless as oversight evidence.
+    decidedBy?: ApprovalDecisionPrincipal,
   ) => withMutation(async () => {
     const decisionReason = normalizedAuditReason(reason, 'Approval decision reason');
     let state = await readConsistentState();
@@ -1279,7 +1284,13 @@ export const createKernelService = (options: KernelServiceOptions) => {
     if (!approval) throw new Error('Approval not found.');
     if (approval.status !== 'pending') throw new Error('Approval has already been decided.');
 
-    const decided = decideApprovalRecord(approval, status, decisionReason);
+    const decided = decideApprovalRecord(
+      approval,
+      status,
+      decisionReason,
+      new Date().toISOString(),
+      decidedBy,
+    );
     const approvalAutomationId = approval.taskId.startsWith('automation:')
       ? approval.taskId.slice('automation:'.length)
       : undefined;
@@ -1295,6 +1306,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
         riskLevel: approval.riskLevel,
         authorityBindingHash: approval.authorityBindingHash,
         reason: decisionReason,
+        // Oversight evidence: which principal decided, and whether that
+        // principal was an identified natural person or a shared credential.
+        decidedBy,
       },
     });
     state = appended.state;

@@ -1,5 +1,5 @@
 import { createKernelId } from './ids';
-import { ApprovalRecord, ApprovalStatus, RiskLevel } from './types';
+import { ApprovalDecisionPrincipal, ApprovalRecord, ApprovalStatus, RiskLevel } from './types';
 
 export interface CreateApprovalInput {
   goalId: string;
@@ -28,6 +28,7 @@ export const decideApprovalRecord = (
   status: Extract<ApprovalStatus, 'approved' | 'denied'>,
   decisionReason: string,
   now = new Date().toISOString(),
+  decidedBy?: ApprovalDecisionPrincipal,
 ): ApprovalRecord => {
   if (approval.status !== 'pending') {
     throw new Error('Only pending approvals can be decided.');
@@ -41,5 +42,23 @@ export const decideApprovalRecord = (
     updatedAt: now,
     decidedAt: now,
     decisionReason,
+    decidedBy,
   };
 };
+
+/**
+ * True only when two decisions were made by two different identified people.
+ *
+ * Shared credentials are rejected outright: two approvals through one operator
+ * token prove nothing about how many people were involved, and a check that
+ * accepted them would manufacture false assurance.
+ */
+export const isIndependentlyVerified = (
+  first: ApprovalRecord,
+  second: ApprovalRecord,
+): boolean => (
+  first.id !== second.id &&
+  first.decidedBy?.attribution === 'natural_person' &&
+  second.decidedBy?.attribution === 'natural_person' &&
+  first.decidedBy.principalId !== second.decidedBy.principalId
+);

@@ -95,6 +95,12 @@ beforeEach(async () => {
       sourceId === apiEvaluatorSource.sourceId ? apiEvaluatorSource : undefined
     ),
     skillAuthorPrincipal: () => 'user:api-skill-author',
+    approvalDecisionPrincipal: () => ({
+      principalId: 'user:api-approver',
+      mode: 'multi_user' as const,
+      role: 'operator' as const,
+      attribution: 'natural_person' as const,
+    }),
   };
   const router = createKernelRouter(routerOptions);
   routerOptions.allowedWorkspaceRoot = outsideWorkspaceRoot;
@@ -284,6 +290,37 @@ describe('kernel API', () => {
 
     const approvals = await requestJson<{ approvals: ApprovalRecord[] }>('/approvals');
     expect(approvals.body.approvals[0].status).toBe('approved');
+  });
+
+  it('attributes an approval decision to the authenticated principal in the ledger', async () => {
+    const approval = createApprovalRecord({
+      goalId: 'goal_1',
+      taskId: 'task_1',
+      requestedAction: 'Run a scoped action',
+      riskLevel: 'L2',
+      reason: 'Explicit user approval is required.',
+    });
+    await writeKernelState(runtimeDir, { ...createEmptyKernelState(), approvals: [approval] });
+
+    const decided = await postJson<ApprovalRecord>(`/approvals/${approval.id}/decision`, {
+      status: 'approved',
+      reason: 'Reviewed the scope and approved.',
+    });
+    expect(decided.response.status).toBe(200);
+
+    const attribution = {
+      principalId: 'user:api-approver',
+      mode: 'multi_user',
+      role: 'operator',
+      attribution: 'natural_person',
+    };
+    // Persisted on the record...
+    expect(decided.body.decidedBy).toEqual(attribution);
+
+    // ...and, the part that constitutes oversight evidence, in the ledger.
+    const events = await requestJson<{ events: KernelEvent[] }>('/events');
+    const decision = events.body.events.find((event) => event.type === 'approval.approved');
+    expect(decision?.payload.decidedBy).toEqual(attribution);
   });
 
   it('returns not found for unknown goal and approval ids', async () => {
