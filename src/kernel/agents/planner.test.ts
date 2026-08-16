@@ -218,7 +218,7 @@ describe('planner prompt', () => {
     expect(prompt.user).toContain('Maximum targets: 7');
     expect(prompt.user).toContain('Review the API docs');
     // Stated to the model as guidance; enforcement does not depend on it.
-    expect(prompt.system).toContain('discarded by the kernel');
+    expect(prompt.system).toContain('anything else is discarded');
   });
 
   it('reports configured origins across every browser scope', () => {

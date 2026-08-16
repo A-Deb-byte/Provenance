@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { CapabilityScope, WorkerRegistration } from '../../capabilities/types';
 import type { AgentSpawn } from './types';
 
@@ -6,28 +7,84 @@ import type { AgentSpawn } from './types';
  *
  * A model may *propose* what an agent should work on. It gains no authority by
  * doing so: everything it returns is untrusted data, validated deterministically
- * against bounds the model cannot see or influence. The rules below are the
- * whole security story of this module.
+ * against bounds the model cannot see or influence.
  *
- * The most important one: **a model can never introduce a new origin.** Every
- * proposed target must fall inside an origin already configured for the agent's
- * worker. A hallucinated, attacker-suggested, or prompt-injected URL is dropped
- * rather than clamped, and the rejection is reported so it can be ledgered.
+ * The rule that generalises across every action type: **a model may only select
+ * identifiers the kernel already knows, never mint one.** Origins, download
+ * roots, connectors, and resource roots must already appear in the worker's
+ * configured scope; payload content is referenced by a staged artifact id whose
+ * hash the *kernel* computes. A model can therefore reorder and choose, but
+ * cannot introduce a destination or author the bytes that get sent.
  */
 
-export type PlannedAction = 'inspect' | 'click';
+export type PlannedAction =
+  | 'inspect'
+  | 'navigate'
+  | 'click'
+  | 'type'
+  | 'download'
+  | 'desktop.discover'
+  | 'connector.read'
+  | 'connector.draft'
+  | 'connector.send'
+  | 'connector.delete';
 
-/** The shape a model is asked to return. Nothing here is trusted. */
+const BROWSER_ACTIONS: Record<string, string> = {
+  inspect: 'browser.inspect',
+  navigate: 'browser.navigate',
+  click: 'browser.click',
+  type: 'browser.type',
+  download: 'browser.download',
+};
+
+const CONNECTOR_ACTIONS = new Set([
+  'connector.read', 'connector.draft', 'connector.send', 'connector.delete',
+]);
+
+/**
+ * Actions requiring a live window snapshot are deliberately unplannable.
+ *
+ * `desktop.click` and friends carry a `treeRevision` that is only valid for the
+ * snapshot it came from. A model cannot know one, and a stale one would either
+ * be refused at dispatch or -- worse -- match a window that has since changed.
+ * Discovery is plannable; acting on a window is not.
+ */
+const WINDOW_BOUND_DESKTOP = new Set([
+  'desktop.inspect', 'desktop.click', 'desktop.type', 'desktop.shortcut',
+]);
+
+export const ALL_PLANNED_ACTIONS: PlannedAction[] = [
+  'inspect', 'navigate', 'click', 'type', 'download',
+  'desktop.discover', 'connector.read', 'connector.draft', 'connector.send', 'connector.delete',
+];
+
+/** The capability action a planned action maps to. */
+export const capabilityActionFor = (action: PlannedAction): string =>
+  BROWSER_ACTIONS[action] ?? action;
+
+/** Shape a model is asked to return. Nothing here is trusted. */
 export interface ProposedAgentPlan {
   targets?: unknown;
   action?: unknown;
   selector?: unknown;
+  /** Reference to already-staged content. The model never supplies a hash. */
+  payloadArtifactId?: unknown;
+  downloadRoot?: unknown;
+  fileName?: unknown;
+  connectorId?: unknown;
+  appId?: unknown;
   rationale?: unknown;
 }
 
 export interface RejectedTarget {
   value: string;
-  reasonCode: 'malformed_url' | 'unsupported_scheme' | 'embedded_credentials' | 'origin_not_configured' | 'duplicate';
+  reasonCode:
+    | 'malformed_url'
+    | 'unsupported_scheme'
+    | 'embedded_credentials'
+    | 'origin_not_configured'
+    | 'resource_not_configured'
+    | 'duplicate';
 }
 
 export interface AgentPlanValidation {
@@ -36,9 +93,12 @@ export interface AgentPlanValidation {
   targets: string[];
   action: PlannedAction;
   selector?: string;
-  /** Reported rather than silently dropped, so a narrowed plan is visible. */
+  payloadArtifactId?: string;
+  downloadRoot?: string;
+  fileName?: string;
+  connectorId?: string;
+  appId?: string;
   rejected: RejectedTarget[];
-  /** Truncated by the remaining operation budget, if any. */
   truncated: number;
   rationale?: string;
 }
@@ -46,13 +106,28 @@ export interface AgentPlanValidation {
 const MAX_RATIONALE_CHARS = 500;
 const MAX_SELECTOR_CHARS = 200;
 const MAX_PROPOSED_TARGETS = 100;
+const ARTIFACT_ID = /^artifact_[A-Za-z0-9_-]{1,64}$/u;
 
-/** Origins the worker is already configured for. The model cannot add to this. */
-export const configuredOrigins = (worker: WorkerRegistration): string[] => (
-  worker.configuredScopes
-    .filter((scope): scope is Extract<CapabilityScope, { family: 'browser' }> => scope.family === 'browser')
-    .flatMap((scope) => scope.origins)
-);
+const browserScopes = (worker: WorkerRegistration) =>
+  worker.configuredScopes.filter(
+    (scope): scope is Extract<CapabilityScope, { family: 'browser' }> => scope.family === 'browser',
+  );
+
+const connectorScopes = (worker: WorkerRegistration) =>
+  worker.configuredScopes.filter(
+    (scope): scope is Extract<CapabilityScope, { family: 'connector' }> => scope.family === 'connector',
+  );
+
+const desktopScopes = (worker: WorkerRegistration) =>
+  worker.configuredScopes.filter(
+    (scope): scope is Extract<CapabilityScope, { family: 'desktop' }> => scope.family === 'desktop',
+  );
+
+export const configuredOrigins = (worker: WorkerRegistration): string[] =>
+  browserScopes(worker).flatMap((scope) => scope.origins);
+
+export const configuredDownloadRoots = (worker: WorkerRegistration): string[] =>
+  browserScopes(worker).flatMap((scope) => scope.downloadRoots);
 
 const originOf = (url: string): { origin?: string; reasonCode?: RejectedTarget['reasonCode'] } => {
   let parsed: URL;
@@ -61,10 +136,7 @@ const originOf = (url: string): { origin?: string; reasonCode?: RejectedTarget['
   } catch {
     return { reasonCode: 'malformed_url' };
   }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    return { reasonCode: 'unsupported_scheme' };
-  }
-  // Credentials in a URL would be written into evidence and sent to a worker.
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return { reasonCode: 'unsupported_scheme' };
   if (parsed.username || parsed.password) return { reasonCode: 'embedded_credentials' };
   return { origin: parsed.origin };
 };
@@ -75,15 +147,9 @@ const asText = (value: unknown, max: number): string | undefined => {
   return trimmed.length > 0 && trimmed.length <= max ? trimmed : undefined;
 };
 
-/**
- * Validates a model-proposed plan against what the agent is actually permitted
- * to do. Returns the narrowed plan plus everything that was refused.
- *
- * Note what this does *not* do: it never widens anything, never substitutes a
- * default for a rejected value, and never lets an unrecognised action through.
- * An unparseable or fully-rejected plan fails rather than degrading into an
- * empty-but-successful one.
- */
+const resourceWithinRoot = (resource: string, root: string): boolean =>
+  resource === root || resource.startsWith(`${root}/`);
+
 export const validateAgentPlan = (
   proposal: ProposedAgentPlan,
   spawn: AgentSpawn,
@@ -94,18 +160,133 @@ export const validateAgentPlan = (
   const fail = (reason: string): AgentPlanValidation =>
     ({ ok: false, reason, targets: [], action: 'inspect', rejected, truncated: 0 });
 
-  const action: PlannedAction = proposal.action === 'click' ? 'click' : 'inspect';
-  if (proposal.action !== undefined && proposal.action !== 'click' && proposal.action !== 'inspect') {
-    return fail(`Planner proposed an unrecognised action.`);
+  const requested = proposal.action === undefined ? 'inspect' : proposal.action;
+  if (typeof requested !== 'string') return fail('Planner proposed an unrecognised action.');
+  if (WINDOW_BOUND_DESKTOP.has(requested)) {
+    return fail(
+      `${requested} needs a live window snapshot and cannot be planned ahead; discover the window first.`,
+    );
   }
-  const requiredOperation = action === 'click' ? 'browser.click' : 'browser.inspect';
-  if (!worker.supportedActions.includes(requiredOperation)) {
-    return fail(`Agent worker does not support ${requiredOperation}.`);
+  if (!ALL_PLANNED_ACTIONS.includes(requested as PlannedAction)) {
+    return fail('Planner proposed an unrecognised action.');
+  }
+  const action = requested as PlannedAction;
+
+  const capabilityAction = capabilityActionFor(action);
+  if (!worker.supportedActions.includes(capabilityAction as never)) {
+    return fail(`Agent worker does not support ${capabilityAction}.`);
   }
 
+  // --- desktop.discover: appId must already be configured -------------------
+  if (action === 'desktop.discover') {
+    const scopes = desktopScopes(worker);
+    if (scopes.length === 0) return fail('Agent worker has no configured desktop scope to plan within.');
+    const appId = asText(proposal.appId, 200);
+    if (!appId) return fail('Desktop discovery requires an appId.');
+    if (!scopes.some((scope) => scope.appId === appId)) {
+      return fail('Planner proposed an application outside the configured desktop scope.');
+    }
+    return {
+      ok: true, reason: `Planned discovery of ${appId}.`, targets: [appId], action, appId,
+      rejected, truncated: 0, rationale: asText(proposal.rationale, MAX_RATIONALE_CHARS),
+    };
+  }
+
+  // --- connector.*: connector and resource roots must already be configured --
+  if (CONNECTOR_ACTIONS.has(action)) {
+    const scopes = connectorScopes(worker);
+    if (scopes.length === 0) return fail('Agent worker has no configured connector scope to plan within.');
+    const connectorId = asText(proposal.connectorId, 200);
+    if (!connectorId) return fail('Connector actions require a connectorId.');
+    const scope = scopes.find((candidate) => candidate.connectorId === connectorId);
+    if (!scope) return fail('Planner proposed a connector outside the configured scope.');
+
+    if (!Array.isArray(proposal.targets) || proposal.targets.length === 0) {
+      return fail('Planner returned no targets.');
+    }
+    if (proposal.targets.length > MAX_PROPOSED_TARGETS) {
+      return fail(`Planner returned more than ${MAX_PROPOSED_TARGETS} targets.`);
+    }
+
+    const accepted: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of proposal.targets) {
+      const value = asText(candidate, 1024);
+      if (!value) {
+        rejected.push({ value: String(candidate).slice(0, 120), reasonCode: 'malformed_url' });
+        continue;
+      }
+      if (seen.has(value)) {
+        rejected.push({ value, reasonCode: 'duplicate' });
+        continue;
+      }
+      seen.add(value);
+      if (!scope.resourceRoots.some((root) => resourceWithinRoot(value, root))) {
+        rejected.push({ value, reasonCode: 'resource_not_configured' });
+        continue;
+      }
+      accepted.push(value);
+    }
+    if (accepted.length === 0) {
+      return fail('No proposed resource fell inside a root configured for this agent.');
+    }
+
+    // Outbound content is referenced, never authored: the model names a staged
+    // artifact and the kernel resolves its hash.
+    let payloadArtifactId: string | undefined;
+    if (action === 'connector.draft' || action === 'connector.send') {
+      payloadArtifactId = asText(proposal.payloadArtifactId, 128);
+      if (action === 'connector.draft' && !payloadArtifactId) {
+        return fail('Drafting requires a staged payload artifact id.');
+      }
+      if (payloadArtifactId && !ARTIFACT_ID.test(payloadArtifactId)) {
+        return fail('Planner proposed a malformed payload artifact id.');
+      }
+    }
+
+    const budget = Math.max(0, Math.min(remainingOperations, spawn.budget.maxOperations - spawn.operationsUsed));
+    const targets = accepted.slice(0, budget);
+    if (targets.length === 0) return fail('The agent has no remaining operation budget for a plan.');
+    const truncated = accepted.length - targets.length;
+    return {
+      ok: true,
+      reason: truncated > 0
+        ? `Planned ${targets.length} resource(s); ${truncated} exceeded the remaining operation budget.`
+        : `Planned ${targets.length} resource(s).`,
+      targets, action, connectorId, payloadArtifactId, rejected, truncated,
+      rationale: asText(proposal.rationale, MAX_RATIONALE_CHARS),
+    };
+  }
+
+  // --- browser.*: origins must already be configured -------------------------
   const selector = asText(proposal.selector, MAX_SELECTOR_CHARS);
-  if (action === 'click' && !selector) {
-    return fail('Planner proposed a click without a usable selector.');
+  if ((action === 'click' || action === 'type') && !selector) {
+    return fail(`Planner proposed a ${action} without a usable selector.`);
+  }
+
+  let payloadArtifactId: string | undefined;
+  if (action === 'type') {
+    payloadArtifactId = asText(proposal.payloadArtifactId, 128);
+    if (!payloadArtifactId) return fail('Typing requires a staged payload artifact id.');
+    if (!ARTIFACT_ID.test(payloadArtifactId)) {
+      return fail('Planner proposed a malformed payload artifact id.');
+    }
+  }
+
+  let downloadRoot: string | undefined;
+  let fileName: string | undefined;
+  if (action === 'download') {
+    downloadRoot = asText(proposal.downloadRoot, 512);
+    fileName = asText(proposal.fileName, 255);
+    if (!downloadRoot || !fileName) return fail('Downloading requires a download root and a file name.');
+    const roots = configuredDownloadRoots(worker);
+    if (!roots.some((root) => path.resolve(root) === path.resolve(downloadRoot as string))) {
+      return fail('Planner proposed a download root outside the configured roots.');
+    }
+    // A basename, not a path: `../../etc/passwd` must not survive as a name.
+    if (path.basename(fileName) !== fileName) {
+      return fail('Planner proposed a file name containing a path.');
+    }
   }
 
   if (!Array.isArray(proposal.targets) || proposal.targets.length === 0) {
@@ -136,7 +317,6 @@ export const validateAgentPlan = (
       rejected.push({ value, reasonCode: reasonCode ?? 'malformed_url' });
       continue;
     }
-    // The containment rule: a model may reorder and select, never introduce.
     if (!allowedOrigins.has(origin)) {
       rejected.push({ value, reasonCode: 'origin_not_configured' });
       continue;
@@ -151,21 +331,15 @@ export const validateAgentPlan = (
   const budget = Math.max(0, Math.min(remainingOperations, spawn.budget.maxOperations - spawn.operationsUsed));
   const targets = accepted.slice(0, budget);
   const truncated = accepted.length - targets.length;
-  if (targets.length === 0) {
-    return fail('The agent has no remaining operation budget for a plan.');
-  }
+  if (targets.length === 0) return fail('The agent has no remaining operation budget for a plan.');
 
   return {
     ok: true,
     reason: truncated > 0
       ? `Planned ${targets.length} target(s); ${truncated} exceeded the remaining operation budget.`
       : `Planned ${targets.length} target(s).`,
-    targets,
-    action,
-    selector: action === 'click' ? selector : undefined,
-    rejected,
-    truncated,
-    rationale: asText(proposal.rationale, MAX_RATIONALE_CHARS),
+    targets, action, selector, payloadArtifactId, downloadRoot, fileName,
+    rejected, truncated, rationale: asText(proposal.rationale, MAX_RATIONALE_CHARS),
   };
 };
 
@@ -183,27 +357,38 @@ export const parseProposedPlan = (content: string): ProposedAgentPlan | undefine
 /**
  * The planning prompt.
  *
- * Candidate origins are supplied so the model selects rather than invents, and
- * it is told plainly that anything outside them is discarded. That is a
- * usability measure, not a security one -- validation enforces it regardless of
- * whether the model cooperates.
+ * Candidates are supplied so the model selects rather than invents, and it is
+ * told plainly that anything outside them is discarded. That is usability, not
+ * security -- validation enforces it whether or not the model cooperates.
  */
 export const buildPlannerPrompt = (
   spawn: AgentSpawn,
   worker: WorkerRegistration,
-): { system: string; user: string } => ({
-  system: [
-    'You plan work for a bounded automation agent.',
-    'Return ONLY a JSON object: {"targets":["https://..."],"action":"inspect"|"click","selector":"#id","rationale":"..."}.',
-    'Use "click" only when the objective requires interacting with a control; it needs a selector.',
-    'Every target must be an https URL whose origin is one of the permitted origins listed below.',
-    'Targets outside those origins are discarded by the kernel, so proposing them wastes the plan.',
-    'Do not include credentials in URLs. Do not invent origins.',
-  ].join('\n'),
-  user: [
-    `Objective: ${spawn.objective}`,
-    `Agent domain: ${spawn.domain}`,
-    `Permitted origins: ${configuredOrigins(worker).join(', ') || '(none)'}`,
-    `Maximum targets: ${Math.max(0, spawn.budget.maxOperations - spawn.operationsUsed)}`,
-  ].join('\n'),
-});
+): { system: string; user: string } => {
+  const supported = worker.supportedActions.join(', ');
+  return {
+    system: [
+      'You plan work for a bounded automation agent.',
+      'Return ONLY a JSON object with: targets (array), action, and any fields the action needs.',
+      'Actions: inspect, navigate, click, type, download, desktop.discover, connector.read,',
+      'connector.draft, connector.send, connector.delete.',
+      'click and type need "selector". type, connector.draft and connector.send need',
+      '"payloadArtifactId" referring to already-staged content -- you never supply content or hashes.',
+      'download needs "downloadRoot" (from the permitted roots) and a bare "fileName".',
+      'connector actions need "connectorId". desktop.discover needs "appId".',
+      'Every destination must come from the permitted lists below; anything else is discarded.',
+      'Desktop actions on a window (inspect, click, type, shortcut) cannot be planned ahead.',
+      'Do not include credentials in URLs. Do not invent origins, connectors, or roots.',
+    ].join('\n'),
+    user: [
+      `Objective: ${spawn.objective}`,
+      `Agent domain: ${spawn.domain}`,
+      `Worker supports: ${supported || '(none)'}`,
+      `Permitted origins: ${configuredOrigins(worker).join(', ') || '(none)'}`,
+      `Permitted download roots: ${configuredDownloadRoots(worker).join(', ') || '(none)'}`,
+      `Permitted connectors: ${connectorScopes(worker).map((scope) => scope.connectorId).join(', ') || '(none)'}`,
+      `Permitted desktop apps: ${desktopScopes(worker).map((scope) => scope.appId).join(', ') || '(none)'}`,
+      `Maximum targets: ${Math.max(0, spawn.budget.maxOperations - spawn.operationsUsed)}`,
+    ].join('\n'),
+  };
+};
