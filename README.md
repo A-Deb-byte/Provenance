@@ -15,7 +15,10 @@ Provenance now provides:
 - Normalized provider routing for Google Gemini, OpenAI, OpenRouter, DeepSeek, and GLM, plus an explicit unavailable boundary for AWS Bedrock when its runtime is absent.
 - Evidence-backed memory and a bounded `pure-transform-v1` skill foundry that never executes model-generated source code.
 - Read-only web inspection and a Playwright browser worker for navigation, clicking, and hash-addressed text entry.
-- A Docker command sandbox with exact workspace health checks. Standalone source runs retain an explicitly reported trusted-host fallback; native desktop launches fail closed and disable command execution unless Docker and the configured image are healthy.
+- A connector worker for read, draft, send, and delete, with hash-verified outbound content and an uncertain-not-failed rule for lost sends. Adapters are supplied per deployment; none ships, so the family is unavailable until one is configured.
+- A tiered agent fleet: definitions, spawns, tier ceilings, domains, budgets, depth and fan-out caps, orchestrated fan-out, a model-driven planner that cannot introduce a destination the kernel does not already know, and a propose-approve-dispatch loop for anything above an agent ceiling. Execution is opt-in per deployment (`AGENT_FLEET_EXECUTION=1`); the authority model applies either way.
+- Ledger anchoring that binds a head hash to an event count and locates where a rewrite began. A local-only anchor log detects a rewrite solely if that log survived it; external witnessing needs a transparency log or notary that is not supplied.
+- A Docker command sandbox with exact workspace health checks and an operator-configurable command allowlist of exact command+args pairs. It is deliberately not a shell. Standalone source runs retain an explicitly reported trusted-host fallback; native desktop launches fail closed and disable command execution unless Docker and the configured image are healthy.
 - Windows DPAPI, macOS Keychain, and Linux Secret Service vault adapters, selected and reported by platform.
 - Dashboard authentication for operator-token, bootstrap, login, role-scoped sessions, logout, and session revocation.
 - A responsive operator cockpit with a server-derived Live Operations inspector for current work, budgets, provider/worker status, recorded browser and desktop targets, pending and approved-but-not-executed actions, Stop All, and sanitized evidence activity.
@@ -278,4 +281,17 @@ The `Native desktop verification` workflow runs TypeScript lint/tests, release-p
 - Installer v1 omits Playwright browser engines and the optional local `node-llama-cpp` runtime/model. Those capabilities remain unavailable in the installed build unless a future audited package includes them.
 - Authenticode certificate custody, updater private-key custody, production publication and hosted-manifest operations, representative-machine installer/update/UIA testing, telemetry policy and operations, and an independent external security audit remain release-owner responsibilities.
 
-For the concise capability matrix, see `docs/superpowers/CURRENT_STATE.md`. Design and implementation history live under `docs/superpowers/specs/` and `docs/superpowers/plans/`. The candidate evidence, rollback, external security review, pilot, and independent sign-off contract is [`docs/Prd_Dev/external-security-audit-and-pilot-runbook.md`](docs/Prd_Dev/external-security-audit-and-pilot-runbook.md); those external obligations remain pending until performed.
+## Documentation
+
+| Document | What it covers |
+| --- | --- |
+| [`CURRENT_STATE.md`](docs/superpowers/CURRENT_STATE.md) | **Start here.** The authoritative capability matrix: what works, what is a boundary |
+| [`agent-fleet-architecture.md`](docs/agent-fleet-architecture.md) | Tiered agents, selectable authority, orchestration, the model planner, and the proposal loop |
+| [`connectors-and-anchoring.md`](docs/connectors-and-anchoring.md) | Writing a connector adapter, the uncertain rule, ledger anchoring, and the command allowlist |
+| [`desktop-automation-field-notes.md`](docs/desktop-automation-field-notes.md) | What is true in practice about UI Automation, including three limits that will bite an operator |
+| [`eu-ai-act-article-mapping.md`](docs/eu-ai-act-article-mapping.md) | Article 12/14/26 mapping with gaps stated rather than buried |
+| [`operator-cockpit.md`](docs/operator-cockpit.md) | The authenticated dashboard and Live Operations projection |
+| [`native-desktop-operator-guide.md`](docs/native-desktop-operator-guide.md) | Running the Windows native host |
+| [`provenance-technical-analysis.md`](docs/provenance-technical-analysis.md) | Source-anchored architecture analysis |
+
+Design and implementation history lives under `docs/superpowers/specs/` and `docs/superpowers/plans/`. The candidate evidence, rollback, external security review, pilot, and independent sign-off contract is [`docs/Prd_Dev/external-security-audit-and-pilot-runbook.md`](docs/Prd_Dev/external-security-audit-and-pilot-runbook.md); those external obligations remain pending until performed.

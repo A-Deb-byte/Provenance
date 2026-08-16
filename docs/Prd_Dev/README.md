@@ -8,6 +8,7 @@ These documents follow the same discipline as the rest of the repository: **stat
 
 | Document | Purpose |
 | --- | --- |
+| [`2026-08-16-capability-closure-evidence.md`](./2026-08-16-capability-closure-evidence.md) | **Most recent session.** Six of seven capability gaps closed, the agent fleet, and the findings that came out of running things rather than reading them. States plainly what was not done and why. |
 | [`external-security-audit-and-pilot-runbook.md`](./external-security-audit-and-pilot-runbook.md) | **Current release acceptance contract.** Threat model, exact source/CI/installed-binary gates, evidence handling, incident/rollback criteria, bounded pilot plan, and independent sign-off fields. External audit and pilot acceptance remain pending until those parties perform and sign them. |
 | [`HANDOFF.md`](./HANDOFF.md) | Current release-hardening handoff and concise list of implemented controls, verification rules, and pending external obligations. It is not a candidate verdict. |
 | [`2026-07-27-final-local-evidence.md`](./2026-07-27-final-local-evidence.md) | Current mutable local TypeScript, release-contract, dependency-audit, and license-complete installed-pilot evidence. Ordinary CI has passed for the repair commit; protected/external gates remain pending. |

@@ -1,8 +1,8 @@
 # EU AI Act — Article 12, 14 and 26 Mapping
 
-- Version: 1.1
+- Version: 1.2
 - Date: 2026-08-16
-- Applies to: Provenance at commit `4d4b4e7` + Gap 1 remediation, branch `codex/production-desktop-release-v1`
+- Applies to: Provenance at commit `6ce339d`, branch `codex/production-desktop-release-v1`
 
 ---
 
@@ -349,13 +349,26 @@ demonstrates Art. 26(2). This is a deployment choice, not a code gap.
 Art. 12(3), 14(5) and 26(10) are unsupported by design. If your use case is
 Annex III point 1(a), Provenance is not a sufficient control plane on its own.
 
-### Gap 3 — Retention and anchoring are not enforced
+### Gap 3 — Retention is not enforced; anchoring has no witness — **PARTIALLY CLOSED 2026-08-16**
 
-Append-only is a property of the code, not an enforced retention policy, and
-hash-chaining proves internal consistency only: a party with full write access
-can rewrite the chain from genesis. External transparency-log anchoring is not
-implemented. For Art. 26(6) durability, pair the ledger with write-once or
-externally anchored storage.
+Append-only remains a property of the code rather than an enforced retention
+policy: nothing deletes events, but nothing stops an operator removing the file
+at OS level, and there is no retention configuration.
+
+Anchoring now exists. Anchor records bind a head hash to an event count, refuse
+to move backwards, and verification replays the chain head at each anchored
+point — which detects both a rewrite (and names where it began) and a
+truncation. That closes the mechanism half of this gap.
+
+**What remains open is the witness.** A local-only anchor log detects a rewrite
+solely if that log survived it, and someone rewriting the chain can rewrite the
+anchors in the same motion. The verification output says so explicitly rather
+than letting local anchoring pass for external. A publisher interface exists;
+connecting a transparency log, timestamping authority, or counterparty is a
+deployment step that has not been taken.
+
+For Art. 26(6) durability, still pair the ledger with write-once storage and an
+external witness. See [`connectors-and-anchoring.md`](./connectors-and-anchoring.md).
 
 ### Gap 4 — Replay covers authorization decisions only
 
@@ -410,7 +423,7 @@ No software discharges these. Listed so they are not mistaken for covered:
 | 26(2) | Competent overseers with authority | ● Provided — principal attribution recorded; run multi-user mode |
 | 26(3) | Input data relevance | ○ Not addressed |
 | 26(5) | Monitor, suspend, report | ◐ Partial — suspension provided; reporting organisational |
-| 26(6) | Six-month log retention | ◐ Partial — append-only, but no enforced policy |
+| 26(6) | Six-month log retention | ◐ Partial — append-only and now anchorable; retention policy and an external witness both outstanding |
 | 26(9) | DPIA support | ● Supports |
 | 26(12) | Cooperate with authorities | ● Supports — vendor-independent verification |
 
