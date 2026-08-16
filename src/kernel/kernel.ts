@@ -125,9 +125,29 @@ import {
   writeKernelState,
   writePendingKernelSnapshot,
 } from './store';
+import {
+  authorizeSpawn,
+  decideSpawn,
+  revokeSpawn,
+  startSpawn,
+} from './agents/registry';
+import {
+  AGENT_AUTHORITY_MODES,
+  AGENT_DOMAINS,
+  AGENT_TIERS,
+  emptyAgentFleetState,
+  TIER_RISK_CEILING,
+  type AgentAuthorityMode,
+  type AgentDefinition,
+  type AgentDomain,
+  type AgentFleetState,
+  type AgentSpawn,
+  type AgentTier,
+} from './agents/types';
 import { buildInitialTaskGraph, getNextReadyTask, markTaskStatus } from './taskGraph';
 import {
   ApprovalDecisionPrincipal,
+  ApprovalRecord,
   ApprovalStatus,
   BenchmarkRun,
   CapabilityToken,
@@ -5309,6 +5329,233 @@ export const createKernelService = (options: KernelServiceOptions) => {
     return options.artifactStore.list();
   };
 
+  // ---------------------------------------------------------------------------
+  // Agent fleet
+  // ---------------------------------------------------------------------------
+
+  const isNonEmptyText = (value: unknown): value is string =>
+    typeof value === 'string' && value.trim().length > 0;
+
+  const fleetOf = (state: KernelState): AgentFleetState => state.agentFleet ?? emptyAgentFleetState();
+
+  const withFleet = (state: KernelState, fleet: AgentFleetState): KernelState =>
+    ({ ...state, agentFleet: fleet });
+
+  const createAgentDefinition = (value: unknown): Promise<AgentDefinition> => withMutation(async () => {
+    const input = value as Partial<AgentDefinition>;
+    if (!isNonEmptyText(input?.name) || !isNonEmptyText(input?.description)) {
+      throw new Error('Agent definition requires a name and description.');
+    }
+    if (!AGENT_TIERS.includes(input.tier as AgentTier)) throw new Error('Unknown agent tier.');
+    if (!AGENT_DOMAINS.includes(input.domain as AgentDomain)) throw new Error('Unknown agent domain.');
+    const workerIds = Array.isArray(input.workerIds) ? input.workerIds.filter(isNonEmptyText) : [];
+    for (const workerId of workerIds) {
+      if (!workerRegistry.get(workerId)) throw new Error(`Agent worker ${workerId} is not registered.`);
+    }
+
+    let state = await readConsistentState();
+    const now = new Date().toISOString();
+    const definition: AgentDefinition = {
+      schemaVersion: 1,
+      id: createKernelId('agent'),
+      name: input.name.trim(),
+      tier: input.tier as AgentTier,
+      domain: input.domain as AgentDomain,
+      description: input.description.trim(),
+      workerIds,
+      defaultBudget: {
+        maxOperations: 25, maxChildren: 4, maxDepth: 3, deadlineMs: 10 * 60 * 1000,
+        ...(input.defaultBudget ?? {}),
+      },
+      createdAt: now,
+    };
+    const appended = await appendEvent(state, {
+      actor: 'user',
+      type: 'agent.defined',
+      entityId: definition.id,
+      entityType: 'agent',
+      payload: {
+        agentId: definition.id,
+        tier: definition.tier,
+        domain: definition.domain,
+        workerIds: definition.workerIds,
+        tierRiskCeiling: TIER_RISK_CEILING[definition.tier],
+      },
+    });
+    state = appended.state;
+    const fleet = fleetOf(state);
+    await commitState(withFleet(state, { ...fleet, definitions: [...fleet.definitions, definition] }));
+    return definition;
+  });
+
+  /**
+   * Requests a spawn. Elevated autonomy does not start the agent: it creates an
+   * approval, so raising autonomy is itself an operator decision on the record.
+   */
+  const spawnAgent = (value: unknown): Promise<AgentSpawn> => withMutation(async () => {
+    const input = value as {
+      definitionId?: string; goalId?: string; objective?: string;
+      requestedAuthority?: AgentAuthorityMode; parentSpawnId?: string;
+      envelope?: AgentSpawn['envelope']; budget?: Partial<AgentSpawn['budget']>;
+    };
+    if (!AGENT_AUTHORITY_MODES.includes(input?.requestedAuthority as AgentAuthorityMode)) {
+      throw new Error('Unknown agent authority mode.');
+    }
+    let state = await readConsistentState();
+    if (state.controls.stopAll) throw new Error('Stop All is active. Resume the kernel before spawning agents.');
+
+    const fleet = fleetOf(state);
+    const definition = fleet.definitions.find((candidate) => candidate.id === input.definitionId);
+    if (!definition) throw new Error('Agent definition not found.');
+    const goal = state.goals.find((candidate) => candidate.id === input.goalId);
+    if (!goal) throw new Error('Goal not found.');
+    const parent = input.parentSpawnId
+      ? fleet.spawns.find((candidate) => candidate.id === input.parentSpawnId)
+      : undefined;
+    if (input.parentSpawnId && !parent) throw new Error('Parent agent spawn not found.');
+
+    const now = new Date().toISOString();
+    const decision = decideSpawn({
+      id: createKernelId('spawn'),
+      definition,
+      goalId: goal.id,
+      objective: input.objective ?? '',
+      requestedAuthority: input.requestedAuthority as AgentAuthorityMode,
+      envelope: input.envelope,
+      budget: input.budget,
+      parent,
+      now,
+    });
+
+    // A refused spawn is evidence, not an error to swallow.
+    if (!decision.ok || !decision.spawn) {
+      const refused = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.spawn_refused',
+        entityId: definition.id,
+        entityType: 'agent',
+        payload: { definitionId: definition.id, goalId: goal.id, reasonCode: decision.reasonCode, reason: decision.reason },
+      });
+      await commitState(refused.state);
+      throw new Error(decision.reason);
+    }
+
+    let spawn = decision.spawn;
+    let approval: ApprovalRecord | undefined;
+    if (decision.approvalRequired) {
+      approval = createApprovalRecord({
+        goalId: goal.id,
+        taskId: `agent:${spawn.id}`,
+        requestedAction: `Grant ${spawn.requestedAuthority} authority to ${definition.name} (ceiling ${spawn.effectiveRiskCeiling})`,
+        riskLevel: spawn.effectiveRiskCeiling,
+        reason: `Agent requests ${spawn.requestedAuthority} authority, which acts without per-action approval.`,
+      }, now);
+      spawn = { ...spawn, approvalId: approval.id };
+    }
+
+    const appended = await appendEvent(state, {
+      actor: 'user',
+      type: 'agent.spawn_requested',
+      entityId: spawn.id,
+      entityType: 'agent',
+      payload: {
+        spawnId: spawn.id,
+        definitionId: definition.id,
+        goalId: goal.id,
+        parentSpawnId: spawn.parentSpawnId,
+        depth: spawn.depth,
+        tier: spawn.tier,
+        domain: spawn.domain,
+        requestedAuthority: spawn.requestedAuthority,
+        effectiveAuthority: spawn.effectiveAuthority,
+        effectiveRiskCeiling: spawn.effectiveRiskCeiling,
+        approvalRequired: Boolean(decision.approvalRequired),
+        approvalId: approval?.id,
+        budget: spawn.budget,
+      },
+    });
+    state = appended.state;
+
+    const started = decision.approvalRequired ? spawn : startSpawn(spawn, now);
+    const nextFleet = fleetOf(state);
+    await commitState(withFleet({
+      ...state,
+      approvals: approval ? [...state.approvals, approval] : state.approvals,
+    }, {
+      ...nextFleet,
+      spawns: [...nextFleet.spawns, started],
+      definitions: nextFleet.definitions,
+    }));
+    return started;
+  });
+
+  /** Consumes the approval that authorises elevated autonomy and starts the agent. */
+  const authorizeAgentSpawn = (
+    spawnId: string,
+    authorizedBy?: ApprovalDecisionPrincipal,
+  ): Promise<AgentSpawn> => withMutation(async () => {
+    let state = await readConsistentState();
+    const fleet = fleetOf(state);
+    const spawn = fleet.spawns.find((candidate) => candidate.id === spawnId);
+    if (!spawn) throw new Error('Agent spawn not found.');
+    if (spawn.status !== 'approval_required') throw new Error('Agent spawn is not awaiting authorization.');
+    const approval = state.approvals.find((candidate) => candidate.id === spawn.approvalId);
+    if (!approval || approval.status !== 'approved') {
+      throw new Error('Elevated agent authority requires an approved approval record.');
+    }
+
+    const now = new Date().toISOString();
+    const authorized = authorizeSpawn(spawn, approval.id, authorizedBy ?? approval.decidedBy, now);
+    const appended = await appendEvent(state, {
+      actor: 'user',
+      type: 'agent.spawn_authorized',
+      entityId: authorized.id,
+      entityType: 'agent',
+      payload: {
+        spawnId: authorized.id,
+        approvalId: approval.id,
+        effectiveAuthority: authorized.effectiveAuthority,
+        effectiveRiskCeiling: authorized.effectiveRiskCeiling,
+        authorizedBy: authorized.authorizedBy,
+      },
+    });
+    state = appended.state;
+    const nextFleet = fleetOf(state);
+    await commitState(withFleet(state, {
+      ...nextFleet,
+      spawns: nextFleet.spawns.map((candidate) => candidate.id === authorized.id ? authorized : candidate),
+    }));
+    return authorized;
+  });
+
+  /** Revocation is always available while an agent is live. */
+  const revokeAgentSpawn = (spawnId: string, reason: string): Promise<AgentSpawn> => withMutation(async () => {
+    const revocationReason = normalizedAuditReason(reason, 'Agent revocation reason');
+    let state = await readConsistentState();
+    const fleet = fleetOf(state);
+    const spawn = fleet.spawns.find((candidate) => candidate.id === spawnId);
+    if (!spawn) throw new Error('Agent spawn not found.');
+
+    const now = new Date().toISOString();
+    const revoked = revokeSpawn(spawn, revocationReason, now);
+    const appended = await appendEvent(state, {
+      actor: 'user',
+      type: 'agent.revoked',
+      entityId: revoked.id,
+      entityType: 'agent',
+      payload: { spawnId: revoked.id, reason: revocationReason, priorStatus: spawn.status },
+    });
+    state = appended.state;
+    const nextFleet = fleetOf(state);
+    await commitState(withFleet(state, {
+      ...nextFleet,
+      spawns: nextFleet.spawns.map((candidate) => candidate.id === revoked.id ? revoked : candidate),
+    }));
+    return revoked;
+  });
+
+  const getAgentFleet = async (): Promise<AgentFleetState> => fleetOf(await getState());
+
   const recordBenchmarkRun = (goalId: string): Promise<BenchmarkRun> => withMutation(async () => {
     let state = await readConsistentState();
     const events = await readKernelEvents(options.runtimeDir);
@@ -5390,5 +5637,10 @@ export const createKernelService = (options: KernelServiceOptions) => {
     recordBenchmarkRun,
     createArtifact,
     listArtifacts,
+    createAgentDefinition,
+    spawnAgent,
+    authorizeAgentSpawn,
+    revokeAgentSpawn,
+    getAgentFleet,
   };
 };

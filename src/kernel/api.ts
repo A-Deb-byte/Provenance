@@ -756,6 +756,60 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
   });
 
+  router.get('/agents', async (_req, res) => {
+    try {
+      res.json(await kernel.getAgentFleet());
+    } catch {
+      res.status(500).json({ error: 'Agent fleet is unavailable.' });
+    }
+  });
+
+  router.post('/agents/definitions', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.createAgentDefinition(req.body));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  router.post('/agents/spawns', async (req, res) => {
+    try {
+      res.status(201).json(await kernel.spawnAgent(req.body));
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  // Separate from the spawn route on purpose: authorizing elevated autonomy is
+  // a distinct operator act, and is attributed to the authenticated principal.
+  router.post('/agents/spawns/:spawnId/authorize', async (req, res) => {
+    try {
+      res.json(await kernel.authorizeAgentSpawn(
+        req.params.spawnId,
+        options.approvalDecisionPrincipal?.(req),
+      ));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent spawn not found.' ? 404 : 400).json({ error: message });
+    }
+  });
+
+  router.post('/agents/spawns/:spawnId/revoke', async (req, res) => {
+    let reason: string;
+    try {
+      reason = requiredAuditReason(req.body?.reason, 'Agent revocation reason');
+    } catch (error) {
+      res.status(400).json({ error: errorMessage(error) });
+      return;
+    }
+    try {
+      res.json(await kernel.revokeAgentSpawn(req.params.spawnId, reason));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent spawn not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
   router.post('/desktop/typed-payloads', async (req, res) => {
     const content = req.body?.content as unknown;
     if (typeof content !== 'string' || content.length === 0) {

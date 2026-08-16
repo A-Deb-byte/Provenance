@@ -274,7 +274,7 @@ export interface KernelEvent {
   actor: KernelActor;
   type: string;
   entityId: string;
-  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark' | 'artifact' | 'mission' | 'schedule' | 'occurrence';
+  entityType: 'goal' | 'task' | 'approval' | 'capability' | 'budget' | 'worker' | 'system' | 'memory' | 'skill' | 'skill_eval' | 'skill_activation' | 'provider' | 'automation' | 'control' | 'release' | 'benchmark' | 'artifact' | 'mission' | 'schedule' | 'occurrence' | 'agent';
   payload: Record<string, unknown>;
   previousHash: string | null;
   hash: string;
@@ -562,6 +562,8 @@ export interface KernelState {
   benchmarkRuns: BenchmarkRun[];
   contentSchemaVersion?: 2;
   recurringResearch?: RecurringResearchKernelState;
+  /** Absent in states written before the agent fleet existed. */
+  agentFleet?: import('./agents/types').AgentFleetState;
   controls: KernelControls;
   lastEventHash: string | null;
 }

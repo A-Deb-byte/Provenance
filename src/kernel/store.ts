@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { emptyAgentFleetState } from './agents/types';
 import { KernelState } from './types';
 
 const statePath = (runtimeDir: string) => path.join(runtimeDir, 'state.json');
@@ -28,6 +29,7 @@ export const createEmptyKernelState = (): KernelState => ({
   benchmarkRuns: [],
   contentSchemaVersion: 2,
   recurringResearch: { schemaVersion: 1, schedules: [], occurrences: [] },
+  agentFleet: emptyAgentFleetState(),
   controls: { stopAll: false },
   lastEventHash: null,
 });
@@ -57,6 +59,15 @@ const normalizeKernelState = (parsed: Partial<KernelState>): KernelState => ({
         : { schemaVersion: 1 as const, schedules: [], occurrences: [] },
     }
     : {}),
+  // A state written before the fleet existed normalizes to an empty fleet
+  // rather than being rejected, so an existing deployment keeps working.
+  agentFleet: parsed.agentFleet &&
+    parsed.agentFleet.schemaVersion === 1 &&
+    Array.isArray(parsed.agentFleet.definitions) &&
+    Array.isArray(parsed.agentFleet.spawns) &&
+    Array.isArray(parsed.agentFleet.proposals)
+    ? parsed.agentFleet
+    : emptyAgentFleetState(),
   controls: parsed.controls && typeof parsed.controls === 'object' && !Array.isArray(parsed.controls)
     ? {
       stopAll: parsed.controls.stopAll === true,

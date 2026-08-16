@@ -28,6 +28,10 @@ export type AgentSpawnStatus =
   | 'failed'
   | 'revoked';
 
+export const AGENT_TIERS: AgentTier[] = ['T0_reader', 'T1_operator', 'T2_connector', 'T3_orchestrator'];
+export const AGENT_DOMAINS: AgentDomain[] = ['research', 'web', 'desktop', 'code', 'connector'];
+export const AGENT_AUTHORITY_MODES: AgentAuthorityMode[] = ['propose_only', 'envelope', 'autonomous'];
+
 /** Highest risk an agent of this tier may ever request. */
 export const TIER_RISK_CEILING: Record<AgentTier, CapabilityRiskLevel> = {
   T0_reader: 'L0',

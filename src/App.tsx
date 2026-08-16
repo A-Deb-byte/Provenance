@@ -37,16 +37,17 @@ import { RecurringResearchPanel } from './components/RecurringResearchPanel';
 import { ResearchMissionPanel } from './components/ResearchMissionPanel';
 import { RuntimePanel } from './components/RuntimePanel';
 import { DesktopPanel } from './components/DesktopPanel';
+import { AgentFleetPanel } from './components/AgentFleetPanel';
 import { AgentObservatory } from './components/AgentObservatory';
 import { 
   Plus, MessageSquare, Trash2, Database, Brain, Sparkles, 
   ArrowRight, ShieldCheck, HelpCircle, HardDrive, RefreshCw, Send,
   Cpu, AlertCircle, FileText, CheckCircle, GitBranch, GitCommit, GitMerge,
-  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen, CalendarClock, MonitorCog,
+  Zap, Compass, ChevronLeft, ChevronRight, Scale, Beaker, Layers, Network, BookOpen, CalendarClock, MonitorCog, Bot,
   Activity, LayoutDashboard, Menu, X
 } from 'lucide-react';
 
-type PanelTab = 'overview' | 'chat' | 'missions' | 'schedules' | 'desktop' | 'knowledge' | 'tree' | 'mutator';
+type PanelTab = 'overview' | 'chat' | 'missions' | 'schedules' | 'agents' | 'desktop' | 'knowledge' | 'tree' | 'mutator';
 type PresentationScope = 'unresolved' | 'open' | 'protected';
 type RequestFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -993,6 +994,7 @@ export default function App() {
     { id: 'chat', label: 'Agent Chat', icon: <MessageSquare size={14} /> },
     { id: 'missions', label: 'Missions', icon: <Compass size={14} /> },
     { id: 'schedules', label: 'Schedules', icon: <CalendarClock size={14} /> },
+    { id: 'agents', label: 'Agent Fleet', icon: <Bot size={14} /> },
     { id: 'desktop', label: 'Desktop', icon: <MonitorCog size={14} /> },
     { id: 'knowledge', label: 'Knowledge', icon: <BookOpen size={14} /> },
     { id: 'tree', label: 'Dialogue Map', icon: <Network size={14} /> },
@@ -1568,6 +1570,15 @@ export default function App() {
               ) : (
                 <KernelAccessNotice />
               )}
+            </div>
+          </div>
+        )}
+
+        {/* PANEL VIEW: TIERED AGENT FLEET */}
+        {activePanelTab === 'agents' && (
+          <div className="flex-1 overflow-y-auto p-3 sm:p-6" role="region" aria-label="Agent Fleet">
+            <div className="max-w-6xl mx-auto space-y-4">
+              <AgentFleetPanel />
             </div>
           </div>
         )}
