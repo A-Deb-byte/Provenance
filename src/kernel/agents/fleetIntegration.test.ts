@@ -38,6 +38,22 @@ const readerRegistration = {
   registeredAt: '2026-08-16T11:00:00.000Z',
 };
 
+const CLICK_WORKER_ID = 'worker.browser.playwright';
+
+const clickRegistration = {
+  id: CLICK_WORKER_ID,
+  family: 'browser' as const,
+  availability: 'available' as const,
+  supportedActions: ['browser.inspect' as const, 'browser.click' as const],
+  configuredScopes: [{
+    family: 'browser' as const,
+    operations: ['browser.inspect' as const, 'browser.click' as const],
+    origins: ['https://example.com', 'https://elsewhere.test'],
+    downloadRoots: [],
+  }],
+  registeredAt: '2026-08-16T11:00:00.000Z',
+};
+
 let dispatched: string[] = [];
 
 const recordingWorker: KernelActionWorker = {
@@ -51,8 +67,8 @@ const makeKernel = (agentExecutionEnabled: boolean) => createKernelService({
   runtimeDir,
   allowedWorkspaceRoot: workspaceRoot,
   agentExecutionEnabled,
-  workerRegistrations: [readerRegistration],
-  actionWorkers: { [READER_WORKER_ID]: recordingWorker },
+  workerRegistrations: [readerRegistration, clickRegistration],
+  actionWorkers: { [READER_WORKER_ID]: recordingWorker, [CLICK_WORKER_ID]: recordingWorker },
 });
 
 beforeEach(async () => {
@@ -321,5 +337,83 @@ describe('agent execution', () => {
 
     await expect(kernel.runAgentOrchestration(spawn.id, readerDefinition.id))
       .rejects.toThrow('may not decompose work');
+  });
+});
+
+describe('proposal to dispatch loop', () => {
+  const setup = async () => {
+    kernel = makeKernel(true);
+    const goal = await kernel.createGoal(goalInput);
+    const definition = await kernel.createAgentDefinition({
+      name: 'operator', description: 'clicks', tier: 'T1_operator', domain: 'web',
+      workerIds: [CLICK_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: definition.id, goalId: goal.id, objective: 'Interact',
+      requestedAuthority: 'propose_only', targets: ['https://example.com/a'],
+      targetAction: 'click', targetSelector: '#accept',
+    });
+    return { goal, definition, spawn };
+  };
+
+  it('proposes instead of acting, and raises the approval a human decides', async () => {
+    const { spawn } = await setup();
+
+    const outcome = await kernel.runAgentStep(spawn.id);
+
+    expect(outcome.kind).toBe('proposed');
+    expect(dispatched).toEqual([]);
+    const proposal = outcome.proposal!;
+    expect(proposal.status).toBe('pending');
+    expect(proposal.riskLevel).toBe('L2');
+
+    // The approval exists and is pending; nothing has been authorized yet.
+    const state = await kernel.getState();
+    const approval = state.approvals.find((item) => item.id === proposal.approvalId);
+    expect(approval?.status).toBe('pending');
+    expect(await eventTypes()).toContain('agent.proposed');
+  });
+
+  it('refuses to dispatch a proposal whose approval is still pending', async () => {
+    const { spawn } = await setup();
+    const proposal = (await kernel.runAgentStep(spawn.id)).proposal!;
+
+    await expect(kernel.dispatchAgentProposal(proposal.id))
+      .rejects.toThrow('only dispatch under an approved approval');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('dispatches once approved, then refuses to dispatch again', async () => {
+    const { spawn } = await setup();
+    const proposal = (await kernel.runAgentStep(spawn.id)).proposal!;
+    await kernel.decideApproval(proposal.approvalId, 'approved', 'Reviewed the click target.', {
+      principalId: 'user:alice', mode: 'multi_user', role: 'operator', attribution: 'natural_person',
+    });
+
+    const result = await kernel.dispatchAgentProposal(proposal.id);
+
+    expect(result.kind).toBe('stepped');
+    expect(dispatched).toEqual(['https://example.com/a']);
+    expect(result.proposal?.status).toBe('dispatched');
+
+    const types = await eventTypes();
+    expect(types).toContain('agent.proposal_dispatched');
+    expect(types).toContain('capability.grant_consumed');
+
+    // Single use: the approval was spent, so a retry needs a new approval.
+    await expect(kernel.dispatchAgentProposal(proposal.id)).rejects.toThrow('already dispatched');
+    expect(dispatched).toHaveLength(1);
+  });
+
+  it('refuses to dispatch for a revoked agent', async () => {
+    const { spawn } = await setup();
+    const proposal = (await kernel.runAgentStep(spawn.id)).proposal!;
+    await kernel.decideApproval(proposal.approvalId, 'approved', 'Approved.', {
+      principalId: 'user:alice', mode: 'multi_user', role: 'operator', attribution: 'natural_person',
+    });
+    await kernel.revokeAgentSpawn(spawn.id, 'Operator halted this agent.');
+
+    await expect(kernel.dispatchAgentProposal(proposal.id)).rejects.toThrow('revoked');
+    expect(dispatched).toEqual([]);
   });
 });

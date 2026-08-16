@@ -119,6 +119,15 @@ export interface AgentSpawn {
    * never repeats a target it already inspected.
    */
   targets?: string[];
+  /**
+   * What the agent does to each target. `inspect` is L0; `click` is L2 and will
+   * therefore be proposed rather than performed unless the agent holds enough
+   * authority. Without this the planner could only ever produce L0 work and the
+   * proposal path would be unreachable.
+   */
+  targetAction?: 'inspect' | 'click';
+  /** Required for `click`; the element acted on at each target. */
+  targetSelector?: string;
   /** Who authorised elevated autonomy. Absent for `propose_only`. */
   authorizedBy?: ApprovalDecisionPrincipal;
   createdAt: string;
@@ -128,6 +137,8 @@ export interface AgentSpawn {
   failureReason?: string;
 }
 
+export type AgentProposalStatus = 'pending' | 'dispatched' | 'denied' | 'withdrawn';
+
 /** An agent's request for a consequential action a human must decide. */
 export interface AgentProposal {
   schemaVersion: 1;
@@ -135,9 +146,22 @@ export interface AgentProposal {
   spawnId: string;
   riskLevel: RiskLevel;
   summary: string;
-  /** Commitment to the intent, so the proposal cannot be swapped after approval. */
-  intentHash: string;
+  /**
+   * Binds the approval to *what will be done* rather than to the exact intent
+   * object. The authority changes between proposing (`kernel_policy`) and
+   * dispatching (`approval`), so a whole-intent hash would never match; this
+   * commits to the action semantics, which must not change.
+   */
+  authorityBindingHash: string;
+  /** Which target this proposal covers, so the intent can be re-derived. */
+  targetIndex: number;
+  /** Approval a human must decide before this can dispatch. */
+  approvalId: string;
+  /** A proposal dispatches at most once. */
+  status: AgentProposalStatus;
   createdAt: string;
+  updatedAt: string;
+  dispatchedAt?: string;
 }
 
 export interface AgentFleetState {

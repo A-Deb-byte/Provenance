@@ -130,7 +130,40 @@ instead of a surprise autonomous worker.
 The GUI states which mode is in force and offers no run control when execution
 is off, so the panel cannot imply agents are working when they are not.
 
+## Proposal → approval → dispatch
+
+`propose_only` is now a complete loop rather than a dead end.
+
+1. The agent plans an action above its ceiling. Nothing is dispatched.
+2. The kernel records an `AgentProposal` **and** raises the `ApprovalRecord` a
+   human decides. The proposal is inert until that approval exists.
+3. A human approves it through the ordinary approvals path, attributed to their
+   identity like any other approval.
+4. `dispatchAgentProposal` **re-derives** the intent from the agent's plan and
+   compares it to the binding hash that was approved. Only then does it build a
+   grant, consume it pre-dispatch, and call the worker.
+
+The re-derivation is the point. The approval commits to
+`hashIntentAuthorityBinding` — a hash of the *action semantics*, not the whole
+intent — because the authority necessarily changes between proposing
+(`kernel_policy`) and dispatching (`approval`). A whole-intent hash could never
+match; this one must. If the action changed, the proposal is withdrawn and
+ledgered as `agent.proposal_withdrawn`.
+
+A proposal dispatches **at most once**, and is marked `dispatched` even when the
+worker fails: the approval was spent, so a retry needs a new one.
+
+> Spawn targets cannot currently drift through any API, so the re-derivation
+> check is defense-in-depth against a future planner or a state-corruption bug
+> rather than a reachable path today. The property it depends on is tested
+> directly instead of through an unreachable integration path.
+
+Because the deterministic planner previously only ever produced `browser.inspect`
+(L0), the proposal path was unreachable — no action could exceed a ceiling. An
+agent now carries a `targetAction` (`inspect` or `click`), so an L2 action is
+derivable and the boundary is exercised by real work.
+
 ## Still out
 
-A model-driven planner (targets are operator-supplied today), proposal→approval
-promotion into a dispatchable action, and skill→agent binding.
+A model-driven planner (targets and target action are operator-supplied today)
+and skill→agent binding.

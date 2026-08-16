@@ -775,6 +775,15 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     }
   });
 
+  router.post('/agents/proposals/:proposalId/dispatch', async (req, res) => {
+    try {
+      res.json(await kernel.dispatchAgentProposal(req.params.proposalId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent proposal not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
   router.post('/agents/spawns/:spawnId/orchestrate', async (req, res) => {
     const childDefinitionId = req.body?.childDefinitionId as unknown;
     if (typeof childDefinitionId !== 'string' || !childDefinitionId.trim()) {

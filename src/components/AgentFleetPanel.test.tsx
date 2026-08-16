@@ -33,6 +33,36 @@ const fleet = {
   execution: { enabled: false, reason: 'Agent execution is disabled.' },
 };
 
+const proposalFleet = {
+  ...fleet,
+  execution: { enabled: true, reason: 'Agent execution is enabled for this deployment.' },
+  spawns: [{ ...fleet.spawns[0], status: 'running' }],
+  proposals: [
+    {
+      schemaVersion: 1,
+      id: 'proposal_1',
+      spawnId: 'spawn_pending',
+      riskLevel: 'L2',
+      summary: 'browser.click — Clicking #accept on target 1 of 1.',
+      authorityBindingHash: 'a'.repeat(64),
+      targetIndex: 0,
+      approvalId: 'approval_2',
+      status: 'pending',
+      createdAt: '2026-08-16T12:00:00.000Z',
+      updatedAt: '2026-08-16T12:00:00.000Z',
+    },
+    {
+      ...{
+        schemaVersion: 1, id: 'proposal_done', spawnId: 'spawn_pending', riskLevel: 'L2',
+        summary: 'already handled', authorityBindingHash: 'b'.repeat(64), targetIndex: 1,
+        approvalId: 'approval_3', createdAt: '2026-08-16T12:00:00.000Z',
+        updatedAt: '2026-08-16T12:00:00.000Z',
+      },
+      status: 'dispatched',
+    },
+  ],
+};
+
 const runningFleet = {
   ...fleet,
   execution: { enabled: true, reason: 'Agent execution is enabled for this deployment.' },
@@ -125,6 +155,31 @@ describe('AgentFleetPanel', () => {
     await waitFor(() => expect(screen.getByTestId('execution-status')).toHaveTextContent(/execution on/i));
     expect(screen.getByRole('button', { name: /run step/i })).toBeInTheDocument();
     expect(screen.queryByText(/will not run until this deployment sets/i)).not.toBeInTheDocument();
+  });
+
+  it('queues only pending proposals for decision, not ones already dispatched', async () => {
+    responses.set('/api/kernel/agents', proposalFleet);
+    render(<AgentFleetPanel goalId="goal_1" />);
+
+    await waitFor(() => expect(screen.getAllByTestId('agent-proposal')).toHaveLength(1));
+    expect(screen.getByText(/Clicking #accept/)).toBeInTheDocument();
+    expect(screen.queryByText('already handled')).not.toBeInTheDocument();
+
+    // The panel says what the kernel will do on dispatch, so an operator is not
+    // led to believe approval alone is sufficient.
+    expect(screen.getByText(/re-derives the action and refuses if it changed/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /dispatch approved action/i })).toBeEnabled();
+  });
+
+  it('cannot dispatch a proposal while execution is off', async () => {
+    responses.set('/api/kernel/agents', {
+      ...proposalFleet,
+      execution: { enabled: false, reason: 'Agent execution is disabled.' },
+    });
+    render(<AgentFleetPanel goalId="goal_1" />);
+
+    await waitFor(() => expect(screen.getByTestId('agent-proposal')).toBeInTheDocument());
+    expect(screen.getByRole('button', { name: /dispatch approved action/i })).toBeDisabled();
   });
 
   it('refuses to spawn without a selected goal', async () => {

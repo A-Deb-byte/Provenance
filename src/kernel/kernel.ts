@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { createCapabilityGrant, hashActionIntent } from '../capabilities/grants';
+import { createCapabilityGrant } from '../capabilities/grants';
 import {
   authorizeCapabilityDispatch,
   type CapabilityDispatchAuthorization,
@@ -5417,7 +5417,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       definitionId?: string; goalId?: string; objective?: string;
       requestedAuthority?: AgentAuthorityMode; parentSpawnId?: string;
       envelope?: AgentSpawn['envelope']; budget?: Partial<AgentSpawn['budget']>;
-      targets?: string[];
+      targets?: string[]; targetAction?: 'inspect' | 'click'; targetSelector?: string;
     };
     if (!AGENT_AUTHORITY_MODES.includes(input?.requestedAuthority as AgentAuthorityMode)) {
       throw new Error('Unknown agent authority mode.');
@@ -5464,6 +5464,8 @@ export const createKernelService = (options: KernelServiceOptions) => {
     let spawn = {
       ...decision.spawn,
       targets: Array.isArray(input.targets) ? input.targets.filter(isNonEmptyText) : undefined,
+      targetAction: input.targetAction === 'click' ? ('click' as const) : undefined,
+      targetSelector: isNonEmptyText(input.targetSelector) ? input.targetSelector.trim() : undefined,
     };
     let approval: ApprovalRecord | undefined;
     if (decision.approvalRequired) {
@@ -5658,18 +5660,47 @@ export const createKernelService = (options: KernelServiceOptions) => {
       createdAt: now,
     };
 
-    // Above the ceiling: record a proposal instead of acting.
+    // Above the ceiling: propose instead of acting, and raise the approval the
+    // human will decide. The proposal is inert until that approval exists.
     if (requiresProposal(spawn, plan.action)) {
+      const authorityBindingHash = hashIntentAuthorityBinding(intent);
+      const approval = createApprovalRecord({
+        goalId: goal.id,
+        taskId: `agent:${spawn.id}`,
+        requestedAction: `agent-proposal:${spawn.id}:${authorityBindingHash}`,
+        authorityBindingHash,
+        riskLevel,
+        reason: `Agent proposed ${plan.action.type}, which exceeds its ${spawn.effectiveRiskCeiling} ceiling.`,
+      }, now);
       const proposal: AgentProposal = {
         schemaVersion: 1,
         id: createKernelId('proposal'),
         spawnId: spawn.id,
         riskLevel,
         summary: `${plan.action.type} — ${plan.reason}`,
-        intentHash: hashActionIntent(intent),
+        authorityBindingHash,
+        targetIndex: plan.targetIndex ?? spawn.operationsUsed,
+        approvalId: approval.id,
+        status: 'pending',
         createdAt: now,
+        updatedAt: now,
       };
-      const appended = await appendEvent(state, {
+      let appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'approval.requested',
+        entityId: approval.id,
+        entityType: 'approval',
+        payload: {
+          goalId: goal.id,
+          taskId: approval.taskId,
+          spawnId: spawn.id,
+          riskLevel,
+          authorityBindingHash,
+          reason: approval.reason,
+        },
+      });
+      state = appended.state;
+      appended = await appendEvent(state, {
         actor: 'kernel',
         type: 'agent.proposed',
         entityId: spawn.id,
@@ -5677,15 +5708,20 @@ export const createKernelService = (options: KernelServiceOptions) => {
         payload: {
           spawnId: spawn.id,
           proposalId: proposal.id,
+          approvalId: approval.id,
           riskLevel,
           actionType: plan.action.type,
-          intentHash: proposal.intentHash,
+          authorityBindingHash,
+          targetIndex: proposal.targetIndex,
           ceiling: spawn.effectiveRiskCeiling,
         },
       });
       state = appended.state;
       const nextFleet = fleetOf(state);
-      await commitState(withFleet(state, { ...nextFleet, proposals: [...nextFleet.proposals, proposal] }));
+      await commitState(withFleet({
+        ...state,
+        approvals: [...state.approvals, approval],
+      }, { ...nextFleet, proposals: [...nextFleet.proposals, proposal] }));
       return { kind: 'proposed', spawn, proposal, reason: `Action exceeds the agent ceiling ${spawn.effectiveRiskCeiling}.` };
     }
 
@@ -5843,6 +5879,209 @@ export const createKernelService = (options: KernelServiceOptions) => {
       kind: stepFailed ? 'failed' : 'stepped',
       spawn: next,
       reason: stepFailed ?? outcomeSummary,
+    };
+  });
+
+  /**
+   * Dispatches a proposal a human approved.
+   *
+   * The intent is **re-derived** from the spawn rather than replayed from
+   * storage, then checked against the binding hash the operator approved. If
+   * the agent's plan changed in between -- different target, different action,
+   * widened scope -- the hashes diverge and this refuses. That is what stops an
+   * approval for one action being spent on another.
+   */
+  const dispatchAgentProposal = (proposalId: string): Promise<AgentStepOutcome> => withMutation(async () => {
+    if (!agentExecutionEnabled()) throw new Error(agentExecutionStatus().reason);
+    let state = await readConsistentState();
+    if (state.controls.stopAll) throw new Error('Stop All is active. Resume the kernel before dispatching proposals.');
+
+    const fleet = fleetOf(state);
+    const proposal = fleet.proposals.find((candidate) => candidate.id === proposalId);
+    if (!proposal) throw new Error('Agent proposal not found.');
+    if (proposal.status !== 'pending') throw new Error(`Agent proposal is already ${proposal.status}.`);
+
+    const spawn = fleet.spawns.find((candidate) => candidate.id === proposal.spawnId);
+    if (!spawn) throw new Error('Agent spawn not found.');
+    if (spawn.status !== 'running') throw new Error(`Agent is ${spawn.status} and cannot dispatch a proposal.`);
+    const goal = state.goals.find((candidate) => candidate.id === spawn.goalId);
+    if (!goal) throw new Error('Goal not found.');
+
+    const approval = state.approvals.find((candidate) => candidate.id === proposal.approvalId);
+    if (!approval) throw new Error('Approval for this proposal was not found.');
+    if (approval.status !== 'approved') {
+      throw new Error('A proposal may only dispatch under an approved approval.');
+    }
+
+    const now = new Date().toISOString();
+    const plan = planAgentStep({ ...spawn, operationsUsed: proposal.targetIndex });
+    if (plan.done || !plan.action || !plan.scope) {
+      throw new Error('The proposed action is no longer derivable from the agent plan.');
+    }
+
+    const workerId = fleet.definitions.find((item) => item.id === spawn.definitionId)?.workerIds[0];
+    if (!workerId) throw new Error('Agent definition lists no worker to dispatch through.');
+    const registration = workerRegistry.get(workerId);
+    if (!registration) throw new Error(`Agent worker ${workerId} is not registered.`);
+
+    const riskLevel = riskForAgentAction(plan.action);
+    // Authority is the approval itself, which is what lets an L2/L3 action
+    // through a policy that would otherwise demand one.
+    const intent: ActionIntent = {
+      schemaVersion: 1,
+      id: createKernelId('intent'),
+      goalId: goal.id,
+      taskId: `agent:${spawn.id}`,
+      workerId,
+      riskLevel,
+      action: plan.action,
+      scope: plan.scope,
+      authority: { kind: 'approval', referenceId: approval.id },
+      untrustedObservationIds: [],
+      createdAt: now,
+    };
+
+    const rederivedBinding = hashIntentAuthorityBinding(intent);
+    if (rederivedBinding !== proposal.authorityBindingHash) {
+      const withdrawn = { ...proposal, status: 'withdrawn' as const, updatedAt: now };
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.proposal_withdrawn',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: {
+          spawnId: spawn.id,
+          proposalId: proposal.id,
+          reasonCode: 'authority_binding_mismatch',
+          reason: 'The agent plan changed after approval; the approved action is no longer the action on offer.',
+        },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, {
+        ...nextFleet,
+        proposals: nextFleet.proposals.map((item) => item.id === withdrawn.id ? withdrawn : item),
+      }));
+      throw new Error('The agent plan changed after approval; the proposal was withdrawn.');
+    }
+
+    const decision = decideActionPolicy(intent, workerRegistry);
+    if (decision.kind !== 'allow') throw new Error(`Proposal dispatch denied: ${decision.reason}`);
+
+    const admitted = admitOperation(
+      { ...spawn, effectiveRiskCeiling: riskLevel },
+      riskLevel,
+      now,
+    );
+    if (!admitted.allowed || !admitted.spawn) throw new Error(admitted.reason);
+
+    const grant = createCapabilityGrant(intent, {
+      id: createKernelId('cap'),
+      issuedAt: now,
+      expiresAt: new Date(Date.parse(now) + 10 * 60 * 1000).toISOString(),
+      maxOps: 1,
+      approvalId: approval.id,
+    });
+    await capabilityGrantStore.create(grant);
+    const dispatchNow = new Date().toISOString();
+    const authorized = await authorizeCapabilityDispatch(
+      capabilityGrantStore, grant.id, intent, registration, { now: dispatchNow, operationsUsed: 1 },
+    );
+    if (!authorized.allowed || !authorized.authorization || !authorized.grant) {
+      throw new Error(`Capability authorization failed before proposal dispatch: ${authorized.reason}`);
+    }
+
+    let appended = await appendEvent(state, {
+      actor: 'kernel',
+      type: 'capability.grant_consumed',
+      entityId: grant.id,
+      entityType: 'capability',
+      payload: {
+        spawnId: spawn.id,
+        proposalId: proposal.id,
+        approvalId: approval.id,
+        intentId: intent.id,
+        grantId: grant.id,
+        grantStatus: authorized.grant.status,
+        decision: buildDispatchDecisionRecord(
+          { grant, intent, worker: registration, now: dispatchNow, operationsUsed: 1 },
+          {
+            allowed: true,
+            reasonCode: 'allowed',
+            reason: 'Capability grant consumed.',
+            riskLevel: intent.riskLevel,
+            grantStatus: authorized.grant.status,
+            usedOps: authorized.grant.usedOps,
+            consumedAt: authorized.grant.consumedAt ?? null,
+          },
+        ),
+      },
+    });
+    state = appended.state;
+
+    const worker = actionWorkers[workerId];
+    let summary = 'Proposal dispatched.';
+    let failure: string | undefined;
+    if (worker) {
+      try {
+        const result = await worker.execute(intent, {
+          timeoutMs: 60_000,
+          authorization: authorized.authorization,
+        });
+        summary = result.summary;
+        if (result.status !== 'succeeded') failure = `Agent worker reported ${result.status}: ${result.summary}`;
+      } catch (error) {
+        failure = error instanceof Error ? error.message : 'Agent worker dispatch failed.';
+      }
+    } else {
+      failure = `No executable runtime is registered for ${workerId}.`;
+    }
+
+    const finishedAt = new Date().toISOString();
+    const dispatchedProposal = {
+      ...proposal,
+      // Marked dispatched even on worker failure: the approval was spent, and a
+      // retry must be approved again rather than reusing this one.
+      status: 'dispatched' as const,
+      updatedAt: finishedAt,
+      dispatchedAt: finishedAt,
+    };
+    const advanced = { ...spawn, operationsUsed: spawn.operationsUsed + 1, updatedAt: finishedAt };
+    const nextSpawn = failure ? failSpawn(advanced, failure, finishedAt) : advanced;
+
+    appended = await appendEvent(state, {
+      actor: 'worker',
+      type: failure ? 'agent.failed' : 'agent.proposal_dispatched',
+      entityId: spawn.id,
+      entityType: 'agent',
+      payload: {
+        spawnId: spawn.id,
+        proposalId: proposal.id,
+        approvalId: approval.id,
+        intentId: intent.id,
+        grantId: grant.id,
+        riskLevel,
+        summary: failure ?? summary,
+      },
+    });
+    state = appended.state;
+    const nextFleet = fleetOf(state);
+    await commitState(withFleet({
+      ...state,
+      approvals: state.approvals.map((candidate) => candidate.id === approval.id
+        ? { ...candidate, status: 'consumed' as const, updatedAt: finishedAt }
+        : candidate),
+    }, {
+      ...nextFleet,
+      spawns: nextFleet.spawns.map((item) => item.id === nextSpawn.id ? nextSpawn : item),
+      proposals: nextFleet.proposals.map((item) => item.id === dispatchedProposal.id ? dispatchedProposal : item),
+    }));
+
+    return {
+      kind: failure ? 'failed' : 'stepped',
+      spawn: nextSpawn,
+      proposal: dispatchedProposal,
+      reason: failure ?? summary,
     };
   });
 
@@ -6038,6 +6277,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
     createAgentDefinition,
     agentExecutionStatus,
     runAgentStep,
+    dispatchAgentProposal,
     runAgentOrchestration,
     spawnAgent,
     authorizeAgentSpawn,

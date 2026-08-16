@@ -56,6 +56,20 @@ export const planAgentStep = (spawn: AgentSpawn): AgentStepPlan => {
     return { done: true, reason: `Agent target ${index + 1} is not a usable http(s) URL.` };
   }
 
+  if (spawn.targetAction === 'click') {
+    const selector = spawn.targetSelector?.trim();
+    if (!selector) {
+      return { done: true, reason: 'A click agent requires a target selector.' };
+    }
+    return {
+      done: false,
+      targetIndex: index,
+      reason: `Clicking ${selector} on target ${index + 1} of ${targets.length}.`,
+      action: { type: 'browser.click', origin, url, selector },
+      scope: { family: 'browser', operations: ['browser.click'], origins: [origin], downloadRoots: [] },
+    };
+  }
+
   return {
     done: false,
     targetIndex: index,

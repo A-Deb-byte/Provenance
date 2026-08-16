@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { envelopePermits, planAgentStep, requiresProposal, riskForAgentAction } from './executor';
 import { decomposeObjective } from './orchestrator';
 import type { AgentDefinition, AgentSpawn } from './types';
+import { hashIntentAuthorityBinding } from '../../capabilities/decisionRecord';
 
 const NOW = '2026-08-16T12:00:00.000Z';
 
@@ -182,5 +183,54 @@ describe('orchestrator decomposition', () => {
     const plan = decomposeObjective({ parent: { ...orchestrator, targets: [] }, childDefinition: definition('T0_reader') });
     expect(plan.ok).toBe(false);
     expect(plan.reason).toContain('at least one target');
+  });
+});
+
+describe('approval binding survives the authority change', () => {
+  // dispatchAgentProposal re-derives the intent and compares this hash to the
+  // one the operator approved. The check is defense-in-depth: spawn targets
+  // cannot currently drift through any API, so it guards against a future
+  // planner or a state-corruption bug rather than a reachable path today.
+  const intentFor = (
+    action: { type: string; origin: string; url: string; selector?: string },
+    authority: { kind: 'kernel_policy' | 'approval'; referenceId: string },
+  ) => ({
+    schemaVersion: 1 as const,
+    id: 'intent_1',
+    goalId: 'goal_1',
+    taskId: 'agent:spawn_1',
+    workerId: 'worker.browser.playwright',
+    riskLevel: 'L2' as const,
+    action,
+    scope: {
+      family: 'browser' as const,
+      operations: ['browser.click' as const],
+      origins: [action.origin],
+      downloadRoots: [],
+    },
+    authority,
+    untrustedObservationIds: [],
+    createdAt: NOW,
+  });
+
+  const click = { type: 'browser.click', origin: 'https://example.com', url: 'https://example.com/a', selector: '#accept' };
+
+  it('is unchanged when only the authority changes', () => {
+    // This is why the proposal commits to the binding hash rather than a whole
+    // intent hash: the authority necessarily differs between propose and dispatch.
+    const proposed = hashIntentAuthorityBinding(intentFor(click, { kind: 'kernel_policy', referenceId: 'spawn_1' }) as never);
+    const dispatched = hashIntentAuthorityBinding(intentFor(click, { kind: 'approval', referenceId: 'approval_1' }) as never);
+
+    expect(dispatched).toBe(proposed);
+  });
+
+  it('changes when the action being approved changes', () => {
+    const approved = hashIntentAuthorityBinding(intentFor(click, { kind: 'approval', referenceId: 'approval_1' }) as never);
+
+    const otherSelector = { ...click, selector: '#delete-everything' };
+    const otherOrigin = { ...click, origin: 'https://elsewhere.test', url: 'https://elsewhere.test/a' };
+
+    expect(hashIntentAuthorityBinding(intentFor(otherSelector, { kind: 'approval', referenceId: 'approval_1' }) as never)).not.toBe(approved);
+    expect(hashIntentAuthorityBinding(intentFor(otherOrigin, { kind: 'approval', referenceId: 'approval_1' }) as never)).not.toBe(approved);
   });
 });

@@ -4,6 +4,7 @@ import type {
   AgentAuthorityMode,
   AgentDomain,
   AgentFleetState,
+  AgentProposal,
   AgentSpawn,
   AgentTier,
 } from '../kernel/agents/types';
@@ -185,6 +186,13 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
     return `${outcome.kind}: ${outcome.reason}`;
   });
 
+  const dispatchProposal = (proposalId: string) => runAction(async () => {
+    const outcome = await request<{ kind: string; reason: string }>(
+      `/api/kernel/agents/proposals/${proposalId}/dispatch`, { method: 'POST' },
+    );
+    return `${outcome.kind}: ${outcome.reason}`;
+  });
+
   const revoke = (spawnId: string) => runAction(async () => {
     const reason = window.prompt('Reason for revoking this agent?')?.trim();
     if (!reason) throw new Error('A revocation reason is required.');
@@ -197,6 +205,9 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
   });
 
   const spawns = fleet?.spawns ?? [];
+  const pendingProposals: AgentProposal[] = (fleet?.proposals ?? []).filter(
+    (item) => item.status === 'pending',
+  );
 
   return (
     <section aria-labelledby="agent-fleet-title" className="rounded-3xl border border-slate-800 bg-[#101114]/90 p-5 shadow-2xl">
@@ -356,6 +367,42 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
         <Sparkles className="h-4 w-4" aria-hidden="true" />
         {busy ? 'Working…' : 'Spawn agent'}
       </button>
+
+      {pendingProposals.length > 0 && (
+        <div className="mt-6 rounded-xl border border-amber-900/60 bg-amber-950/10 p-3">
+          <p className="text-[10px] font-mono font-bold uppercase tracking-[0.25em] text-amber-400">
+            Awaiting your decision
+          </p>
+          <p className="mt-1 text-xs text-slate-400">
+            These actions exceed the agent's ceiling. Approve the request in the approvals queue,
+            then dispatch it here — the kernel re-derives the action and refuses if it changed.
+          </p>
+          <div className="mt-3 space-y-2">
+            {pendingProposals.map((proposal) => (
+              <article
+                key={proposal.id}
+                data-testid="agent-proposal"
+                className="rounded-lg border border-slate-800 bg-slate-950/50 p-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-mono text-xs text-slate-200">{proposal.summary}</span>
+                  <span className="rounded-full border border-amber-800/60 bg-amber-950/30 px-2 py-0.5 text-[10px] font-mono text-amber-300">
+                    {proposal.riskLevel}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => dispatchProposal(proposal.id)}
+                  disabled={busy || !execution?.enabled}
+                  className="mt-2 inline-flex items-center gap-1 rounded-lg border border-amber-700 bg-amber-950/30 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/30 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <ShieldCheck className="h-3 w-3" aria-hidden="true" />Dispatch approved action
+                </button>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="mt-6 space-y-2">
         {spawns.length === 0 && !loadError && (
