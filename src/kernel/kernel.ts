@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { createCapabilityGrant } from '../capabilities/grants';
+import { createCapabilityGrant, hashActionIntent } from '../capabilities/grants';
 import {
   authorizeCapabilityDispatch,
   type CapabilityDispatchAuthorization,
@@ -126,11 +126,21 @@ import {
   writePendingKernelSnapshot,
 } from './store';
 import {
+  admitOperation,
   authorizeSpawn,
+  completeSpawn,
   decideSpawn,
+  failSpawn,
   revokeSpawn,
   startSpawn,
 } from './agents/registry';
+import {
+  envelopePermits,
+  planAgentStep,
+  requiresProposal,
+  riskForAgentAction,
+} from './agents/executor';
+import { decomposeObjective } from './agents/orchestrator';
 import {
   AGENT_AUTHORITY_MODES,
   AGENT_DOMAINS,
@@ -141,9 +151,17 @@ import {
   type AgentDefinition,
   type AgentDomain,
   type AgentFleetState,
+  type AgentProposal,
   type AgentSpawn,
   type AgentTier,
 } from './agents/types';
+
+export type AgentStepOutcome = {
+  kind: 'stepped' | 'completed' | 'failed' | 'proposed';
+  spawn: AgentSpawn;
+  proposal?: AgentProposal;
+  reason: string;
+};
 import { buildInitialTaskGraph, getNextReadyTask, markTaskStatus } from './taskGraph';
 import {
   ApprovalDecisionPrincipal,
@@ -237,6 +255,8 @@ export interface AutomationRunOutcome {
 
 export interface KernelServiceOptions {
   runtimeDir: string;
+  /** Fleet execution is opt-in; the authority model applies regardless. */
+  agentExecutionEnabled?: boolean;
   allowedWorkspaceRoot?: string;
   providerRouter?: ProviderRouter;
   workerRegistrations?: WorkerRegistration[];
@@ -5397,6 +5417,7 @@ export const createKernelService = (options: KernelServiceOptions) => {
       definitionId?: string; goalId?: string; objective?: string;
       requestedAuthority?: AgentAuthorityMode; parentSpawnId?: string;
       envelope?: AgentSpawn['envelope']; budget?: Partial<AgentSpawn['budget']>;
+      targets?: string[];
     };
     if (!AGENT_AUTHORITY_MODES.includes(input?.requestedAuthority as AgentAuthorityMode)) {
       throw new Error('Unknown agent authority mode.');
@@ -5440,7 +5461,10 @@ export const createKernelService = (options: KernelServiceOptions) => {
       throw new Error(decision.reason);
     }
 
-    let spawn = decision.spawn;
+    let spawn = {
+      ...decision.spawn,
+      targets: Array.isArray(input.targets) ? input.targets.filter(isNonEmptyText) : undefined,
+    };
     let approval: ApprovalRecord | undefined;
     if (decision.approvalRequired) {
       approval = createApprovalRecord({
@@ -5556,6 +5580,380 @@ export const createKernelService = (options: KernelServiceOptions) => {
 
   const getAgentFleet = async (): Promise<AgentFleetState> => fleetOf(await getState());
 
+  /**
+   * Fleet execution is opt-in. The authority model is always enforced, but
+   * actually running agents is a deployment decision, so a deployment that has
+   * not enabled it gets a refusal rather than a surprise autonomous worker.
+   */
+  const agentExecutionEnabled = (): boolean => options.agentExecutionEnabled === true;
+
+  const agentExecutionStatus = () => ({
+    enabled: agentExecutionEnabled(),
+    reason: agentExecutionEnabled()
+      ? 'Agent execution is enabled for this deployment.'
+      : 'Agent execution is disabled. Agents can be defined and authorized, but will not run.',
+  });
+
+  /**
+   * Runs one agent step: plan, admit, then either dispatch or propose.
+   *
+   * An action above the agent's ceiling is not an error -- it is recorded as a
+   * proposal for a human, which is what `propose_only` means in practice.
+   */
+  const runAgentStep = (spawnId: string): Promise<AgentStepOutcome> => withMutation(async () => {
+    if (!agentExecutionEnabled()) throw new Error(agentExecutionStatus().reason);
+    let state = await readConsistentState();
+    if (state.controls.stopAll) throw new Error('Stop All is active. Resume the kernel before running agents.');
+
+    const fleet = fleetOf(state);
+    const spawn = fleet.spawns.find((candidate) => candidate.id === spawnId);
+    if (!spawn) throw new Error('Agent spawn not found.');
+    const goal = state.goals.find((candidate) => candidate.id === spawn.goalId);
+    if (!goal) throw new Error('Goal not found.');
+
+    if (spawn.status !== 'running') {
+      return {
+        kind: 'failed',
+        spawn,
+        reason: `Agent is ${spawn.status} and cannot take another step.`,
+      };
+    }
+
+    const now = new Date().toISOString();
+    const plan = planAgentStep(spawn);
+    if (plan.done || !plan.action || !plan.scope) {
+      const completed = completeSpawn(spawn, now);
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.completed',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: { spawnId: spawn.id, reason: plan.reason, operationsUsed: spawn.operationsUsed },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, {
+        ...nextFleet,
+        spawns: nextFleet.spawns.map((item) => item.id === completed.id ? completed : item),
+      }));
+      return { kind: 'completed', spawn: completed, reason: plan.reason };
+    }
+
+    const riskLevel = riskForAgentAction(plan.action);
+    const workerId = fleet.definitions.find((item) => item.id === spawn.definitionId)?.workerIds[0];
+    if (!workerId) throw new Error('Agent definition lists no worker to dispatch through.');
+    const registration = workerRegistry.get(workerId);
+
+    const intent: ActionIntent = {
+      schemaVersion: 1,
+      id: createKernelId('intent'),
+      goalId: goal.id,
+      taskId: `agent:${spawn.id}`,
+      workerId,
+      riskLevel,
+      action: plan.action,
+      scope: plan.scope,
+      authority: { kind: 'kernel_policy', referenceId: spawn.id },
+      untrustedObservationIds: [],
+      createdAt: now,
+    };
+
+    // Above the ceiling: record a proposal instead of acting.
+    if (requiresProposal(spawn, plan.action)) {
+      const proposal: AgentProposal = {
+        schemaVersion: 1,
+        id: createKernelId('proposal'),
+        spawnId: spawn.id,
+        riskLevel,
+        summary: `${plan.action.type} — ${plan.reason}`,
+        intentHash: hashActionIntent(intent),
+        createdAt: now,
+      };
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.proposed',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: {
+          spawnId: spawn.id,
+          proposalId: proposal.id,
+          riskLevel,
+          actionType: plan.action.type,
+          intentHash: proposal.intentHash,
+          ceiling: spawn.effectiveRiskCeiling,
+        },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, { ...nextFleet, proposals: [...nextFleet.proposals, proposal] }));
+      return { kind: 'proposed', spawn, proposal, reason: `Action exceeds the agent ceiling ${spawn.effectiveRiskCeiling}.` };
+    }
+
+    const admitted = admitOperation(spawn, riskLevel, now);
+    if (!admitted.allowed || !admitted.spawn) {
+      const failed = failSpawn(spawn, admitted.reason, now);
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.failed',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: { spawnId: spawn.id, reasonCode: admitted.reasonCode, reason: admitted.reason },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, {
+        ...nextFleet,
+        spawns: nextFleet.spawns.map((item) => item.id === failed.id ? failed : item),
+      }));
+      return { kind: 'failed', spawn: failed, reason: admitted.reason };
+    }
+
+    if (!registration) throw new Error(`Agent worker ${workerId} is not registered.`);
+    const envelope = envelopePermits(spawn, registration, riskLevel, now);
+    if (!envelope.allowed) {
+      const failed = failSpawn(spawn, envelope.reason, now);
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.failed',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: { spawnId: spawn.id, reasonCode: 'envelope_denied', reason: envelope.reason },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, {
+        ...nextFleet,
+        spawns: nextFleet.spawns.map((item) => item.id === failed.id ? failed : item),
+      }));
+      return { kind: 'failed', spawn: failed, reason: envelope.reason };
+    }
+
+    // The agent has no privileged path: the same policy engine, the same
+    // single-use grant, the same pre-dispatch consumption as any other actor.
+    const decision = decideActionPolicy(intent, workerRegistry);
+    if (decision.kind !== 'allow') {
+      const failed = failSpawn(spawn, decision.reason, now);
+      const appended = await appendEvent(state, {
+        actor: 'kernel',
+        type: 'agent.failed',
+        entityId: spawn.id,
+        entityType: 'agent',
+        payload: {
+          spawnId: spawn.id,
+          reasonCode: decision.reasonCode,
+          reason: decision.reason,
+          decision: buildPolicyDecisionRecord({ intent, worker: registration, now }, decision),
+        },
+      });
+      state = appended.state;
+      const nextFleet = fleetOf(state);
+      await commitState(withFleet(state, {
+        ...nextFleet,
+        spawns: nextFleet.spawns.map((item) => item.id === failed.id ? failed : item),
+      }));
+      return { kind: 'failed', spawn: failed, reason: decision.reason };
+    }
+
+    const grant = createCapabilityGrant(intent, {
+      id: createKernelId('cap'),
+      issuedAt: now,
+      expiresAt: new Date(Date.parse(now) + 10 * 60 * 1000).toISOString(),
+      maxOps: 1,
+    });
+    await capabilityGrantStore.create(grant);
+    const dispatchNow = new Date().toISOString();
+    const authorized = await authorizeCapabilityDispatch(
+      capabilityGrantStore, grant.id, intent, registration, { now: dispatchNow, operationsUsed: 1 },
+    );
+    if (!authorized.allowed || !authorized.authorization || !authorized.grant) {
+      throw new Error(`Capability authorization failed before agent dispatch: ${authorized.reason}`);
+    }
+
+    let appended = await appendEvent(state, {
+      actor: 'kernel',
+      type: 'capability.grant_consumed',
+      entityId: grant.id,
+      entityType: 'capability',
+      payload: {
+        spawnId: spawn.id,
+        intentId: intent.id,
+        grantId: grant.id,
+        grantStatus: authorized.grant.status,
+        decision: buildDispatchDecisionRecord(
+          { grant, intent, worker: registration, now: dispatchNow, operationsUsed: 1 },
+          {
+            allowed: true,
+            reasonCode: 'allowed',
+            reason: 'Capability grant consumed.',
+            riskLevel: intent.riskLevel,
+            grantStatus: authorized.grant.status,
+            usedOps: authorized.grant.usedOps,
+            consumedAt: authorized.grant.consumedAt ?? null,
+          },
+        ),
+      },
+    });
+    state = appended.state;
+
+    const worker = actionWorkers[workerId];
+    let outcomeSummary = 'Agent step dispatched.';
+    let stepFailed: string | undefined;
+    if (worker) {
+      try {
+        const result = await worker.execute(intent, {
+          timeoutMs: 60_000,
+          authorization: authorized.authorization,
+        });
+        outcomeSummary = result.summary;
+        // 'uncertain' means the worker could not confirm the outcome. Treating
+        // that as success would be the fail-open the kernel exists to prevent.
+        if (result.status !== 'succeeded') {
+          stepFailed = `Agent worker reported ${result.status}: ${result.summary}`;
+        }
+      } catch (error) {
+        stepFailed = error instanceof Error ? error.message : 'Agent worker dispatch failed.';
+      }
+    } else {
+      stepFailed = `No executable runtime is registered for ${workerId}.`;
+    }
+
+    const advanced = { ...admitted.spawn, updatedAt: new Date().toISOString() };
+    const next = stepFailed ? failSpawn(advanced, stepFailed, advanced.updatedAt) : advanced;
+    appended = await appendEvent(state, {
+      actor: 'worker',
+      type: stepFailed ? 'agent.failed' : 'agent.step_completed',
+      entityId: spawn.id,
+      entityType: 'agent',
+      payload: {
+        spawnId: spawn.id,
+        intentId: intent.id,
+        grantId: grant.id,
+        targetIndex: plan.targetIndex,
+        operationsUsed: next.operationsUsed,
+        summary: stepFailed ?? outcomeSummary,
+      },
+    });
+    state = appended.state;
+    const nextFleet = fleetOf(state);
+    await commitState(withFleet(state, {
+      ...nextFleet,
+      spawns: nextFleet.spawns.map((item) => item.id === next.id ? next : item),
+    }));
+    return {
+      kind: stepFailed ? 'failed' : 'stepped',
+      spawn: next,
+      reason: stepFailed ?? outcomeSummary,
+    };
+  });
+
+  /** Fans an orchestrator's targets out across child agents. */
+  const runAgentOrchestration = (
+    spawnId: string,
+    childDefinitionId: string,
+  ): Promise<{ children: AgentSpawn[]; deferred: string[]; reason: string }> => withMutation(async () => {
+    if (!agentExecutionEnabled()) throw new Error(agentExecutionStatus().reason);
+    const state = await readConsistentState();
+    if (state.controls.stopAll) throw new Error('Stop All is active. Resume the kernel before running agents.');
+    const fleet = fleetOf(state);
+    const parent = fleet.spawns.find((candidate) => candidate.id === spawnId);
+    if (!parent) throw new Error('Agent spawn not found.');
+    const childDefinition = fleet.definitions.find((candidate) => candidate.id === childDefinitionId);
+    if (!childDefinition) throw new Error('Child agent definition not found.');
+
+    const plan = decomposeObjective({ parent, childDefinition });
+    if (!plan.ok) throw new Error(plan.reason);
+
+    // Children are created inline rather than through spawnAgent: that helper
+    // holds the mutation lock, so calling it from here would deadlock. The
+    // admission rules are shared via decideSpawn, so the boundary is identical.
+    let workingState = state;
+    const children: AgentSpawn[] = [];
+    let workingParent = parent;
+    const now = new Date().toISOString();
+
+    for (const child of plan.children) {
+      const decision = decideSpawn({
+        id: createKernelId('spawn'),
+        definition: childDefinition,
+        goalId: parent.goalId,
+        objective: child.objective,
+        // A child is never more autonomous than its parent; decideSpawn caps it.
+        requestedAuthority: parent.effectiveAuthority,
+        envelope: parent.envelope,
+        parent: workingParent,
+        now,
+      });
+      if (!decision.ok || !decision.spawn) {
+        const refused = await appendEvent(workingState, {
+          actor: 'kernel',
+          type: 'agent.spawn_refused',
+          entityId: parent.id,
+          entityType: 'agent',
+          payload: {
+            parentSpawnId: parent.id,
+            definitionId: childDefinition.id,
+            reasonCode: decision.reasonCode,
+            reason: decision.reason,
+          },
+        });
+        workingState = refused.state;
+        break;
+      }
+
+      const started = decision.approvalRequired
+        ? decision.spawn
+        : startSpawn({ ...decision.spawn, targets: child.targets }, now);
+      const seeded = decision.approvalRequired
+        ? { ...decision.spawn, targets: child.targets }
+        : started;
+
+      const appended = await appendEvent(workingState, {
+        actor: 'kernel',
+        type: 'agent.spawn_requested',
+        entityId: seeded.id,
+        entityType: 'agent',
+        payload: {
+          spawnId: seeded.id,
+          parentSpawnId: parent.id,
+          definitionId: childDefinition.id,
+          goalId: parent.goalId,
+          depth: seeded.depth,
+          tier: seeded.tier,
+          effectiveAuthority: seeded.effectiveAuthority,
+          effectiveRiskCeiling: seeded.effectiveRiskCeiling,
+          targetCount: child.targets.length,
+          approvalRequired: Boolean(decision.approvalRequired),
+        },
+      });
+      workingState = appended.state;
+      children.push(seeded);
+      workingParent = { ...workingParent, childCount: workingParent.childCount + 1 };
+    }
+
+    // Deferred targets are ledgered so a partial fan-out is never mistaken for
+    // a complete one.
+    if (plan.deferred.length > 0) {
+      const appended = await appendEvent(workingState, {
+        actor: 'kernel',
+        type: 'agent.decomposition_deferred',
+        entityId: parent.id,
+        entityType: 'agent',
+        payload: { spawnId: parent.id, deferredCount: plan.deferred.length, reason: plan.reason },
+      });
+      workingState = appended.state;
+    }
+
+    const nextFleet = fleetOf(workingState);
+    await commitState(withFleet(workingState, {
+      ...nextFleet,
+      spawns: [
+        ...nextFleet.spawns.map((item) => item.id === parent.id ? workingParent : item),
+        ...children,
+      ],
+    }));
+    return { children, deferred: plan.deferred, reason: plan.reason };
+  });
+
   const recordBenchmarkRun = (goalId: string): Promise<BenchmarkRun> => withMutation(async () => {
     let state = await readConsistentState();
     const events = await readKernelEvents(options.runtimeDir);
@@ -5638,6 +6036,9 @@ export const createKernelService = (options: KernelServiceOptions) => {
     createArtifact,
     listArtifacts,
     createAgentDefinition,
+    agentExecutionStatus,
+    runAgentStep,
+    runAgentOrchestration,
     spawnAgent,
     authorizeAgentSpawn,
     revokeAgentSpawn,

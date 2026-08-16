@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bot, ChevronRight, Layers, ShieldAlert, ShieldCheck, Sparkles, XOctagon } from 'lucide-react';
+import { Bot, ChevronRight, Layers, Play, PowerOff, ShieldAlert, ShieldCheck, Sparkles, Split, XOctagon } from 'lucide-react';
 import type {
   AgentAuthorityMode,
   AgentDomain,
@@ -81,8 +81,14 @@ interface AgentFleetPanelProps {
   goalId?: string;
 }
 
+interface ExecutionStatus {
+  enabled: boolean;
+  reason: string;
+}
+
 export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedGoalId }) => {
   const [fleet, setFleet] = useState<AgentFleetState | undefined>(undefined);
+  const [execution, setExecution] = useState<ExecutionStatus | undefined>(undefined);
   const [goals, setGoals] = useState<GoalOption[]>([]);
   const [selectedGoalId, setSelectedGoalId] = useState<string>('');
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
@@ -94,13 +100,16 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
   const [domain, setDomain] = useState<AgentDomain>('research');
   const [name, setName] = useState('');
   const [objective, setObjective] = useState('');
+  const [targets, setTargets] = useState('');
   const [authority, setAuthority] = useState<AgentAuthorityMode>('propose_only');
 
   const goalId = fixedGoalId ?? (selectedGoalId || undefined);
 
   const refresh = useCallback(async () => {
     try {
-      setFleet(await request<AgentFleetState>('/api/kernel/agents'));
+      const payload = await request<AgentFleetState & { execution?: ExecutionStatus }>('/api/kernel/agents');
+      setFleet(payload);
+      setExecution(payload.execution);
       setLoadError(undefined);
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : 'Agent fleet is unavailable.');
@@ -142,6 +151,7 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
 
   const spawn = () => runAction(async () => {
     if (!goalId) throw new Error('Select a goal before spawning an agent.');
+    const targetList = targets.split('\n').map((line) => line.trim()).filter(Boolean);
     const definition = await request<{ id: string }>('/api/kernel/agents/definitions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -150,7 +160,13 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
     const created = await request<AgentSpawn>('/api/kernel/agents/spawns', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ definitionId: definition.id, goalId, objective, requestedAuthority: authority }),
+      body: JSON.stringify({
+        definitionId: definition.id,
+        goalId,
+        objective,
+        requestedAuthority: authority,
+        targets: targetList,
+      }),
     });
     return created.status === 'approval_required'
       ? 'Agent requested. Elevated authority needs an approval before it starts.'
@@ -160,6 +176,13 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
   const authorize = (spawnId: string) => runAction(async () => {
     await request(`/api/kernel/agents/spawns/${spawnId}/authorize`, { method: 'POST' });
     return 'Elevated authority authorized; agent is running.';
+  });
+
+  const step = (spawnId: string) => runAction(async () => {
+    const outcome = await request<{ kind: string; reason: string }>(
+      `/api/kernel/agents/spawns/${spawnId}/step`, { method: 'POST' },
+    );
+    return `${outcome.kind}: ${outcome.reason}`;
   });
 
   const revoke = (spawnId: string) => runAction(async () => {
@@ -186,14 +209,37 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
             each action and consumes a single-use grant — autonomy changes who approves, never whether policy applies.
           </p>
         </div>
-        <span className="flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-1 text-[10px] font-mono text-slate-300">
-          <Layers className="h-3 w-3" aria-hidden="true" />{spawns.length} spawned
-        </span>
+        <div className="flex flex-col items-end gap-1">
+          <span className="flex items-center gap-1 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-1 text-[10px] font-mono text-slate-300">
+            <Layers className="h-3 w-3" aria-hidden="true" />{spawns.length} spawned
+          </span>
+          {execution && (
+            <span
+              data-testid="execution-status"
+              className={`flex items-center gap-1 rounded-full border px-3 py-1 text-[10px] font-mono ${
+                execution.enabled
+                  ? 'border-emerald-800/60 bg-emerald-950/30 text-emerald-300'
+                  : 'border-slate-700 bg-slate-900/60 text-slate-400'
+              }`}
+            >
+              {execution.enabled
+                ? <><Play className="h-3 w-3" aria-hidden="true" />execution on</>
+                : <><PowerOff className="h-3 w-3" aria-hidden="true" />execution off</>}
+            </span>
+          )}
+        </div>
       </div>
 
       {loadError && <p role="alert" className="mt-4 rounded-lg border border-rose-900/60 bg-rose-950/20 px-3 py-2 text-xs text-rose-300">{loadError}</p>}
       {actionError && <p role="alert" className="mt-4 rounded-lg border border-rose-900/60 bg-rose-950/20 px-3 py-2 text-xs text-rose-300">{actionError}</p>}
       {actionStatus && <p role="status" className="mt-4 rounded-lg border border-emerald-900/60 bg-emerald-950/20 px-3 py-2 text-xs text-emerald-300">{actionStatus}</p>}
+      {execution && !execution.enabled && (
+        <p role="note" className="mt-4 rounded-lg border border-slate-700 bg-slate-900/40 px-3 py-2 text-xs text-slate-300">
+          {execution.reason} Agents can still be defined, spawned, authorized, and revoked — the
+          authority model applies either way — but they will not run until this deployment sets
+          <code className="mx-1 rounded bg-slate-950 px-1 font-mono text-[10px]">AGENT_FLEET_EXECUTION=1</code>.
+        </p>
+      )}
       {!goalId && <p className="mt-4 rounded-lg border border-amber-900/60 bg-amber-950/20 px-3 py-2 text-xs text-amber-300">Select a goal to spawn agents against it.</p>}
 
       {!fixedGoalId && (
@@ -262,6 +308,17 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
       </div>
 
       <label className="mt-3 flex flex-col gap-1 text-xs text-slate-300">
+        <span className="font-mono uppercase tracking-wider text-slate-500">Targets (one URL per line)</span>
+        <textarea
+          value={targets}
+          onChange={(event) => setTargets(event.target.value)}
+          rows={2}
+          placeholder="https://example.com/page"
+          className="rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 font-mono text-xs text-white outline-none focus:border-sky-600"
+        />
+      </label>
+
+      <label className="mt-3 flex flex-col gap-1 text-xs text-slate-300">
         <span className="font-mono uppercase tracking-wider text-slate-500">Objective</span>
         <textarea
           value={objective}
@@ -274,6 +331,7 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
 
       <p
         role="note"
+        data-testid="authority-note"
         className={`mt-3 flex items-start gap-2 rounded-lg border px-3 py-2 text-xs ${
           selectedAuthority.elevated
             ? 'border-amber-800/60 bg-amber-950/20 text-amber-200'
@@ -337,6 +395,16 @@ export const AgentFleetPanel: React.FC<AgentFleetPanelProps> = ({ goalId: fixedG
                   className="inline-flex items-center gap-1 rounded-lg border border-amber-700 bg-amber-950/30 px-3 py-1 text-xs font-semibold text-amber-200 hover:bg-amber-900/30 disabled:opacity-50"
                 >
                   <ShieldCheck className="h-3 w-3" aria-hidden="true" />Authorize
+                </button>
+              )}
+              {item.status === 'running' && execution?.enabled && (
+                <button
+                  type="button"
+                  onClick={() => step(item.id)}
+                  disabled={busy}
+                  className="inline-flex items-center gap-1 rounded-lg border border-sky-700 bg-sky-950/30 px-3 py-1 text-xs font-semibold text-sky-200 hover:bg-sky-900/30 disabled:opacity-50"
+                >
+                  <Split className="h-3 w-3" aria-hidden="true" />Run step
                 </button>
               )}
               {(item.status === 'running' || item.status === 'approval_required' || item.status === 'requested') && (

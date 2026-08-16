@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createKernelService } from '../kernel';
 import { readKernelEvents } from '../ledger';
 import type { AgentFleetState } from './types';
+import type { KernelActionWorker } from '../kernel';
 
 let runtimeDir = '';
 let kernel: ReturnType<typeof createKernelService>;
@@ -21,8 +22,42 @@ const goalInput = {
   budget: { maxOperations: 50, maxCommandRuntimeMs: 120_000, maxApprovals: 10, maxProviderCalls: 0 },
 };
 
+const READER_WORKER_ID = 'worker.browser.web_inspect';
+
+const readerRegistration = {
+  id: READER_WORKER_ID,
+  family: 'browser' as const,
+  availability: 'available' as const,
+  supportedActions: ['browser.inspect' as const],
+  configuredScopes: [{
+    family: 'browser' as const,
+    operations: ['browser.inspect' as const],
+    origins: ['https://example.com'],
+    downloadRoots: [],
+  }],
+  registeredAt: '2026-08-16T11:00:00.000Z',
+};
+
+let dispatched: string[] = [];
+
+const recordingWorker: KernelActionWorker = {
+  execute: async (intent) => {
+    dispatched.push((intent.action as { url?: string }).url ?? intent.action.type);
+    return { status: 'succeeded', summary: 'inspected', sourceRef: 'test' };
+  },
+};
+
+const makeKernel = (agentExecutionEnabled: boolean) => createKernelService({
+  runtimeDir,
+  allowedWorkspaceRoot: workspaceRoot,
+  agentExecutionEnabled,
+  workerRegistrations: [readerRegistration],
+  actionWorkers: { [READER_WORKER_ID]: recordingWorker },
+});
+
 beforeEach(async () => {
   runtimeDir = await mkdtemp(path.join(os.tmpdir(), 'provenance-fleet-'));
+  dispatched = [];
   kernel = createKernelService({ runtimeDir, allowedWorkspaceRoot: workspaceRoot });
 });
 
@@ -161,5 +196,130 @@ describe('agent fleet through the kernel', () => {
     const events = await readKernelEvents(runtimeDir);
     expect(events.length).toBeGreaterThan(0);
     expect(events.some((event) => event.entityType === 'agent')).toBe(true);
+  });
+});
+
+describe('agent execution', () => {
+  const defineReader = (target: string[] = ['https://example.com/a', 'https://example.com/b']) => ({
+    target,
+  });
+
+  it('refuses to run when fleet execution is not enabled for the deployment', async () => {
+    kernel = makeKernel(false);
+    const goal = await kernel.createGoal(goalInput);
+    const definition = await kernel.createAgentDefinition({
+      name: 'reader', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: definition.id, goalId: goal.id, objective: 'Read',
+      requestedAuthority: 'propose_only', targets: defineReader().target,
+    });
+
+    expect(kernel.agentExecutionStatus().enabled).toBe(false);
+    await expect(kernel.runAgentStep(spawn.id)).rejects.toThrow('Agent execution is disabled');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('actually dispatches real work through the capability path, one target per step', async () => {
+    kernel = makeKernel(true);
+    const goal = await kernel.createGoal(goalInput);
+    const definition = await kernel.createAgentDefinition({
+      name: 'reader', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: definition.id, goalId: goal.id, objective: 'Read',
+      requestedAuthority: 'propose_only', targets: defineReader().target,
+    });
+
+    const first = await kernel.runAgentStep(spawn.id);
+    expect(first.kind).toBe('stepped');
+    expect(first.spawn.operationsUsed).toBe(1);
+    expect(dispatched).toEqual(['https://example.com/a']);
+
+    const second = await kernel.runAgentStep(spawn.id);
+    expect(second.kind).toBe('stepped');
+    expect(dispatched).toEqual(['https://example.com/a', 'https://example.com/b']);
+
+    // Out of targets: the agent completes rather than looping.
+    const third = await kernel.runAgentStep(spawn.id);
+    expect(third.kind).toBe('completed');
+    expect(third.spawn.status).toBe('completed');
+
+    // The dispatch consumed a real single-use grant, so the evidence is there.
+    const types = await eventTypes();
+    expect(types).toContain('capability.grant_consumed');
+    expect(types).toContain('agent.step_completed');
+    expect(types).toContain('agent.completed');
+  });
+
+  it('stops a revoked agent from doing any further work', async () => {
+    kernel = makeKernel(true);
+    const goal = await kernel.createGoal(goalInput);
+    const definition = await kernel.createAgentDefinition({
+      name: 'reader', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: definition.id, goalId: goal.id, objective: 'Read',
+      requestedAuthority: 'propose_only', targets: defineReader().target,
+    });
+
+    await kernel.revokeAgentSpawn(spawn.id, 'Operator halted this agent.');
+    const outcome = await kernel.runAgentStep(spawn.id);
+
+    expect(outcome.kind).toBe('failed');
+    expect(dispatched).toEqual([]);
+  });
+
+  it('fans an orchestrator out into one child per target and ledgers the plan', async () => {
+    kernel = makeKernel(true);
+    const goal = await kernel.createGoal(goalInput);
+    const orchestratorDefinition = await kernel.createAgentDefinition({
+      name: 'planner', description: 'plans', tier: 'T3_orchestrator', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const readerDefinition = await kernel.createAgentDefinition({
+      name: 'reader', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const parent = await kernel.spawnAgent({
+      definitionId: orchestratorDefinition.id, goalId: goal.id, objective: 'Survey sources',
+      requestedAuthority: 'propose_only',
+      targets: ['https://example.com/a', 'https://example.com/b'],
+    });
+
+    const result = await kernel.runAgentOrchestration(parent.id, readerDefinition.id);
+
+    expect(result.children).toHaveLength(2);
+    expect(result.children[0].parentSpawnId).toBe(parent.id);
+    expect(result.children[0].depth).toBe(1);
+    expect(result.children[0].targets).toEqual(['https://example.com/a']);
+    expect(result.deferred).toEqual([]);
+
+    const fleet = await kernel.getAgentFleet() as AgentFleetState;
+    expect(fleet.spawns).toHaveLength(3);
+
+    // Children do real work through the same path as any other agent.
+    const step = await kernel.runAgentStep(result.children[0].id);
+    expect(step.kind).toBe('stepped');
+    expect(dispatched).toEqual(['https://example.com/a']);
+  });
+
+  it('refuses orchestration from a tier that cannot spawn', async () => {
+    kernel = makeKernel(true);
+    const goal = await kernel.createGoal(goalInput);
+    const readerDefinition = await kernel.createAgentDefinition({
+      name: 'reader', description: 'reads', tier: 'T0_reader', domain: 'research',
+      workerIds: [READER_WORKER_ID],
+    });
+    const spawn = await kernel.spawnAgent({
+      definitionId: readerDefinition.id, goalId: goal.id, objective: 'Read',
+      requestedAuthority: 'propose_only', targets: ['https://example.com/a'],
+    });
+
+    await expect(kernel.runAgentOrchestration(spawn.id, readerDefinition.id))
+      .rejects.toThrow('may not decompose work');
   });
 });

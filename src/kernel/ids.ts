@@ -3,6 +3,8 @@ import crypto from 'node:crypto';
 export type IdPrefix =
   | 'agent'
   | 'spawn'
+  | 'proposal'
+  | 'intent'
   | 'goal'
   | 'task'
   | 'event'

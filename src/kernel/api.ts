@@ -65,6 +65,7 @@ export interface KernelRouterOptions {
     readonly health?: () => readonly DiagnosticHealthInput[] | Promise<readonly DiagnosticHealthInput[]>;
     readonly logs?: () => readonly DiagnosticLogInput[] | Promise<readonly DiagnosticLogInput[]>;
   };
+  readonly agentExecutionEnabled?: boolean;
   readonly recoverOnStart?: boolean;
   readonly kernelService?: ReturnType<typeof createKernelService>;
 }
@@ -109,6 +110,7 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
     recurringResearchTickMs: options.recurringResearchTickMs,
     skillEvaluationSourceResolver: options.skillEvaluationSourceResolver,
     skillEvaluatorAllowlist: options.skillEvaluatorAllowlist,
+    agentExecutionEnabled: options.agentExecutionEnabled,
   });
   const kernel = options.kernelService ?? createKernelService(config);
   const router = express.Router();
@@ -758,9 +760,32 @@ export const createKernelRouter = (options: KernelRouterOptions) => {
 
   router.get('/agents', async (_req, res) => {
     try {
-      res.json(await kernel.getAgentFleet());
+      res.json({ ...await kernel.getAgentFleet(), execution: kernel.agentExecutionStatus() });
     } catch {
       res.status(500).json({ error: 'Agent fleet is unavailable.' });
+    }
+  });
+
+  router.post('/agents/spawns/:spawnId/step', async (req, res) => {
+    try {
+      res.json(await kernel.runAgentStep(req.params.spawnId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent spawn not found.' ? 404 : 409).json({ error: message });
+    }
+  });
+
+  router.post('/agents/spawns/:spawnId/orchestrate', async (req, res) => {
+    const childDefinitionId = req.body?.childDefinitionId as unknown;
+    if (typeof childDefinitionId !== 'string' || !childDefinitionId.trim()) {
+      res.status(400).json({ error: 'A child agent definition id is required.' });
+      return;
+    }
+    try {
+      res.json(await kernel.runAgentOrchestration(req.params.spawnId, childDefinitionId));
+    } catch (error) {
+      const message = errorMessage(error);
+      res.status(message === 'Agent spawn not found.' ? 404 : 409).json({ error: message });
     }
   });
 

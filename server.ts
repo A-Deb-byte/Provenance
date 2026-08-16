@@ -101,6 +101,9 @@ const PORT = Number.isSafeInteger(configuredPort) && configuredPort >= 0 && conf
 const RUNTIME_DIR = path.resolve(process.env.PROVENANCE_RUNTIME_DIR?.trim() || path.join(PROJECT_ROOT, '.agent-kernel'));
 const IS_DEVELOPMENT = process.env.NODE_ENV === 'development' || /\.[cm]?tsx?$/iu.test(process.argv[1] || '');
 const IS_RELEASE_CHILD = process.env.RELEASE_CHILD_MODE === '1';
+// Fleet execution is opt-in per deployment. The authority model is enforced
+// either way; this only decides whether agents actually run.
+const AGENT_EXECUTION_ENABLED = process.env.AGENT_FLEET_EXECUTION === '1';
 
 const publishReleaseReadiness = async (
   nonce: string,
@@ -429,6 +432,7 @@ const createServerContext = async () => {
   const kernelConfig = {
     runtimeDir: RUNTIME_DIR,
     allowedWorkspaceRoot: workspaceRoot,
+    agentExecutionEnabled: AGENT_EXECUTION_ENABLED,
     providerRouter: providerRuntime.router,
     releaseSigningPublicKey: process.env.RELEASE_SIGNING_PUBLIC_KEY,
     workerRegistrations,

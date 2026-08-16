@@ -30,6 +30,13 @@ const fleet = {
     },
   ],
   proposals: [],
+  execution: { enabled: false, reason: 'Agent execution is disabled.' },
+};
+
+const runningFleet = {
+  ...fleet,
+  execution: { enabled: true, reason: 'Agent execution is enabled for this deployment.' },
+  spawns: [{ ...fleet.spawns[0], status: 'running' }],
 };
 
 const responses = new Map<string, unknown>();
@@ -60,19 +67,19 @@ describe('AgentFleetPanel', () => {
     // The default must be the safe one.
     const authoritySelect = await screen.findByLabelText(/authority/i);
     expect(authoritySelect).toHaveValue('propose_only');
-    expect(screen.getByRole('note')).toHaveTextContent(/You approve each one/i);
+    expect(screen.getByTestId('authority-note')).toHaveTextContent(/You approve each one/i);
 
     // Selecting an elevated mode must say plainly that per-action review stops
     // and that the decision is attributed -- a trust-boundary UI must not
     // understate what the operator is giving up.
     await user.selectOptions(authoritySelect, 'autonomous');
-    const note = screen.getByRole('note');
+    const note = screen.getByTestId('authority-note');
     expect(note).toHaveTextContent(/self-authorises/i);
     expect(note).toHaveTextContent(/No per-action approval/i);
     expect(note).toHaveTextContent(/recorded against your identity/i);
 
     await user.selectOptions(authoritySelect, 'envelope');
-    expect(screen.getByRole('note')).toHaveTextContent(/bounded, expiring delegation/i);
+    expect(screen.getByTestId('authority-note')).toHaveTextContent(/bounded, expiring delegation/i);
   });
 
   it('shows the effective authority and ceiling actually in force, not what was requested', async () => {
@@ -99,6 +106,25 @@ describe('AgentFleetPanel', () => {
 
     await waitFor(() => expect(screen.queryByRole('button', { name: /authorize/i })).not.toBeInTheDocument());
     expect(screen.getByRole('button', { name: /revoke/i })).toBeInTheDocument();
+  });
+
+  it('says plainly when execution is off, and offers no run control', async () => {
+    render(<AgentFleetPanel goalId="goal_1" />);
+
+    await waitFor(() => expect(screen.getByTestId('execution-status')).toHaveTextContent(/execution off/i));
+    // The panel must not imply agents are working when the deployment has not
+    // enabled execution.
+    expect(screen.getByText(/will not run until this deployment sets/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /run step/i })).not.toBeInTheDocument();
+  });
+
+  it('offers a run control only for a running agent once execution is enabled', async () => {
+    responses.set('/api/kernel/agents', runningFleet);
+    render(<AgentFleetPanel goalId="goal_1" />);
+
+    await waitFor(() => expect(screen.getByTestId('execution-status')).toHaveTextContent(/execution on/i));
+    expect(screen.getByRole('button', { name: /run step/i })).toBeInTheDocument();
+    expect(screen.queryByText(/will not run until this deployment sets/i)).not.toBeInTheDocument();
   });
 
   it('refuses to spawn without a selected goal', async () => {

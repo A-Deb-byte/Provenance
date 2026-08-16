@@ -96,15 +96,41 @@ deadline. Exhaustion terminates the agent and ledgers `agent.failed` with a reas
 Unbounded recursion is the obvious failure mode of any spawn system, so depth and
 fan-out are hard caps, not advisory.
 
-## What phase 1 implements
+## Execution
 
-- `AgentDefinition`, `AgentSpawn`, tier and authority types
-- Registry with tier/domain/authority resolution and the floor rule
-- Spawn lifecycle with ledger events and approval gating for elevated modes
-- Budget and depth enforcement
-- API surface
-- GUI panel with the authority selector
+Agents run real work through the **same** capability path as any other actor:
+`decideActionPolicy`, a single-use grant consumed pre-dispatch, then the worker.
+There is no agent fast path. `runAgentStep` performs one step:
 
-Execution — actually running an agent's work loop — is phase 2. Phase 1 makes the
-authority model real and enforceable first, because retrofitting an authority
-boundary onto a running executor is exactly how the approval gate would get lost.
+1. refuse if the agent is not `running` (a revoked agent takes no further step);
+2. plan the next action from its targets;
+3. if the action is above the ceiling, record an `AgentProposal` — this is what
+   `propose_only` means in practice;
+4. admit against ceiling, operation budget and deadline;
+5. re-check the envelope, which can lapse mid-run;
+6. dispatch, and treat a worker's `uncertain` result as failure, never success.
+
+Planning is deterministic rather than model-driven: an agent is given explicit
+targets and consumes one per admitted operation, using `operationsUsed` as the
+cursor so a resumed agent never repeats work. A model can later produce that
+target list without changing anything beneath it.
+
+Orchestration is likewise mechanical — one child per target, capped by the
+parent's remaining child budget, with anything over the cap ledgered as deferred
+rather than dropped. An orchestrator may not spawn another orchestrator: depth
+caps alone are a fragile defence against an unbounded tree.
+
+## Execution is opt-in
+
+The authority model is always enforced. Whether agents actually *run* is a
+deployment decision: `AGENT_FLEET_EXECUTION=1`. A deployment that has not
+enabled it can define, spawn, authorize and revoke agents — and gets a refusal
+instead of a surprise autonomous worker.
+
+The GUI states which mode is in force and offers no run control when execution
+is off, so the panel cannot imply agents are working when they are not.
+
+## Still out
+
+A model-driven planner (targets are operator-supplied today), proposal→approval
+promotion into a dispatchable action, and skill→agent binding.

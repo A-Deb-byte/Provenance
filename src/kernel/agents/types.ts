@@ -114,6 +114,11 @@ export interface AgentSpawn {
   operationsUsed: number;
   childCount: number;
   approvalId?: string;
+  /**
+   * Concrete work items. `operationsUsed` indexes into this, so a resumed agent
+   * never repeats a target it already inspected.
+   */
+  targets?: string[];
   /** Who authorised elevated autonomy. Absent for `propose_only`. */
   authorizedBy?: ApprovalDecisionPrincipal;
   createdAt: string;
